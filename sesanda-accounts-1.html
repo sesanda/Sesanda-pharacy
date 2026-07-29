@@ -1,0 +1,730 @@
+<!DOCTYPE html>
+<html lang="si">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+<title>Sesanda Accounts — Ledger &amp; Audit</title>
+<meta name="theme-color" content="#0A2149" />
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<style>
+  :root{
+    --bg:#060912; --card:#0F1B33; --card2:#132A4D; --line:#233254;
+    --ink:#EAF1FF; --ink-soft:#93A6CC;
+    --navy:#0A2149; --teal-700:#123C82; --teal-500:#2E6FE0;
+    --accent:#6BC3FF; --accent-2:#3EE6D0;
+    --brass:#C9A26A; --brass-soft:rgba(201,162,106,.14);
+    --red:#FF6B6B; --green:#3EE6D0;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0; background:var(--bg); color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; -webkit-font-smoothing:antialiased;}
+  input,select{ background:var(--card); color:var(--ink); border:1.5px solid var(--line); border-radius:9px; padding:9px 11px; font-size:13.5px; font-family:inherit;}
+  input:focus,select:focus{outline:none; border-color:var(--teal-500); box-shadow:0 0 0 3px rgba(46,111,224,.2);}
+  label{display:block; font-size:11.5px; color:var(--ink-soft); margin-bottom:5px; font-weight:600; letter-spacing:.02em; text-transform:uppercase;}
+  button{font-family:inherit; cursor:pointer;}
+  .btn{padding:9px 16px; border-radius:9px; border:1.5px solid var(--line); font-size:13px; font-weight:600; background:var(--card);color:var(--ink);}
+  .btn-primary{background:var(--teal-700); border-color:var(--teal-700); color:#fff;}
+  .btn-primary:hover{background:var(--teal-500);}
+  .btn-brass{background:var(--brass); border-color:var(--brass); color:#1a1204;}
+  .btn-ghost{background:transparent;}
+  .mono{font-family:var(--mono);}
+  .card{background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; margin-bottom:16px;}
+  .card h3{margin:0 0 14px; font-size:14.5px; color:var(--accent); display:flex; align-items:center; gap:8px;}
+  .grid{display:grid; gap:12px;}
+  .g2{grid-template-columns:repeat(2,1fr);}
+  .g3{grid-template-columns:repeat(3,1fr);}
+  .g4{grid-template-columns:repeat(4,1fr);}
+  @media(max-width:820px){ .g2,.g3,.g4{grid-template-columns:1fr;} }
+  table{width:100%; border-collapse:collapse; font-size:13px;}
+  th{text-align:left; font-size:10.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--ink-soft); padding:8px 10px; border-bottom:1.5px solid var(--line);}
+  td{padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top;}
+  tr.total-row td{border-top:3px double var(--brass); font-weight:700; color:var(--brass);}
+  .num{font-family:var(--mono); text-align:right; white-space:nowrap;}
+  .empty{text-align:center; padding:36px 20px; color:var(--ink-soft); font-size:13px;}
+  .app{display:flex; min-height:100vh;}
+  .side{width:224px; background:var(--navy); color:#fff; display:flex; flex-direction:column; padding:20px 12px; flex-shrink:0;}
+  .side .brand{font-size:15.5px; font-weight:800; margin-bottom:2px;}
+  .side .sub{font-size:11px; color:var(--accent-2); margin-bottom:22px;}
+  .navbtn{display:flex; align-items:center; gap:9px; width:100%; text-align:left; padding:10px 12px; border-radius:10px; background:none; border:none; color:#c9d6f0; font-size:13px; margin-bottom:3px;}
+  .navbtn.active{background:var(--teal-700); color:#fff; font-weight:700;}
+  .navbtn:hover{background:rgba(255,255,255,.06);}
+  .main{flex:1; padding:22px 26px; max-width:1180px;}
+  .topbar{display:flex; justify-content:space-between; align-items:center; margin-bottom:18px;}
+  .topbar h1{font-size:19px; margin:0; color:var(--ink);}
+  .userchip{font-size:12px; color:var(--ink-soft); display:flex; align-items:center; gap:10px;}
+  .gate{max-width:360px; margin:12vh auto; background:var(--card); border:1px solid var(--line); border-radius:16px; padding:30px;}
+  .gate h1{font-size:20px; margin:0 0 4px; color:var(--accent);}
+  .gate p{color:var(--ink-soft); font-size:13px; margin:0 0 22px;}
+  .kpi{background:var(--card2); border:1px solid var(--line); border-radius:12px; padding:14px 16px;}
+  .kpi .lbl{font-size:11px; color:var(--ink-soft); text-transform:uppercase; letter-spacing:.03em;}
+  .kpi .val{font-family:var(--mono); font-size:20px; font-weight:700; margin-top:4px;}
+  .stamp{display:inline-flex; align-items:center; justify-content:center; width:26px; height:26px; border-radius:50%; font-size:12px; font-weight:800; flex-shrink:0;}
+  .stamp.sale{background:rgba(62,230,208,.15); color:var(--accent-2); border:1.5px solid var(--accent-2);}
+  .stamp.cogs{background:rgba(107,195,255,.15); color:var(--accent); border:1.5px solid var(--accent);}
+  .stamp.purchase{background:rgba(201,162,106,.18); color:var(--brass); border:1.5px solid var(--brass);}
+  .stamp.expense{background:rgba(255,107,107,.15); color:var(--red); border:1.5px solid var(--red);}
+  .stamp.loss{background:rgba(255,107,107,.22); color:var(--red); border:1.5px solid var(--red);}
+  .stamp.receipt{background:rgba(46,111,224,.2); color:var(--teal-500); border:1.5px solid var(--teal-500);}
+  .stamp.manual{background:rgba(255,255,255,.08); color:var(--ink-soft); border:1.5px solid var(--ink-soft);}
+  .tag{font-size:10px; padding:2px 8px; border-radius:20px; border:1px solid var(--line); color:var(--ink-soft); text-transform:uppercase; letter-spacing:.03em;}
+  .tabs{display:flex; gap:6px; margin-bottom:16px; flex-wrap:wrap;}
+  .tabs button{padding:8px 14px; border-radius:9px; border:1.5px solid var(--line); background:var(--card); color:var(--ink-soft); font-size:12.5px; font-weight:600;}
+  .tabs button.active{background:var(--brass); color:#1a1204; border-color:var(--brass);}
+  .toast{position:fixed; bottom:20px; right:20px; background:var(--teal-900,var(--navy)); color:#fff; padding:14px 18px; border-radius:12px; font-size:13px; box-shadow:0 12px 28px rgba(0,0,0,.35); z-index:100;}
+  .diffOK{color:var(--accent-2); font-weight:700;}
+  .diffBAD{color:var(--red); font-weight:700;}
+  .rowline{display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px dashed var(--line); font-size:12.5px;}
+  .expandRow{cursor:pointer;}
+  .subrows{background:rgba(255,255,255,.02);}
+  a.linklike{color:var(--accent); cursor:pointer; text-decoration:underline;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const {useState,useEffect,useMemo,useRef} = React;
+
+/* ============== FIREBASE — same project as Sesanda Pharmacy POS ============== */
+const firebaseConfig = {
+  apiKey: "AIzaSyAhHxvaREdLBW8d3LmtdQ8B4s3ldYPZ_H0",
+  authDomain: "supper-app-311e1.firebaseapp.com",
+  projectId: "supper-app-311e1",
+  storageBucket: "supper-app-311e1.firebasestorage.app",
+  messagingSenderId: "542953167376",
+  appId: "1:542953167376:web:67432a6de3c1f50b77c895",
+};
+let db=null, fbReady=false;
+try{ firebase.initializeApp(firebaseConfig); db=firebase.firestore(); fbReady=true; }catch(e){ console.error(e); }
+
+/* ============== helpers ============== */
+const fmt = n => "Rs. " + (Number(n)||0).toLocaleString('en-LK',{minimumFractionDigits:2,maximumFractionDigits:2});
+const todayISO = () => new Date().toISOString().slice(0,10);
+const endOfDayMs = iso => new Date(iso+'T23:59:59.999').getTime();
+const startOfDayMs = iso => new Date(iso+'T00:00:00.000').getTime();
+const tsMillis = d => {
+  if(d.createdAtMs) return d.createdAtMs;
+  if(d.createdAt && typeof d.createdAt.toMillis==='function') return d.createdAt.toMillis();
+  if(d.createdAt && d.createdAt.seconds) return d.createdAt.seconds*1000;
+  if(d.date) return Date.parse(d.date+'T12:00:00');
+  return 0;
+};
+const dOf = ms => ms? new Date(ms).toISOString().slice(0,10) : '';
+const daysFromToday = iso => Math.round((Date.parse(iso)-Date.parse(todayISO()))/86400000);
+
+const ACCOUNTS = {
+  CASH:"Cash & Bank", AR:"Accounts Receivable", INV:"Inventory", AP:"Accounts Payable",
+  SALES:"Sales Revenue", DISC:"Discount Allowed", OTHINC:"Other Income",
+  COGS:"Cost of Goods Sold", EXP:"Operating Expenses", LOSS:"Stock Loss / Write-off",
+  EQUITY:"Owner's Equity",
+};
+const ACCOUNT_LIST = Object.values(ACCOUNTS);
+const NORMAL_DEBIT = new Set([ACCOUNTS.CASH,ACCOUNTS.AR,ACCOUNTS.INV,ACCOUNTS.COGS,ACCOUNTS.EXP,ACCOUNTS.LOSS,ACCOUNTS.DISC]);
+
+function useCollection(name){
+  const [data,setData]=useState([]); const [loading,setLoading]=useState(true);
+  useEffect(()=>{
+    if(!db) return;
+    const unsub = db.collection(name).onSnapshot(snap=>{
+      setData(snap.docs.map(d=>({id:d.id,...d.data()}))); setLoading(false);
+    }, err=>{ console.error(name,err); setLoading(false); });
+    return unsub;
+  },[name]);
+  return [data,loading];
+}
+
+function estimateLineCost(it, batches){
+  if(it.costTotal!=null) return it.costTotal;
+  const relevant = batches.filter(b=>b.itemId===it.itemId);
+  if(relevant.length===0) return 0;
+  const withStock = relevant.filter(b=>(b.remainingUnits||0)>0);
+  const pool = withStock.length? withStock : relevant;
+  const totalUnits = pool.reduce((s,b)=>s+(b.remainingUnits||0),0);
+  const totalCost = pool.reduce((s,b)=>s+(b.remainingUnits||0)*(b.unitCost||0),0);
+  const avgCost = totalUnits>0 ? totalCost/totalUnits : (pool[0].unitCost||0);
+  return avgCost*(it.qty||0);
+}
+
+/* ============== build the double-entry feed from operational data ============== */
+function buildEntries({invoices,grns,expenses,journal,payments,manual,batches}){
+  const out=[];
+  invoices.forEach(inv=>{
+    const ms=tsMillis(inv);
+    const payAcc = inv.payment==='credit' ? ACCOUNTS.AR : ACCOUNTS.CASH;
+    const lines=[{account:payAcc, dr:inv.totalToPay||0}];
+    if(inv.discountAmount>0) lines.push({account:ACCOUNTS.DISC, dr:inv.discountAmount});
+    lines.push({account:ACCOUNTS.SALES, cr:inv.subtotal||0});
+    if(inv.otherCharges>0) lines.push({account:ACCOUNTS.OTHINC, cr:inv.otherCharges});
+    out.push({id:'inv-'+inv.id, ms, type:'sale', docNo:inv.billNo||'INV', desc:'Sale — '+(inv.customerName||'Walk-in'), staff:inv.staffName||'', lines, source:{collection:'invoices', id:inv.id}});
+    const costTotal = (inv.items||[]).reduce((s,it)=>s+estimateLineCost(it,batches),0);
+    if(costTotal>0){
+      out.push({id:'cogs-'+inv.id, ms, type:'cogs', docNo:inv.billNo||'INV', desc:'Cost of goods sold — '+(inv.billNo||''), staff:'', lines:[{account:ACCOUNTS.COGS,dr:costTotal},{account:ACCOUNTS.INV,cr:costTotal}], source:{collection:'invoices', id:inv.id}});
+    }
+  });
+  grns.forEach(g=>{
+    const ms=tsMillis(g);
+    const lines=[{account:ACCOUNTS.INV, dr:g.totalAmount||0}, {account: g.paid?ACCOUNTS.CASH:ACCOUNTS.AP, cr:g.totalAmount||0}];
+    out.push({id:'grn-'+g.id, ms, type:'purchase', docNo:g.grnNo||'GRN', desc:'Purchase — '+(g.supplierName||''), staff:'', lines, source:{collection:'grns', id:g.id}});
+  });
+  expenses.forEach(e=>{
+    const ms=tsMillis(e);
+    out.push({id:'exp-'+e.id, ms, type:'expense', docNo:'EXP-'+e.id.slice(0,6).toUpperCase(), desc:e.description||'Expense', staff:'', lines:[{account:ACCOUNTS.EXP,dr:e.amount||0},{account:ACCOUNTS.CASH,cr:e.amount||0}], source:{collection:'expenses', id:e.id}});
+  });
+  journal.filter(j=>j.type==='loss').forEach(j=>{
+    const ms=tsMillis(j);
+    out.push({id:'loss-'+j.id, ms, type:'loss', docNo:'WO-'+j.id.slice(0,6).toUpperCase(), desc:'Write-off — '+(j.itemName||'')+(j.batchCode?(' ('+j.batchCode+')'):''), staff:'', lines:[{account:ACCOUNTS.LOSS,dr:j.amount||0},{account:ACCOUNTS.INV,cr:j.amount||0}], source:{collection:'journal', id:j.id}});
+  });
+  payments.forEach(p=>{
+    const ms=tsMillis(p);
+    out.push({id:'pay-'+p.id, ms, type:'receipt', docNo:'RCT-'+p.id.slice(0,6).toUpperCase(), desc:'Payment received — '+(p.customerName||''), staff:'', lines:[{account:ACCOUNTS.CASH,dr:p.amount||0},{account:ACCOUNTS.AR,cr:p.amount||0}], source:{collection:'payments', id:p.id}});
+  });
+  manual.forEach(m=>{
+    const ms=tsMillis(m);
+    out.push({id:'jv-'+m.id, ms, type:'manual', docNo:'JV-'+m.id.slice(0,6).toUpperCase(), desc:m.note||'Manual entry', staff:m.createdBy||'', lines:[{account:m.drAccount, dr:Number(m.amount)||0},{account:m.crAccount, cr:Number(m.amount)||0}], source:{collection:'acctManual', id:m.id}});
+  });
+  out.sort((a,b)=>a.ms-b.ms);
+  return out;
+}
+function totalsUpTo(entries, uptoMs){
+  const t={};
+  entries.forEach(e=>{
+    if(uptoMs!=null && e.ms>uptoMs) return;
+    e.lines.forEach(l=>{ if(!t[l.account]) t[l.account]={dr:0,cr:0}; t[l.account].dr+=l.dr||0; t[l.account].cr+=l.cr||0; });
+  });
+  return t;
+}
+function totalsInRange(entries, fromMs, toMs){
+  const t={};
+  entries.forEach(e=>{
+    if(e.ms<fromMs || e.ms>toMs) return;
+    e.lines.forEach(l=>{ if(!t[l.account]) t[l.account]={dr:0,cr:0}; t[l.account].dr+=l.dr||0; t[l.account].cr+=l.cr||0; });
+  });
+  return t;
+}
+const bal = (acc,t)=> ((t[acc]&&t[acc].dr)||0) - ((t[acc]&&t[acc].cr)||0);
+const balCr = (acc,t)=> ((t[acc]&&t[acc].cr)||0) - ((t[acc]&&t[acc].dr)||0);
+
+function downloadCSV(filename, rows){
+  const csv = rows.map(r=>r.map(c=>{
+    const s = String(c==null?'':c);
+    return /[",\n]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s;
+  }).join(',')).join('\n');
+  const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download=filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+/* ============== Login ============== */
+function Login(){
+  const [email,setEmail]=useState(''); const [password,setPassword]=useState('');
+  const [err,setErr]=useState(''); const [loading,setLoading]=useState(false);
+  const submit = async (e)=>{
+    e.preventDefault(); setErr(''); setLoading(true);
+    try{ await firebase.auth().signInWithEmailAndPassword(email.trim(), password); }
+    catch(ex){ setErr('Login අසාර්ථකයි — email/password එක check කරන්න'); }
+    setLoading(false);
+  };
+  return (
+    <div className="gate">
+      <h1>📒 Sesanda Accounts</h1>
+      <p>Pharmacy POS එකේම staff login එකෙන් sign in වෙන්න.</p>
+      <form onSubmit={submit}>
+        <div style={{marginBottom:12}}><label>Email</label><input style={{width:'100%'}} value={email} onChange={e=>setEmail(e.target.value)} type="email" required/></div>
+        <div style={{marginBottom:16}}><label>Password</label><input style={{width:'100%'}} value={password} onChange={e=>setPassword(e.target.value)} type="password" required/></div>
+        {err && <div style={{color:'var(--red)', fontSize:12.5, marginBottom:12}}>{err}</div>}
+        <button className="btn btn-primary" style={{width:'100%'}} disabled={loading}>{loading?'...':'Sign in'}</button>
+      </form>
+    </div>
+  );
+}
+
+/* ============== Dashboard ============== */
+function Dashboard({entries, batches, customers, grns}){
+  const now = Date.now();
+  const todayFrom = startOfDayMs(todayISO()), todayTo = endOfDayMs(todayISO());
+  const monthFrom = startOfDayMs(todayISO().slice(0,8)+'01');
+  const tToday = totalsInRange(entries, todayFrom, todayTo);
+  const tMonth = totalsInRange(entries, monthFrom, todayTo);
+  const netProfit = t => (bal(ACCOUNTS.SALES,{}) ,( (t[ACCOUNTS.SALES]&&t[ACCOUNTS.SALES].cr||0) + (t[ACCOUNTS.OTHINC]&&t[ACCOUNTS.OTHINC].cr||0) - (t[ACCOUNTS.DISC]&&t[ACCOUNTS.DISC].dr||0) - (t[ACCOUNTS.COGS]&&t[ACCOUNTS.COGS].dr||0) - (t[ACCOUNTS.EXP]&&t[ACCOUNTS.EXP].dr||0) - (t[ACCOUNTS.LOSS]&&t[ACCOUNTS.LOSS].dr||0) ));
+  const tAll = totalsUpTo(entries, now);
+  const cash = bal(ACCOUNTS.CASH,tAll), ar = bal(ACCOUNTS.AR,tAll), ap = balCr(ACCOUNTS.AP,tAll), invLedger = bal(ACCOUNTS.INV,tAll);
+  const invActual = batches.reduce((s,b)=>s+(b.remainingUnits||0)*(b.unitCost||0),0);
+  const arActual = customers.reduce((s,c)=>s+(c.dueAmount||0),0);
+  const apActual = (grns||[]).filter(g=>!g.paid).reduce((s,g)=>s+(g.totalAmount||0),0);
+  const expiringSoon = batches.filter(b=>(b.remainingUnits||0)>0 && b.expiryDate && daysFromToday(b.expiryDate)>=0 && daysFromToday(b.expiryDate)<=60).length;
+
+  const Kpi = ({label,value,sub})=>(
+    <div className="kpi"><div className="lbl">{label}</div><div className="val">{value}</div>{sub && <div style={{fontSize:11, color:'var(--ink-soft)', marginTop:4}}>{sub}</div>}</div>
+  );
+  return (
+    <div>
+      <div className="grid g4" style={{marginBottom:16}}>
+        <Kpi label="Today's Net Profit (est.)" value={fmt(netProfit(tToday))} />
+        <Kpi label="This Month Net Profit (est.)" value={fmt(netProfit(tMonth))} />
+        <Kpi label="Cash & Bank (ledger)" value={fmt(cash)} />
+        <Kpi label="Inventory (ledger)" value={fmt(invLedger)} sub={"Actual stock value: "+fmt(invActual)} />
+      </div>
+      <div className="grid g4" style={{marginBottom:16}}>
+        <Kpi label="Accounts Receivable (ledger)" value={fmt(ar)} sub={"Customer dues: "+fmt(arActual)} />
+        <Kpi label="Accounts Payable (ledger)" value={fmt(ap)} sub={"Unpaid GRNs: "+fmt(apActual)} />
+        <Kpi label="Debtor customers" value={customers.filter(c=>(c.dueAmount||0)>0).length} />
+        <Kpi label="Stock expiring ≤60 days" value={expiringSoon} />
+      </div>
+      <div className="card">
+        <h3>🪙 Audit Reconciliation — Live Check</h3>
+        <p style={{fontSize:12.5, color:'var(--ink-soft)', marginTop:-6}}>ලෙජරයේ ගණනය කරන ලද balance එක, පවතින stock/customer/GRN data එකට match වෙනවද කියලා check කරනවා.</p>
+        <table>
+          <thead><tr><th>Account</th><th className="num">Ledger</th><th className="num">Actual (live)</th><th className="num">Difference</th></tr></thead>
+          <tbody>
+            <tr><td>Inventory</td><td className="num">{fmt(invLedger)}</td><td className="num">{fmt(invActual)}</td><td className={"num "+(Math.abs(invLedger-invActual)<1?'diffOK':'diffBAD')}>{fmt(invLedger-invActual)}</td></tr>
+            <tr><td>Accounts Receivable</td><td className="num">{fmt(ar)}</td><td className="num">{fmt(arActual)}</td><td className={"num "+(Math.abs(ar-arActual)<1?'diffOK':'diffBAD')}>{fmt(ar-arActual)}</td></tr>
+            <tr><td>Accounts Payable</td><td className="num">{fmt(ap)}</td><td className="num">{fmt(apActual)}</td><td className={"num "+(Math.abs(ap-apActual)<1?'diffOK':'diffBAD')}>{fmt(ap-apActual)}</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ============== Journal ============== */
+function JournalView({entries}){
+  const [from,setFrom]=useState(''); const [to,setTo]=useState('');
+  const rows = useMemo(()=>{
+    let out=[];
+    entries.forEach(e=>{
+      const d = dOf(e.ms);
+      if(from && d<from) return; if(to && d>to) return;
+      e.lines.forEach(l=> out.push({date:d, docNo:e.docNo, desc:e.desc, account:l.account, dr:l.dr||0, cr:l.cr||0}));
+    });
+    return out;
+  },[entries,from,to]);
+  const totalDr = rows.reduce((s,r)=>s+r.dr,0), totalCr = rows.reduce((s,r)=>s+r.cr,0);
+  const exportCsv = ()=> downloadCSV('journal.csv', [['Date','Doc No','Particulars','Account','Debit','Credit'], ...rows.map(r=>[r.date,r.docNo,r.desc,r.account,r.dr.toFixed(2),r.cr.toFixed(2)])]);
+  return (
+    <div className="card">
+      <h3>📘 General Journal</h3>
+      <div className="grid g3" style={{marginBottom:14}}>
+        <div><label>From</label><input type="date" value={from} onChange={e=>setFrom(e.target.value)} style={{width:'100%'}}/></div>
+        <div><label>To</label><input type="date" value={to} onChange={e=>setTo(e.target.value)} style={{width:'100%'}}/></div>
+        <div style={{display:'flex', alignItems:'end'}}><button className="btn btn-ghost" onClick={exportCsv}>⬇ Export CSV</button></div>
+      </div>
+      {rows.length===0? <div className="empty">Entries නැහැ.</div> :
+      <div style={{overflowX:'auto', maxHeight:520, overflowY:'auto'}}>
+        <table>
+          <thead><tr><th>Date</th><th>Doc No</th><th>Particulars</th><th>Account</th><th className="num">Debit</th><th className="num">Credit</th></tr></thead>
+          <tbody>
+            {rows.map((r,i)=>(<tr key={i}><td className="mono">{r.date}</td><td>{r.docNo}</td><td>{r.desc}</td><td>{r.account}</td><td className="num">{r.dr? fmt(r.dr):''}</td><td className="num">{r.cr? fmt(r.cr):''}</td></tr>))}
+            <tr className="total-row"><td colSpan="4">TOTAL</td><td className="num">{fmt(totalDr)}</td><td className="num">{fmt(totalCr)}</td></tr>
+          </tbody>
+        </table>
+      </div>}
+    </div>
+  );
+}
+
+/* ============== Ledger ============== */
+function LedgerView({entries}){
+  const [account,setAccount]=useState(ACCOUNTS.SALES);
+  const rows = useMemo(()=>{
+    let running=0; const out=[];
+    entries.forEach(e=>{
+      e.lines.filter(l=>l.account===account).forEach(l=>{
+        running += (l.dr||0)-(l.cr||0);
+        out.push({date:dOf(e.ms), docNo:e.docNo, desc:e.desc, dr:l.dr||0, cr:l.cr||0, running});
+      });
+    });
+    return out;
+  },[entries,account]);
+  return (
+    <div className="card">
+      <h3>📒 Account Ledger</h3>
+      <div style={{marginBottom:14, maxWidth:320}}>
+        <label>Account</label>
+        <select value={account} onChange={e=>setAccount(e.target.value)} style={{width:'100%'}}>
+          {ACCOUNT_LIST.map(a=><option key={a} value={a}>{a}</option>)}
+        </select>
+      </div>
+      {rows.length===0? <div className="empty">මේ account එකට entries නැහැ.</div> :
+      <div style={{overflowX:'auto', maxHeight:520, overflowY:'auto'}}>
+        <table>
+          <thead><tr><th>Date</th><th>Doc No</th><th>Particulars</th><th className="num">Debit</th><th className="num">Credit</th><th className="num">Balance</th></tr></thead>
+          <tbody>
+            {rows.map((r,i)=>(<tr key={i}><td className="mono">{r.date}</td><td>{r.docNo}</td><td>{r.desc}</td><td className="num">{r.dr? fmt(r.dr):''}</td><td className="num">{r.cr? fmt(r.cr):''}</td><td className="num" style={{color:'var(--brass)'}}>{fmt(r.running)}</td></tr>))}
+          </tbody>
+        </table>
+      </div>}
+    </div>
+  );
+}
+
+/* ============== Trial Balance ============== */
+function TrialBalanceView({entries}){
+  const [asAt,setAsAt]=useState(todayISO());
+  const t = totalsUpTo(entries, endOfDayMs(asAt));
+  const rows = ACCOUNT_LIST.map(a=>({account:a, dr:(t[a]&&t[a].dr)||0, cr:(t[a]&&t[a].cr)||0}));
+  const totalDr = rows.reduce((s,r)=>s+r.dr,0), totalCr = rows.reduce((s,r)=>s+r.cr,0);
+  return (
+    <div className="card">
+      <h3>⚖️ Trial Balance</h3>
+      <div style={{maxWidth:220, marginBottom:14}}><label>As at</label><input type="date" value={asAt} onChange={e=>setAsAt(e.target.value)} style={{width:'100%'}}/></div>
+      <table>
+        <thead><tr><th>Account</th><th className="num">Debit</th><th className="num">Credit</th></tr></thead>
+        <tbody>
+          {rows.map(r=>(<tr key={r.account}><td>{r.account}</td><td className="num">{r.dr? fmt(r.dr):''}</td><td className="num">{r.cr? fmt(r.cr):''}</td></tr>))}
+          <tr className="total-row"><td>TOTAL</td><td className="num">{fmt(totalDr)}</td><td className="num">{fmt(totalCr)}</td></tr>
+        </tbody>
+      </table>
+      <p style={{fontSize:12, color: Math.abs(totalDr-totalCr)<1?'var(--accent-2)':'var(--red)', marginTop:10}}>
+        {Math.abs(totalDr-totalCr)<1? '✓ Debit සහ Credit balance වෙනවා — ledger integrity ok.' : '⚠ Debit/Credit mismatch — manual entries check කරන්න.'}
+      </p>
+    </div>
+  );
+}
+
+/* ============== P&L ============== */
+function PLView({entries}){
+  const [from,setFrom]=useState(todayISO().slice(0,8)+'01'); const [to,setTo]=useState(todayISO());
+  const t = totalsInRange(entries, startOfDayMs(from), endOfDayMs(to));
+  const sales=(t[ACCOUNTS.SALES]&&t[ACCOUNTS.SALES].cr)||0;
+  const othInc=(t[ACCOUNTS.OTHINC]&&t[ACCOUNTS.OTHINC].cr)||0;
+  const disc=(t[ACCOUNTS.DISC]&&t[ACCOUNTS.DISC].dr)||0;
+  const cogs=(t[ACCOUNTS.COGS]&&t[ACCOUNTS.COGS].dr)||0;
+  const exp=(t[ACCOUNTS.EXP]&&t[ACCOUNTS.EXP].dr)||0;
+  const loss=(t[ACCOUNTS.LOSS]&&t[ACCOUNTS.LOSS].dr)||0;
+  const gross = sales - disc - cogs;
+  const net = gross + othInc - exp - loss;
+  const Row = ({label,value,bold,indent})=>(
+    <div className="rowline" style={{fontWeight:bold?700:400, paddingLeft:indent?14:0, color:bold?'var(--brass)':'var(--ink)'}}>
+      <span>{label}</span><span className="mono">{fmt(value)}</span>
+    </div>
+  );
+  return (
+    <div className="card">
+      <h3>📈 Profit &amp; Loss Statement</h3>
+      <div className="grid g2" style={{marginBottom:14, maxWidth:460}}>
+        <div><label>From</label><input type="date" value={from} onChange={e=>setFrom(e.target.value)} style={{width:'100%'}}/></div>
+        <div><label>To</label><input type="date" value={to} onChange={e=>setTo(e.target.value)} style={{width:'100%'}}/></div>
+      </div>
+      <Row label="Sales Revenue" value={sales} indent/>
+      <Row label="Less: Discount Allowed" value={-disc} indent/>
+      <Row label="Less: Cost of Goods Sold" value={-cogs} indent/>
+      <Row label="Gross Profit" value={gross} bold/>
+      <Row label="Add: Other Income" value={othInc} indent/>
+      <Row label="Less: Operating Expenses" value={-exp} indent/>
+      <Row label="Less: Stock Loss / Write-off" value={-loss} indent/>
+      <Row label="NET PROFIT" value={net} bold/>
+    </div>
+  );
+}
+
+/* ============== Balance Sheet ============== */
+function BalanceSheetView({entries, batches, customers, grns}){
+  const [asAt,setAsAt]=useState(todayISO());
+  const t = totalsUpTo(entries, endOfDayMs(asAt));
+  const cash=bal(ACCOUNTS.CASH,t), ar=bal(ACCOUNTS.AR,t), inv=bal(ACCOUNTS.INV,t);
+  const ap=balCr(ACCOUNTS.AP,t), equity=balCr(ACCOUNTS.EQUITY,t);
+  const retained = ((t[ACCOUNTS.SALES]&&t[ACCOUNTS.SALES].cr)||0)+((t[ACCOUNTS.OTHINC]&&t[ACCOUNTS.OTHINC].cr)||0)
+    -((t[ACCOUNTS.DISC]&&t[ACCOUNTS.DISC].dr)||0)-((t[ACCOUNTS.COGS]&&t[ACCOUNTS.COGS].dr)||0)
+    -((t[ACCOUNTS.EXP]&&t[ACCOUNTS.EXP].dr)||0)-((t[ACCOUNTS.LOSS]&&t[ACCOUNTS.LOSS].dr)||0);
+  const totalAssets = cash+ar+inv;
+  const totalLiabEq = ap+equity+retained;
+  const diff = totalAssets-totalLiabEq;
+  const Row=({label,value,bold})=>(<div className="rowline" style={{fontWeight:bold?700:400, color:bold?'var(--brass)':'var(--ink)'}}><span>{label}</span><span className="mono">{fmt(value)}</span></div>);
+  return (
+    <div className="card">
+      <h3>🧾 Balance Sheet</h3>
+      <div style={{maxWidth:220, marginBottom:14}}><label>As at</label><input type="date" value={asAt} onChange={e=>setAsAt(e.target.value)} style={{width:'100%'}}/></div>
+      <div className="grid g2">
+        <div>
+          <div style={{fontSize:12, color:'var(--accent)', fontWeight:700, marginBottom:6}}>ASSETS</div>
+          <Row label="Cash & Bank" value={cash}/>
+          <Row label="Accounts Receivable" value={ar}/>
+          <Row label="Inventory" value={inv}/>
+          <Row label="Total Assets" value={totalAssets} bold/>
+        </div>
+        <div>
+          <div style={{fontSize:12, color:'var(--accent)', fontWeight:700, marginBottom:6}}>LIABILITIES &amp; EQUITY</div>
+          <Row label="Accounts Payable" value={ap}/>
+          <Row label="Owner's Equity (opening)" value={equity}/>
+          <Row label="Retained Earnings" value={retained}/>
+          <Row label="Total Liabilities + Equity" value={totalLiabEq} bold/>
+        </div>
+      </div>
+      <p style={{fontSize:12.5, marginTop:16, color: Math.abs(diff)<1?'var(--accent-2)':'var(--red)'}}>
+        {Math.abs(diff)<1? '✓ Assets = Liabilities + Equity — balanced.' : '⚠ Difference of '+fmt(diff)+' — check opening balance entries (Manual tab) or old invoices missing cost data.'}
+      </p>
+    </div>
+  );
+}
+
+/* ============== Audit Trail ============== */
+function AuditTrailView({entries}){
+  const [type,setType]=useState('all'); const [q,setQ]=useState('');
+  const [from,setFrom]=useState(''); const [to,setTo]=useState('');
+  const [openId,setOpenId]=useState(null);
+  const TYPES = [['all','සියල්ල'],['sale','Sale'],['cogs','COGS'],['purchase','Purchase'],['expense','Expense'],['loss','Loss'],['receipt','Receipt'],['manual','Manual']];
+  const ICON = {sale:'💰',cogs:'📦',purchase:'🚚',expense:'💸',loss:'🗑',receipt:'🧾',manual:'✍️'};
+  const rows = useMemo(()=>{
+    return entries.filter(e=>{
+      if(type!=='all' && e.type!==type) return false;
+      const d=dOf(e.ms);
+      if(from && d<from) return false; if(to && d>to) return false;
+      if(q && !(e.desc+' '+e.docNo).toLowerCase().includes(q.toLowerCase())) return false;
+      return true;
+    }).slice().reverse();
+  },[entries,type,q,from,to]);
+  const exportCsv = ()=> downloadCSV('audit-trail.csv', [['Date','Type','Doc No','Description','Staff','Amount'], ...rows.map(r=>[dOf(r.ms), r.type, r.docNo, r.desc, r.staff, r.lines.reduce((s,l)=>s+(l.dr||0),0).toFixed(2)])]);
+  return (
+    <div className="card">
+      <h3>🔎 Audit Trail</h3>
+      <div className="grid g4" style={{marginBottom:14}}>
+        <div><label>Type</label><select value={type} onChange={e=>setType(e.target.value)} style={{width:'100%'}}>{TYPES.map(([v,l])=><option key={v} value={v}>{l}</option>)}</select></div>
+        <div><label>Search</label><input value={q} onChange={e=>setQ(e.target.value)} placeholder="doc no / description" style={{width:'100%'}}/></div>
+        <div><label>From</label><input type="date" value={from} onChange={e=>setFrom(e.target.value)} style={{width:'100%'}}/></div>
+        <div><label>To</label><input type="date" value={to} onChange={e=>setTo(e.target.value)} style={{width:'100%'}}/></div>
+      </div>
+      <button className="btn btn-ghost" onClick={exportCsv} style={{marginBottom:12}}>⬇ Export CSV</button>
+      {rows.length===0? <div className="empty">Records නැහැ.</div> :
+      <div style={{maxHeight:560, overflowY:'auto'}}>
+        {rows.map(r=>{
+          const amt = r.lines.reduce((s,l)=>s+(l.dr||0),0);
+          const open = openId===r.id;
+          return (
+            <div key={r.id} style={{borderBottom:'1px solid var(--line)'}}>
+              <div className="expandRow" onClick={()=>setOpenId(open?null:r.id)} style={{display:'flex', alignItems:'center', gap:12, padding:'10px 4px'}}>
+                <span className={"stamp "+r.type}>{ICON[r.type]||'•'}</span>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:13, fontWeight:600}}>{r.desc}</div>
+                  <div style={{fontSize:11, color:'var(--ink-soft)'}}>{dOf(r.ms)} · {r.docNo}{r.staff? (' · '+r.staff):''}</div>
+                </div>
+                <div className="mono" style={{fontWeight:700}}>{fmt(amt)}</div>
+                <span className="tag">{r.type}</span>
+              </div>
+              {open && <div className="subrows" style={{padding:'4px 4px 10px 46px'}}>
+                {r.lines.map((l,i)=>(<div key={i} style={{fontSize:12, display:'flex', justifyContent:'space-between', maxWidth:420}}>
+                  <span>{l.dr? 'Dr':'Cr'} — {l.account}</span><span className="mono">{fmt(l.dr||l.cr)}</span>
+                </div>))}
+                <div style={{fontSize:10.5, color:'var(--ink-soft)', marginTop:6}}>Source: {r.source.collection} / {r.source.id}</div>
+              </div>}
+            </div>
+          );
+        })}
+      </div>}
+    </div>
+  );
+}
+
+/* ============== Manual Entries (Opening Balances / Adjustments) ============== */
+function ManualEntries({manual, user, notify}){
+  const [date,setDate]=useState(todayISO()); const [drAccount,setDrAccount]=useState(ACCOUNTS.CASH);
+  const [crAccount,setCrAccount]=useState(ACCOUNTS.EQUITY); const [amount,setAmount]=useState('');
+  const [note,setNote]=useState(''); const [saving,setSaving]=useState(false);
+  const save = async ()=>{
+    if(!amount || Number(amount)<=0) return notify('Amount එකක් දෙන්න');
+    if(drAccount===crAccount) return notify('Debit සහ Credit accounts වෙනස් වෙන්න ඕන');
+    setSaving(true);
+    try{
+      await db.collection('acctManual').add({
+        date, drAccount, crAccount, amount:Number(amount), note,
+        createdBy: user? (user.email||user.name):'', createdAtMs: Date.now(),
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+      notify('✓ Journal voucher එක save කළා');
+      setAmount(''); setNote('');
+    } finally{ setSaving(false); }
+  };
+  const del = async (id)=>{
+    if(!confirm('මේ manual entry එක delete කරනවද?')) return;
+    await db.collection('acctManual').doc(id).delete();
+  };
+  return (
+    <div>
+      <div className="card">
+        <h3>✍️ Manual Journal Voucher — Opening Balances / Adjustments</h3>
+        <p style={{fontSize:12.5, color:'var(--ink-soft)', marginTop:-6}}>Business එක accounts module එකට move කරද්දී opening balances (e.g. Owner's Equity, opening Cash) මෙතනින් දාන්න. මේවා pharmacy POS එකේ operational data එකට කිසි බලපෑමක් කරන්නේ නෑ — accounts collection එකකටම save වෙනවා.</p>
+        <div className="grid g4">
+          <div><label>Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} style={{width:'100%'}}/></div>
+          <div><label>Debit Account</label><select value={drAccount} onChange={e=>setDrAccount(e.target.value)} style={{width:'100%'}}>{ACCOUNT_LIST.map(a=><option key={a}>{a}</option>)}</select></div>
+          <div><label>Credit Account</label><select value={crAccount} onChange={e=>setCrAccount(e.target.value)} style={{width:'100%'}}>{ACCOUNT_LIST.map(a=><option key={a}>{a}</option>)}</select></div>
+          <div><label>Amount (Rs.)</label><input type="number" value={amount} onChange={e=>setAmount(e.target.value)} style={{width:'100%'}}/></div>
+        </div>
+        <div style={{marginTop:12}}><label>Note</label><input value={note} onChange={e=>setNote(e.target.value)} placeholder="e.g. Opening owner's equity" style={{width:'100%'}}/></div>
+        <button className="btn btn-brass" style={{marginTop:14}} onClick={save} disabled={saving}>{saving?'Saving...':'+ Save Voucher'}</button>
+      </div>
+      <div className="card">
+        <h3>Manual Vouchers History</h3>
+        {manual.length===0? <div className="empty">තවම manual entries නැහැ.</div> :
+        <table>
+          <thead><tr><th>Date</th><th>Dr</th><th>Cr</th><th className="num">Amount</th><th>Note</th><th></th></tr></thead>
+          <tbody>
+            {manual.slice().sort((a,b)=>(b.date||'').localeCompare(a.date||'')).map(m=>(
+              <tr key={m.id}><td className="mono">{m.date}</td><td>{m.drAccount}</td><td>{m.crAccount}</td><td className="num">{fmt(m.amount)}</td><td>{m.note}</td>
+                <td><button className="btn btn-ghost" style={{padding:'4px 10px', fontSize:11}} onClick={()=>del(m.id)}>🗑</button></td></tr>
+            ))}
+          </tbody>
+        </table>}
+      </div>
+    </div>
+  );
+}
+
+/* ============== Reports ============== */
+function ReportsView({entries, invoices, batches, customers, grns}){
+  const [from,setFrom]=useState(todayISO().slice(0,8)+'01'); const [to,setTo]=useState(todayISO());
+  const periodInv = invoices.filter(inv=>{ const d=dOf(tsMillis(inv)); return d>=from && d<=to; });
+  const itemAgg = {};
+  periodInv.forEach(inv=>(inv.items||[]).forEach(it=>{
+    if(!itemAgg[it.brandName]) itemAgg[it.brandName]={qty:0, revenue:0};
+    itemAgg[it.brandName].qty += it.qty||0;
+    itemAgg[it.brandName].revenue += it.lineTotal||0;
+  }));
+  const topItems = Object.entries(itemAgg).map(([name,v])=>({name,...v})).sort((a,b)=>b.revenue-a.revenue).slice(0,10);
+  const debtors = customers.filter(c=>(c.dueAmount||0)>0).sort((a,b)=>(b.dueAmount||0)-(a.dueAmount||0));
+  const payables = (grns||[]).filter(g=>!g.paid).sort((a,b)=>(b.totalAmount||0)-(a.totalAmount||0));
+  const expiring = batches.filter(b=>(b.remainingUnits||0)>0 && b.expiryDate && daysFromToday(b.expiryDate)<=60).sort((a,b)=>(a.expiryDate||'').localeCompare(b.expiryDate||''));
+  const maxRev = Math.max(1, ...topItems.map(i=>i.revenue));
+  return (
+    <div>
+      <div className="card">
+        <h3>📊 Sales Analysis</h3>
+        <div className="grid g2" style={{marginBottom:14, maxWidth:460}}>
+          <div><label>From</label><input type="date" value={from} onChange={e=>setFrom(e.target.value)} style={{width:'100%'}}/></div>
+          <div><label>To</label><input type="date" value={to} onChange={e=>setTo(e.target.value)} style={{width:'100%'}}/></div>
+        </div>
+        {topItems.length===0? <div className="empty">Data නැහැ.</div> :
+        topItems.map(it=>(
+          <div key={it.name} style={{marginBottom:10}}>
+            <div style={{display:'flex', justifyContent:'space-between', fontSize:12.5, marginBottom:3}}>
+              <span>{it.name} <span style={{color:'var(--ink-soft)'}}>× {it.qty}</span></span>
+              <span className="mono">{fmt(it.revenue)}</span>
+            </div>
+            <div style={{background:'var(--card2)', borderRadius:6, height:8}}>
+              <div style={{background:'var(--brass)', height:8, borderRadius:6, width:(100*it.revenue/maxRev)+'%'}}></div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="grid g2">
+        <div className="card">
+          <h3>👥 Debtors (Customer Dues)</h3>
+          {debtors.length===0? <div className="empty">Dues නැහැ.</div> :
+          <table><thead><tr><th>Customer</th><th className="num">Due</th></tr></thead><tbody>
+            {debtors.map(c=>(<tr key={c.id}><td>{c.name}</td><td className="num">{fmt(c.dueAmount)}</td></tr>))}
+          </tbody></table>}
+        </div>
+        <div className="card">
+          <h3>🚚 Payables (Unpaid GRNs)</h3>
+          {payables.length===0? <div className="empty">Unpaid GRN නැහැ.</div> :
+          <table><thead><tr><th>Supplier</th><th>GRN No</th><th className="num">Amount</th></tr></thead><tbody>
+            {payables.map(g=>(<tr key={g.id}><td>{g.supplierName}</td><td>{g.grnNo}</td><td className="num">{fmt(g.totalAmount)}</td></tr>))}
+          </tbody></table>}
+        </div>
+      </div>
+
+      <div className="card">
+        <h3>⏳ Expiring Stock (≤ 60 days)</h3>
+        {expiring.length===0? <div className="empty">Expiring stock නැහැ.</div> :
+        <table><thead><tr><th>Item</th><th>Batch</th><th>Expiry</th><th className="num">Qty</th><th className="num">Value</th></tr></thead><tbody>
+          {expiring.map(b=>(<tr key={b.id}><td>{b.brandName}</td><td>{b.batchCode}</td>
+            <td style={{color: daysFromToday(b.expiryDate)<0?'var(--red)':'var(--ink)'}}>{b.expiryDate} ({daysFromToday(b.expiryDate)}d)</td>
+            <td className="num">{b.remainingUnits}</td><td className="num">{fmt((b.remainingUnits||0)*(b.unitCost||0))}</td></tr>))}
+        </tbody></table>}
+      </div>
+    </div>
+  );
+}
+
+/* ============== App ============== */
+function App(){
+  const [user,setUser]=useState(null); const [authChecked,setAuthChecked]=useState(false);
+  const [tab,setTab]=useState('dashboard'); const [toast,setToast]=useState(null);
+  const notify = (msg)=>{ setToast(msg); setTimeout(()=>setToast(null), 3200); };
+
+  useEffect(()=>{
+    const unsub = firebase.auth().onAuthStateChanged(fbUser=>{
+      if(fbUser){
+        const nm = fbUser.email? fbUser.email.split('@')[0].replace(/[._]/g,' ') : 'Staff';
+        setUser({name: nm.charAt(0).toUpperCase()+nm.slice(1), email: fbUser.email});
+      } else setUser(null);
+      setAuthChecked(true);
+    });
+    return unsub;
+  },[]);
+
+  const [items] = useCollection('items');
+  const [batches] = useCollection('batches');
+  const [customers] = useCollection('customers');
+  const [suppliers] = useCollection('suppliers');
+  const [invoices] = useCollection('invoices');
+  const [grns] = useCollection('grns');
+  const [expenses] = useCollection('expenses');
+  const [journal] = useCollection('journal');
+  const [payments] = useCollection('payments');
+  const [manual] = useCollection('acctManual');
+
+  const entries = useMemo(()=>buildEntries({invoices,grns,expenses,journal,payments,manual,batches}),
+    [invoices,grns,expenses,journal,payments,manual,batches]);
+
+  if(!fbReady) return <div style={{padding:40}}>Firebase init failed.</div>;
+  if(!authChecked) return <div style={{padding:40, color:'#fff'}}>Loading...</div>;
+  if(!user) return <Login/>;
+
+  const NAV = [
+    ['dashboard','📊','Dashboard'],
+    ['journal','📘','Journal'],
+    ['ledger','📒','Ledger'],
+    ['trial','⚖️','Trial Balance'],
+    ['pl','📈','P&L'],
+    ['bs','🧾','Balance Sheet'],
+    ['audit','🔎','Audit Trail'],
+    ['reports','📋','Reports'],
+    ['manual','✍️','Manual Entries'],
+  ];
+  const TITLES = {dashboard:'Dashboard', journal:'General Journal', ledger:'Account Ledger', trial:'Trial Balance', pl:'Profit & Loss', bs:'Balance Sheet', audit:'Audit Trail', reports:'Reports & Analysis', manual:'Manual Journal Vouchers'};
+
+  return (
+    <div className="app">
+      <div className="side">
+        <div className="brand">📒 Sesanda Accounts</div>
+        <div className="sub">Ledger &amp; Audit</div>
+        {NAV.map(([id,icon,label])=>(
+          <button key={id} className={"navbtn "+(tab===id?'active':'')} onClick={()=>setTab(id)}>
+            <span>{icon}</span><span>{label}</span>
+          </button>
+        ))}
+        <div style={{flex:1}}></div>
+        <div style={{fontSize:11, color:'#9fb0d8', padding:'10px 12px'}}>
+          Data feeds live from the Sesanda Pharmacy POS.
+        </div>
+        <button className="navbtn" onClick={()=>firebase.auth().signOut()}>↩ Sign out</button>
+      </div>
+      <div className="main">
+        <div className="topbar">
+          <h1>{TITLES[tab]}</h1>
+          <div className="userchip">👤 {user.name}</div>
+        </div>
+        {tab==='dashboard' && <Dashboard entries={entries} batches={batches} customers={customers} grns={grns}/>}
+        {tab==='journal' && <JournalView entries={entries}/>}
+        {tab==='ledger' && <LedgerView entries={entries}/>}
+        {tab==='trial' && <TrialBalanceView entries={entries}/>}
+        {tab==='pl' && <PLView entries={entries}/>}
+        {tab==='bs' && <BalanceSheetView entries={entries} batches={batches} customers={customers} grns={grns}/>}
+        {tab==='audit' && <AuditTrailView entries={entries}/>}
+        {tab==='reports' && <ReportsView entries={entries} invoices={invoices} batches={batches} customers={customers} grns={grns}/>}
+        {tab==='manual' && <ManualEntries manual={manual} user={user} notify={notify}/>}
+      </div>
+      {toast && <div className="toast">{toast}</div>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
