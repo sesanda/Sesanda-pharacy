@@ -11,3 +11,6 @@ with `playwright-core`, `react@18.2.0`, `react-dom@18.2.0` and `@babel/standalon
     TEST_DEPS=/tmp/sesanda-test-deps/node_modules CHROMIUM=/path/to/chrome node --test --test-concurrency=4 tests/*.test.mjs
 
 Without TEST_DEPS the browser tests are skipped.
+
+`scripts/reconcile-customer-balances.js` (read-only balance check, run in the browser console while signed in)
+is covered by `tests/reconcile-script.test.mjs`, which also fails if its balance helpers drift from index.html.
