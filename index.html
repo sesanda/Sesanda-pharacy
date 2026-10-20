@@ -598,20 +598,40 @@ function batchPrefix(n){
 const pad5 = n => String(n).padStart(5,'0');
 
 /* ---------------- Firestore hooks (real-time) ---------------- */
+// Auth-aware: StaffApp mounts these listeners BEFORE the staff member signs in. Collections that
+// require auth (customers, payments, glJournals, ...) fail with permission-denied at that point,
+// and Firestore permanently closes a listener after an error — so previously the Customers list
+// and balances stayed empty after login until a full page reload. We now (re)subscribe whenever
+// the signed-in user changes, and expose the last error so screens can show it.
+function useAuthUid(){
+  const [uid,setUid] = useState(()=> (window.firebase && firebase.apps && firebase.apps.length && firebase.auth().currentUser) ? firebase.auth().currentUser.uid : null);
+  useEffect(()=>{
+    if(!(window.firebase && firebase.apps && firebase.apps.length)) return;
+    return firebase.auth().onAuthStateChanged(u=> setUid(u ? u.uid : null));
+  },[]);
+  return uid;
+}
 function useCollection(name, orderField){
   const [data,setData] = useState([]);
   const [loading,setLoading] = useState(true);
+  const [error,setError] = useState(null);
+  const authUid = useAuthUid();
   useEffect(()=>{
     if(!db) return;
+    setLoading(true); setError(null);
     let q = db.collection(name);
     const unsub = q.onSnapshot(snap=>{
       let rows = snap.docs.map(d=>({id:d.id,...d.data()}));
       if(orderField) rows.sort((a,b)=> (a[orderField]>b[orderField]?1:-1));
-      setData(rows); setLoading(false);
-    }, err=>{ console.error(name, err); setLoading(false); });
+      setData(rows); setLoading(false); setError(null);
+    }, err=>{
+      console.error(name, err);
+      if(err && err.code==='permission-denied') setData([]); // never keep showing data the current user may not read
+      setError(err); setLoading(false);
+    });
     return unsub;
-  },[name]);
-  return [data, loading];
+  },[name, authUid]);
+  return [data, loading, error];
 }
 
 async function nextItemNumber(){
@@ -3681,11 +3701,11 @@ function StaffApp({onExit}){
   const [items] = useCollection('items');
   const [batches] = useCollection('batches');
   const [suppliers] = useCollection('suppliers');
-  const [customers] = useCollection('customers');
+  const [customers, customersLoading, customersError] = useCollection('customers');
   const [orders] = useCollection('orders');
   const [grns] = useCollection('grns');
   const [specialOrders] = useCollection('specialOrders');
-  const [invoices] = useCollection('invoices');
+  const [invoices, invoicesLoading, invoicesError] = useCollection('invoices');
   const [journal] = useCollection('journal');
   const [expenses] = useCollection('expenses');
   const [adjustments] = useCollection('adjustments');
@@ -3817,7 +3837,7 @@ function StaffApp({onExit}){
           <span className="conn-pill"><span className="dot"></span>Live</span>
         </div>
         <div className="content">
-          {tab==='dashboard' && <Dashboard items={items} batches={batches} orders={orders} suppliers={suppliers} customers={customers} grns={grns} medReminders={medReminders} notify={notify} purchaseOrders={purchaseOrders} glAccounts={glAccounts} glJournals={glJournals}/>}
+          {tab==='dashboard' && <Dashboard items={items} batches={batches} orders={orders} suppliers={suppliers} customers={customers} invoices={invoices} grns={grns} medReminders={medReminders} notify={notify} purchaseOrders={purchaseOrders} glAccounts={glAccounts} glJournals={glJournals}/>}
           {tab==='billing' && (
             <div>
               <DraftTabBar drafts={billDrafts} activeId={activeBillDraftId} label={billDraftLabel}
@@ -3845,7 +3865,7 @@ function StaffApp({onExit}){
           {tab==='opening' && <OpeningStock items={items} batches={batches} notify={notify}/>}
           {tab==='stock' && <StockView items={items} batches={batches}/>}
           {tab==='suppliers' && <Suppliers suppliers={suppliers} notify={notify}/>}
-          {tab==='customers' && <Customers customers={customers} invoices={invoices} items={items} medReminders={medReminders} notify={notify} glAccounts={glAccounts} glJournals={glJournals}/>}
+          {tab==='customers' && <Customers customers={customers} invoices={invoices} items={items} medReminders={medReminders} notify={notify} glAccounts={glAccounts} glJournals={glJournals} customersLoading={customersLoading} customersError={customersError} invoicesError={invoicesError}/>}
           {tab==='orders' && <OrdersBoard orders={orders} items={items} batches={batches} notify={notify}/>}
           {tab==='special' && <StaffSpecialOrders specialOrders={specialOrders} notify={notify}
             onConvertToInvoice={(s)=>{ setBillPrefill({customerName:s.customerName, customerTel:s.customerTel, sourceSpecialOrderId:s.id}); setTab('billing'); }} />}
@@ -3933,7 +3953,7 @@ function DraftTabBar({drafts, activeId, label, onSwitch, onNew, onClose, icon}){
   );
 }
 
-function Dashboard({items,batches,orders,suppliers,customers,grns,medReminders,notify,purchaseOrders,glAccounts,glJournals}){
+function Dashboard({items,batches,orders,suppliers,customers,invoices,grns,medReminders,notify,purchaseOrders,glAccounts,glJournals}){
   const [supPayAmounts,setSupPayAmounts] = useState({});
   const [supPayMethods,setSupPayMethods] = useState({});
   const [supPaying,setSupPaying] = useState(null);
@@ -3944,7 +3964,7 @@ function Dashboard({items,batches,orders,suppliers,customers,grns,medReminders,n
     return rem>0 && rem<=20;
   }).length;
   const pending = orders.filter(o=>o.status==='ordered').length;
-  const totalDue = customers.reduce((s,c)=>s+(c.dueAmount||0),0);
+  const totalDue = computeCustomerOutstanding(customers, invoices).total; // same figure as Customers tab
   const poList = purchaseOrders || [];
   const poPending = poList.filter(p=>p.status==='Draft' || p.status==='Sent').length;
   const poPartial = poList.filter(p=>p.status==='Partially Received').length;
@@ -4629,16 +4649,61 @@ function CashControl({invoices, payments, cashChecks, notify}){
 }
 
 function invoiceBalanceInfo(inv){
-  const total = inv.totalToPay||0;
-  const paidAmt = inv.paidAmount!=null ? inv.paidAmount : (inv.payment!=='credit' || inv.paid ? total : 0);
+  const total = Number(inv.totalToPay)||0;
+  const paidAmt = inv.paidAmount!=null ? (Number(inv.paidAmount)||0) : (inv.payment!=='credit' || inv.paid ? total : 0);
   const balance = Math.max(0, total - paidAmt);
-  const isPaid = inv.payment!=='credit' ? true : (inv.paid || balance<=0);
-  return {total, paidAmt, balance, isPaid};
+  // A cash/card bill that was only partly paid (paidAmount < total) carries a real balance that
+  // billing added to the customer's due — it must not be reported as PAID.
+  const isPaid = inv.payment!=='credit' ? balance<=0.001 : (inv.paid || balance<=0.001);
+  return {total, paidAmt, balance: isPaid ? 0 : balance, isPaid};
 }
 
-function Customers({customers, invoices, items, medReminders, notify, glAccounts, glJournals}){
+// Customer outstanding, recomputed from the invoice records themselves (read-only — nothing is
+// written back). Each invoice is counted once (keyed by invoice id, so a duplicated array entry
+// can't double count). Invoice balances already reflect payments (paidAmount), sales returns
+// (applySalesReturnToInvoice lowers totalToPay/paidAmount) and deleted invoices (removed docs).
+// The stored customers.dueAmount running total is kept alongside for reconciliation only.
+function computeCustomerOutstanding(customers, invoices){
+  const byCustomer = {};
+  const unlinked = []; // invoices with a balance but no matching customer record
+  const seen = new Set();
+  const custIds = new Set((customers||[]).map(c=>c.id));
+  (invoices||[]).forEach(inv=>{
+    if(!inv || !inv.id || seen.has(inv.id)) return;
+    seen.add(inv.id);
+    const info = invoiceBalanceInfo(inv);
+    if(info.balance<=0.001) return;
+    if(!inv.customerId || !custIds.has(inv.customerId)){ unlinked.push({inv, ...info}); return; }
+    const row = byCustomer[inv.customerId] || (byCustomer[inv.customerId] = {outstanding:0, openBills:0});
+    row.outstanding += info.balance; row.openBills += 1;
+  });
+  const result = {};
+  (customers||[]).forEach(c=>{
+    const r = byCustomer[c.id] || {outstanding:0, openBills:0};
+    const outstanding = Math.round(r.outstanding*100)/100;
+    const storedDue = Math.round((Number(c.dueAmount)||0)*100)/100;
+    result[c.id] = { outstanding, openBills:r.openBills, storedDue, mismatch: Math.abs(outstanding-storedDue)>0.009 };
+  });
+  const total = Math.round(Object.values(result).reduce((s,r)=>s+r.outstanding,0)*100)/100;
+  const storedTotal = Math.round(Object.values(result).reduce((s,r)=>s+r.storedDue,0)*100)/100;
+  return { byId: result, total, storedTotal, unlinked, mismatchCount: Object.values(result).filter(r=>r.mismatch).length };
+}
+
+// Null-safe customer search over name / tel / code (records missing a field are never dropped or crash the list).
+function customerMatchesQuery(c, query){
+  const q = String(query||'').trim().toLowerCase();
+  if(!q) return true;
+  const qDigits = q.replace(/[^0-9]/g,'');
+  const name = String(c.name||'').toLowerCase();
+  const code = String(c.code||'').toLowerCase();
+  const tel = String(c.tel||'');
+  return name.includes(q) || code.includes(q) || tel.includes(q) || (qDigits.length>=3 && tel.replace(/[^0-9]/g,'').includes(qDigits));
+}
+
+function Customers({customers, invoices, items, medReminders, notify, glAccounts, glJournals, customersLoading, customersError, invoicesError}){
   const [f,setF] = useState({name:'',code:'',tel:'',idNo:'',address:'',category:'NC'});
   const [showDebtorsOnly,setShowDebtorsOnly] = useState(false);
+  const [custSearch,setCustSearch] = useState('');
   const [payAmounts,setPayAmounts] = useState({});
   const [payMethods,setPayMethods] = useState({}); // per-customer: 'cash' | 'card'
   const [selectedBills,setSelectedBills] = useState({}); // per-customer: {invId: true}
@@ -4677,8 +4742,9 @@ function Customers({customers, invoices, items, medReminders, notify, glAccounts
   };
   const deleteCustomer = async (c)=>{
     const hasHistory = (invoices||[]).some(inv=>inv.customerId===c.id) || (medReminders||[]).some(m=>m.customerId===c.id);
-    const warning = (c.dueAmount||0)>0
-      ? `${c.name} ට තාම Due Rs.${(c.dueAmount||0).toFixed(2)} තියෙනවා. මේ customer ව delete කරන්නද?`
+    const dueNow = Math.max(Number(c.dueAmount)||0, (computeCustomerOutstanding([c], invoices).byId[c.id]||{}).outstanding||0);
+    const warning = dueNow>0
+      ? `${c.name} ට තාම Due Rs.${dueNow.toFixed(2)} තියෙනවා. මේ customer ව delete කරන්නද?`
       : hasHistory
         ? `${c.name} ගේ bills/medication history තියෙනවා (ඒවා delete වෙන්නේ නැහැ, customer record එක විතරයි ඉවත් වෙන්නේ). ඉවත් කරන්නද?`
         : `${c.name} ව delete කරන්නද? මේක undo කරන්න බෑ.`;
@@ -4692,8 +4758,10 @@ function Customers({customers, invoices, items, medReminders, notify, glAccounts
     }
   };
 
-  // per-bill credit ledger for one customer — oldest bill first
-  const ledgerFor = (c)=> (invoices||[]).filter(inv=> inv.customerId===c.id && inv.payment==='credit')
+  // per-bill credit ledger for one customer — oldest bill first. Includes credit bills AND
+  // partly-paid cash/card bills (their unpaid balance was added to the customer's due at billing,
+  // so it must be visible and payable here too).
+  const ledgerFor = (c)=> (invoices||[]).filter(inv=> inv.customerId===c.id && (inv.payment==='credit' || invoiceBalanceInfo(inv).balance>0.001))
     .slice().sort((a,b)=>(a.createdAtMs||0)-(b.createdAtMs||0))
     .map(inv=>({inv, ...invoiceBalanceInfo(inv)}));
 
@@ -4816,9 +4884,13 @@ function Customers({customers, invoices, items, medReminders, notify, glAccounts
     }
   };
 
-  const debtors = customers.filter(c=>(c.dueAmount||0)>0);
-  const totalDue = debtors.reduce((s,c)=>s+(c.dueAmount||0),0);
-  const list = showDebtorsOnly ? debtors : customers;
+  const outstandingInfo = computeCustomerOutstanding(customers, invoices);
+  const balOf = (c)=> outstandingInfo.byId[c.id] || {outstanding:0, openBills:0, storedDue:Number(c.dueAmount)||0, mismatch:false};
+  // a customer counts as a debtor if EITHER the bills or the stored running total say they owe — nobody valid is hidden
+  const debtors = (customers||[]).filter(c=> balOf(c).outstanding>0.001 || balOf(c).storedDue>0.001);
+  const totalDue = outstandingInfo.total;
+  const searched = (showDebtorsOnly ? debtors : (customers||[])).filter(c=> customerMatchesQuery(c, custSearch));
+  const list = searched.slice().sort((a,b)=> String(a.name||'').localeCompare(String(b.name||'')));
 
   return (
     <div>
@@ -4844,14 +4916,25 @@ function Customers({customers, invoices, items, medReminders, notify, glAccounts
           <input type="checkbox" checked={showDebtorsOnly} onChange={e=>setShowDebtorsOnly(e.target.checked)} style={{width:'auto'}}/>
           Show only customers with due amount
         </label>
-        {list.length===0? <div className="empty">{showDebtorsOnly? 'Due ඇති customers නැහැ' : 'Customers නැහැ'}</div> :
+        <input data-testid="customer-search" value={custSearch} onChange={e=>setCustSearch(e.target.value)}
+          placeholder="🔍 Search name, tel or code..." style={{marginBottom:12}} autoComplete="off"/>
+        <div style={{fontSize:12, color:'var(--ink-soft)', marginBottom:10}}>
+          Showing {list.length} of {(customers||[]).length} customers
+          {outstandingInfo.mismatchCount>0 && <span style={{color:'#c9820a', marginLeft:8}}>⚠ {outstandingInfo.mismatchCount} stored due value(s) differ from bills (stored total {fmt(outstandingInfo.storedTotal)}) — needs review, not auto-corrected</span>}
+          {outstandingInfo.unlinked.length>0 && <span style={{color:'#c9820a', marginLeft:8}}>⚠ {outstandingInfo.unlinked.length} unpaid bill(s) not linked to a customer record</span>}
+        </div>
+        {customersError && <div className="empty" style={{color:'var(--red)'}}>❌ Customers load වුනේ නැහැ: {customersError.code || customersError.message || String(customersError)}</div>}
+        {invoicesError && <div className="empty" style={{color:'var(--red)'}}>❌ Bills load වුනේ නැහැ — outstanding amounts may be incomplete: {invoicesError.code || invoicesError.message || String(invoicesError)}</div>}
+        {customersLoading && !customersError && (customers||[]).length===0 ? <div className="empty">⏳ Customers loading...</div> :
+         customersError ? null :
+         list.length===0? <div className="empty">{custSearch.trim()? 'Search එකට ගැලපෙන customers නැහැ' : showDebtorsOnly? 'Due ඇති customers නැහැ' : 'Customers නැහැ'}</div> :
         list.map(c=>{
           const ledger = ledgerFor(c);
           const meds = medsFor(c);
           const isLedgerOpen = expandedId===c.id && expandedPanel==='ledger';
           const isMedOpen = expandedId===c.id && expandedPanel==='med';
           const mf = getMedForm(c);
-          const itemMatches = mf.itemQuery.length>0 ? items.filter(it=>it.brandName.toLowerCase().includes(mf.itemQuery.toLowerCase())).slice(0,8) : [];
+          const itemMatches = mf.itemQuery.length>0 ? items.filter(it=>String(it.brandName||'').toLowerCase().includes(mf.itemQuery.toLowerCase())).slice(0,8) : [];
           const dueRows = ledger.filter(row=>row.balance>0);
           const selCount = dueRows.filter(row=>isBillSelected(c,row.inv.id)).length;
           const selTotal = dueRows.filter(row=>isBillSelected(c,row.inv.id)).reduce((s,r)=>s+r.balance,0);
@@ -4881,11 +4964,16 @@ function Customers({customers, invoices, items, medReminders, notify, glAccounts
           <div key={c.id} style={{padding:'10px 4px', borderBottom:'1px solid var(--line)'}}>
             <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:10}}>
               <div>
-                <b>{c.name}</b> <span style={{fontSize:12, color:'var(--ink-soft)'}}>({c.tel})</span>
+                <b>{c.name || '(no name)'}</b> <span style={{fontSize:12, color:'var(--ink-soft)'}}>({c.tel || 'no tel'})</span>
+                {c.code && <span style={{fontSize:12, color:'var(--ink-soft)', marginLeft:4}}>#{c.code}</span>}
                 {c.category==='VIP' && <span className="tag" style={{background:'#8a5cf6', color:'#fff', fontWeight:700, marginLeft:6}}>VIP</span>}
-                <div style={{fontSize:12.5, marginTop:2, color:(c.dueAmount||0)>0?'var(--red)':'var(--green)', fontWeight:700}}>
-                  Total Due: {fmt(c.dueAmount||0)}
+                <div data-testid="customer-due" style={{fontSize:12.5, marginTop:2, color:balOf(c).outstanding>0.001?'var(--red)':'var(--green)', fontWeight:700}}>
+                  Total Due: {fmt(balOf(c).outstanding)}
+                  {balOf(c).openBills>0 && <span style={{fontWeight:400, color:'var(--ink-soft)', marginLeft:6}}>({balOf(c).openBills} open bill{balOf(c).openBills>1?'s':''})</span>}
                 </div>
+                {balOf(c).mismatch && (
+                  <div style={{fontSize:11.5, color:'#c9820a'}}>⚠ Stored due {fmt(balOf(c).storedDue)} ≠ bills {fmt(balOf(c).outstanding)} — review</div>
+                )}
               </div>
               <div style={{display:'flex', gap:6, alignItems:'center', flexWrap:'wrap'}}>
                 {ledger.length>0 && (
@@ -6379,9 +6467,7 @@ function NewBill({items, batches, customers, notify, staffUser, prefill, clearPr
   },[prefill]);
 
   const selectedCustomer = customers.find(c=>c.id===customerId);
-  const custMatches = custQuery.length>0 ? customers.filter(c=>
-      c.name.toLowerCase().includes(custQuery.toLowerCase()) || (c.tel||'').includes(custQuery)
-    ).slice(0,8) : [];
+  const custMatches = custQuery.length>0 ? customers.filter(c=> customerMatchesQuery(c, custQuery)).slice(0,8) : [];
 
   const batchFor = (itemId)=>{
     const bs = batches.filter(b=>b.itemId===itemId && b.remainingUnits>0).sort((a,b)=>(a.expiryDate||'')<(b.expiryDate||'')?-1:1);
