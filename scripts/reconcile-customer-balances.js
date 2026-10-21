@@ -11,7 +11,9 @@
 //   3. Paste this whole file and press Enter.
 // It prints a summary + tables and downloads reconcile-customer-balances-<date>.csv.
 //
-// The two balance helpers below are verbatim copies from index.html;
+// Or, without the console: Customers tab → "⬇ Download balance check" (same code, same CSV).
+//
+// The helper functions below are verbatim copies from index.html;
 // tests/reconcile-script.test.mjs fails if they ever drift apart.
 (function(){
 
@@ -51,15 +53,15 @@ function computeCustomerOutstanding(customers, invoices){
   return { byId: result, total, storedTotal, unlinked, mismatchCount: Object.values(result).filter(r=>r.mismatch).length };
 }
 
-const toMs = v => v && typeof v.toMillis==='function' ? v.toMillis() : (typeof v==='number' ? v : null);
-const day = ms => ms ? new Date(ms).toISOString().slice(0,10) : '';
+function reconcileToMs(v){ return v && typeof v.toMillis==='function' ? v.toMillis() : (typeof v==='number' ? v : null); }
+function reconcileDay(ms){ return ms ? new Date(ms).toISOString().slice(0,10) : ''; }
 
-// Pure report builder (no Firestore) so it can be unit tested.
-function buildReport(customers, invoices, payments){
+// Pure report builder (no Firestore) — also used by the Customers tab "Download balance check" button.
+function buildReconcileReport(customers, invoices, payments){
   const info = computeCustomerOutstanding(customers, invoices);
   const lastPayment = {};
   (payments||[]).forEach(p=>{
-    const ms = toMs(p.createdAt);
+    const ms = reconcileToMs(p.createdAt);
     const cur = lastPayment[p.customerId];
     if(p.customerId && (!cur || (ms||0) > (cur.ms||0))) lastPayment[p.customerId] = {ms, amount:Number(p.amount)||0};
   });
@@ -72,7 +74,7 @@ function buildReport(customers, invoices, payments){
         storedDue: r.storedDue, fromBills: r.outstanding,
         difference: Math.round((r.storedDue - r.outstanding)*100)/100, // + = stored is higher than bills
         openBills: r.openBills,
-        lastPayment: lp ? day(lp.ms) : '', lastPaymentAmount: lp ? lp.amount : '',
+        lastPayment: lp ? reconcileDay(lp.ms) : '', lastPaymentAmount: lp ? lp.amount : '',
       };
     })
     .sort((a,b)=> Math.abs(b.difference) - Math.abs(a.difference));
@@ -80,7 +82,7 @@ function buildReport(customers, invoices, payments){
     invoiceId: u.inv.id, billNo: u.inv.billNo||'', customerId: u.inv.customerId||'',
     customerName: u.inv.customerName||'', customerTel: u.inv.customerTel||'',
     payment: u.inv.payment||'', total: u.total, balance: Math.round(u.balance*100)/100,
-    date: day(u.inv.createdAtMs || toMs(u.inv.createdAt)),
+    date: reconcileDay(u.inv.createdAtMs || reconcileToMs(u.inv.createdAt)),
   }));
   return {
     summary: {
@@ -93,7 +95,7 @@ function buildReport(customers, invoices, payments){
   };
 }
 
-function toCsv(report){
+function reconcileReportCsv(report){
   const esc = v => { const s = String(v==null?'':v); return /[",\n]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s; };
   const lines = [];
   const section = (title, rows) => {
@@ -118,7 +120,7 @@ async function run(){
   const read = async name => (await db.collection(name).get()).docs.map(d=>({id:d.id, ...d.data()}));
   console.log('Reading customers, invoices and payments (read-only)...');
   const [customers, invoices, payments] = await Promise.all([read('customers'), read('invoices'), read('payments')]);
-  const report = buildReport(customers, invoices, payments);
+  const report = buildReconcileReport(customers, invoices, payments);
   console.log('%cCustomer balance reconciliation', 'font-weight:bold;font-size:14px');
   console.table([report.summary]);
   console.log(report.mismatches.length ? 'Customers whose stored due differs from their bills (difference + = stored is higher):' : 'No stored-due mismatches.');
@@ -126,14 +128,14 @@ async function run(){
   console.log(report.unlinked.length ? 'Unpaid bills not linked to a customer record:' : 'No unlinked unpaid bills.');
   if(report.unlinked.length) console.table(report.unlinked);
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([toCsv(report)], {type:'text/csv'}));
+  a.href = URL.createObjectURL(new Blob([reconcileReportCsv(report)], {type:'text/csv'}));
   a.download = 'reconcile-customer-balances-' + new Date().toISOString().slice(0,10) + '.csv';
   document.body.appendChild(a); a.click(); a.remove();
   console.log('Nothing was changed in the database. CSV downloaded: ' + a.download);
   return report;
 }
 
-if(typeof module!=='undefined' && module.exports) module.exports = { invoiceBalanceInfo, computeCustomerOutstanding, buildReport, toCsv };
+if(typeof module!=='undefined' && module.exports) module.exports = { invoiceBalanceInfo, computeCustomerOutstanding, buildReconcileReport, reconcileReportCsv };
 else run().catch(e=> console.error('Reconcile failed:', e.message || e));
 
 })();

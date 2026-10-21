@@ -103,6 +103,18 @@ test('search filters by name / tel / code and "debtors only" keeps valid debtors
   } finally { await browser.close(); }
 });
 
+test('"Download balance check" button downloads the reconciliation CSV without writing', { skip }, async()=>{
+  const { browser, page } = await openCustomers();
+  try{
+    const [dl] = await Promise.all([ page.waitForEvent('download'), page.getByTestId('balance-check').click() ]);
+    assert.match(dl.suggestedFilename(), /^reconcile-customer-balances-\d{4}-\d{2}-\d{2}\.csv$/);
+    const csv = fs.readFileSync(await dl.path(), 'utf8');
+    assert.match(csv, /c3,Gamma Test,0770000003,,999,400,599,1/);   // stored 999 vs bills 400
+    assert.ok(!/\nc1,/.test(csv));                                  // c1 matches its bills
+    assert.deepEqual(await page.evaluate(()=>window.__writes), []);
+  } finally { await browser.close(); }
+});
+
 test('Firestore error is shown instead of an empty list', { skip }, async()=>{
   const { browser, page } = await openCustomers({ failCollections:['customers'] });
   try{

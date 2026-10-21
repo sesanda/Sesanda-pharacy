@@ -3865,7 +3865,7 @@ function StaffApp({onExit}){
           {tab==='opening' && <OpeningStock items={items} batches={batches} notify={notify}/>}
           {tab==='stock' && <StockView items={items} batches={batches}/>}
           {tab==='suppliers' && <Suppliers suppliers={suppliers} notify={notify}/>}
-          {tab==='customers' && <Customers customers={customers} invoices={invoices} items={items} medReminders={medReminders} notify={notify} glAccounts={glAccounts} glJournals={glJournals} customersLoading={customersLoading} customersError={customersError} invoicesError={invoicesError}/>}
+          {tab==='customers' && <Customers customers={customers} invoices={invoices} payments={payments} items={items} medReminders={medReminders} notify={notify} glAccounts={glAccounts} glJournals={glJournals} customersLoading={customersLoading} customersError={customersError} invoicesError={invoicesError}/>}
           {tab==='orders' && <OrdersBoard orders={orders} items={items} batches={batches} notify={notify}/>}
           {tab==='special' && <StaffSpecialOrders specialOrders={specialOrders} notify={notify}
             onConvertToInvoice={(s)=>{ setBillPrefill({customerName:s.customerName, customerTel:s.customerTel, sourceSpecialOrderId:s.id}); setTab('billing'); }} />}
@@ -4689,6 +4689,65 @@ function computeCustomerOutstanding(customers, invoices){
   return { byId: result, total, storedTotal, unlinked, mismatchCount: Object.values(result).filter(r=>r.mismatch).length };
 }
 
+
+// Balance check report (read-only) — Customers tab download button; same code as
+// scripts/reconcile-customer-balances.js (tests/reconcile-script.test.mjs keeps them identical).
+function reconcileToMs(v){ return v && typeof v.toMillis==='function' ? v.toMillis() : (typeof v==='number' ? v : null); }
+function reconcileDay(ms){ return ms ? new Date(ms).toISOString().slice(0,10) : ''; }
+function buildReconcileReport(customers, invoices, payments){
+  const info = computeCustomerOutstanding(customers, invoices);
+  const lastPayment = {};
+  (payments||[]).forEach(p=>{
+    const ms = reconcileToMs(p.createdAt);
+    const cur = lastPayment[p.customerId];
+    if(p.customerId && (!cur || (ms||0) > (cur.ms||0))) lastPayment[p.customerId] = {ms, amount:Number(p.amount)||0};
+  });
+  const mismatches = (customers||[])
+    .filter(c=> info.byId[c.id].mismatch)
+    .map(c=>{
+      const r = info.byId[c.id], lp = lastPayment[c.id];
+      return {
+        customerId: c.id, name: c.name||'', tel: c.tel||'', code: c.code||'',
+        storedDue: r.storedDue, fromBills: r.outstanding,
+        difference: Math.round((r.storedDue - r.outstanding)*100)/100, // + = stored is higher than bills
+        openBills: r.openBills,
+        lastPayment: lp ? reconcileDay(lp.ms) : '', lastPaymentAmount: lp ? lp.amount : '',
+      };
+    })
+    .sort((a,b)=> Math.abs(b.difference) - Math.abs(a.difference));
+  const unlinked = info.unlinked.map(u=>({
+    invoiceId: u.inv.id, billNo: u.inv.billNo||'', customerId: u.inv.customerId||'',
+    customerName: u.inv.customerName||'', customerTel: u.inv.customerTel||'',
+    payment: u.inv.payment||'', total: u.total, balance: Math.round(u.balance*100)/100,
+    date: reconcileDay(u.inv.createdAtMs || reconcileToMs(u.inv.createdAt)),
+  }));
+  return {
+    summary: {
+      customers: (customers||[]).length, invoices: (invoices||[]).length,
+      totalFromBills: info.total, totalStored: info.storedTotal,
+      totalDifference: Math.round((info.storedTotal - info.total)*100)/100,
+      mismatchedCustomers: mismatches.length, unlinkedUnpaidBills: unlinked.length,
+    },
+    mismatches, unlinked,
+  };
+}
+function reconcileReportCsv(report){
+  const esc = v => { const s = String(v==null?'':v); return /[",\n]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s; };
+  const lines = [];
+  const section = (title, rows) => {
+    lines.push(title);
+    if(!rows.length){ lines.push('(none)', ''); return; }
+    const cols = Object.keys(rows[0]);
+    lines.push(cols.join(','));
+    rows.forEach(r=> lines.push(cols.map(k=>esc(r[k])).join(',')));
+    lines.push('');
+  };
+  section('Summary', [report.summary]);
+  section('Customers whose stored due differs from their bills', report.mismatches);
+  section('Unpaid bills not linked to a customer record', report.unlinked);
+  return lines.join('\n');
+}
+
 // Null-safe customer search over name / tel / code (records missing a field are never dropped or crash the list).
 function customerMatchesQuery(c, query){
   const q = String(query||'').trim().toLowerCase();
@@ -4700,7 +4759,7 @@ function customerMatchesQuery(c, query){
   return name.includes(q) || code.includes(q) || tel.includes(q) || (qDigits.length>=3 && tel.replace(/[^0-9]/g,'').includes(qDigits));
 }
 
-function Customers({customers, invoices, items, medReminders, notify, glAccounts, glJournals, customersLoading, customersError, invoicesError}){
+function Customers({customers, invoices, payments, items, medReminders, notify, glAccounts, glJournals, customersLoading, customersError, invoicesError}){
   const [f,setF] = useState({name:'',code:'',tel:'',idNo:'',address:'',category:'NC'});
   const [showDebtorsOnly,setShowDebtorsOnly] = useState(false);
   const [custSearch,setCustSearch] = useState('');
@@ -4889,6 +4948,16 @@ function Customers({customers, invoices, items, medReminders, notify, glAccounts
   // a customer counts as a debtor if EITHER the bills or the stored running total say they owe — nobody valid is hidden
   const debtors = (customers||[]).filter(c=> balOf(c).outstanding>0.001 || balOf(c).storedDue>0.001);
   const totalDue = outstandingInfo.total;
+  // Read-only: builds the reconciliation CSV from data already loaded on this screen.
+  const downloadBalanceCheck = ()=>{
+    const report = buildReconcileReport(customers, invoices, payments);
+    const url = URL.createObjectURL(new Blob([reconcileReportCsv(report)], {type:'text/csv'}));
+    const a = document.createElement('a');
+    a.href = url; a.download = 'reconcile-customer-balances-' + todayISO() + '.csv';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(()=>URL.revokeObjectURL(url), 5000);
+    notify(`📥 Balance check downloaded — ${report.summary.mismatchedCustomers} mismatch(es), ${report.summary.unlinkedUnpaidBills} unlinked bill(s). Nothing was changed.`);
+  };
   const searched = (showDebtorsOnly ? debtors : (customers||[])).filter(c=> customerMatchesQuery(c, custSearch));
   const list = searched.slice().sort((a,b)=> String(a.name||'').localeCompare(String(b.name||'')));
 
@@ -4920,6 +4989,9 @@ function Customers({customers, invoices, items, medReminders, notify, glAccounts
           placeholder="🔍 Search name, tel or code..." style={{marginBottom:12}} autoComplete="off"/>
         <div style={{fontSize:12, color:'var(--ink-soft)', marginBottom:10}}>
           Showing {list.length} of {(customers||[]).length} customers
+          {(customers||[]).length>0 && !customersError && !invoicesError && (
+            <button data-testid="balance-check" className="btn btn-ghost btn-sm" onClick={downloadBalanceCheck} style={{marginLeft:8}}>⬇ Download balance check</button>
+          )}
           {outstandingInfo.mismatchCount>0 && <span style={{color:'#c9820a', marginLeft:8}}>⚠ {outstandingInfo.mismatchCount} stored due value(s) differ from bills (stored total {fmt(outstandingInfo.storedTotal)}) — needs review, not auto-corrected</span>}
           {outstandingInfo.unlinked.length>0 && <span style={{color:'#c9820a', marginLeft:8}}>⚠ {outstandingInfo.unlinked.length} unpaid bill(s) not linked to a customer record</span>}
         </div>

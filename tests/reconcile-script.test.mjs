@@ -8,11 +8,11 @@ import { fileURLToPath } from 'node:url';
 import { extractFunction } from './_extract.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const scriptPath = path.join(here, '..', 'scripts', 'reconcile-customer-balances.js');
-const { buildReport, toCsv } = createRequire(import.meta.url)(scriptPath);
+const { buildReconcileReport: buildReport, reconcileReportCsv: toCsv } = createRequire(import.meta.url)(scriptPath);
 
-test('balance helpers are identical to index.html', ()=>{
+test('script helpers are identical to index.html', ()=>{
   const script = fs.readFileSync(scriptPath, 'utf8');
-  for(const name of ['invoiceBalanceInfo','computeCustomerOutstanding']){
+  for(const name of ['invoiceBalanceInfo','computeCustomerOutstanding','reconcileToMs','reconcileDay','buildReconcileReport','reconcileReportCsv']){
     assert.ok(script.includes(extractFunction(name)), name + ' in the script differs from index.html');
   }
 });
