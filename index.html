@@ -1062,7 +1062,25 @@ const DEFAULT_CHART_OF_ACCOUNTS = [
   {accountCode:'6600', accountName:'Other Expenses', accountType:'EXPENSE'},
 ];
 
+// Journal numbers reserved in one block by reserveJournalNos() for a bulk run (Retry all), so
+// many postings can run side by side without each one fighting over the counter document.
+let glReservedJournalNos = [];
+async function reserveJournalNos(count){
+  const ref = db.collection('meta').doc('counters');
+  const dateKey = todayISO().replace(/-/g,'');
+  const key = 'journalSeq_' + dateKey;
+  const last = await db.runTransaction(async tx=>{
+    const snap = await tx.get(ref);
+    const data = snap.exists ? snap.data() : {};
+    const end = (data[key]||0) + count;
+    tx.set(ref, {[key]: end}, {merge:true});
+    return end;
+  });
+  for(let s = last - count + 1; s <= last; s++) glReservedJournalNos.push('JE-' + dateKey + '-' + String(s).padStart(3,'0'));
+}
+
 async function nextJournalNo(){
+  if(glReservedJournalNos.length) return glReservedJournalNos.shift();
   const ref = db.collection('meta').doc('counters');
   const dateKey = todayISO().replace(/-/g,'');
   const key = 'journalSeq_' + dateKey;
@@ -3536,25 +3554,42 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
   const retryAll = async (groups)=>{
     const total = groups.reduce((s,g)=> s + g.items().length, 0);
     if(total===0) return;
-    if(!window.confirm(total + ' items books වලට post කරන්නද? (විනාඩි කිහිපයක් යයි — page එක close කරන්න එපා)')) return;
-    let done = 0, failed = 0;
+    if(!window.confirm(total + ' items books වලට post කරන්නද? (විනාඩි කිහිපයක් යයි — ඉවර වෙනකල් මේ tab එක screen එකේම තියන්න)')) return;
+    // Keep the screen awake while it runs (where the browser supports it), and run a few postings
+    // side by side with journal numbers reserved up front — fast enough to finish before a
+    // browser puts the tab to sleep. Interrupted? Press again: posted items are not in the lists
+    // any more, and the duplicate guard skips anything already in the books.
+    let wake = null;
+    try{ if(navigator.wakeLock) wake = await navigator.wakeLock.request('screen'); }catch(e){}
+    let done = 0, failed = 0, lastError = '';
     setBulk({label: groups.map(g=>g.label).join(', '), done, total, failed});
-    for(const g of groups){
-      for(const it of g.items()){
-        try{
-          const acct = await g.post(it, glAccounts, glJournals);
-          await db.collection(g.coll).doc(it.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null, accountingError: null });
-        }catch(err){
-          failed++;
-          console.error('Retry all —', g.label, it.id, err);
-          await db.collection(g.coll).doc(it.id).update({ accountingError: err.message }).catch(()=>{});
-        }
-        done++;
-        setBulk({label: g.label, done, total, failed});
+    try{
+      await reserveJournalNos(total);
+      for(const g of groups){
+        const queue = g.items().slice();
+        const worker = async ()=>{
+          while(queue.length){
+            const it = queue.shift();
+            try{
+              const acct = await g.post(it, glAccounts, glJournals);
+              await db.collection(g.coll).doc(it.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null, accountingError: null });
+            }catch(err){
+              failed++; lastError = err.message||String(err);
+              console.error('Retry all —', g.label, it.id, err);
+              await db.collection(g.coll).doc(it.id).update({ accountingError: lastError }).catch(()=>{});
+            }
+            done++;
+            setBulk({label: g.label, done, total, failed});
+          }
+        };
+        await Promise.all(Array.from({length: 6}, worker));
       }
+    } finally {
+      glReservedJournalNos = []; // unused reserved numbers are simply skipped
+      if(wake) wake.release().catch(()=>{});
+      setBulk(null);
     }
-    setBulk(null);
-    notify(failed ? ('⚠ ' + (done-failed) + ' posted, ' + failed + ' still failing — see the Error column') : ('✓ ' + done + ' items posted to the books'));
+    notify(failed ? ('⚠ ' + (done-failed) + ' posted, ' + failed + ' still failing — ' + lastError) : ('✓ ' + done + ' items posted to the books'));
   };
   const bulkButton = (groups, label)=>{
     const n = groups.reduce((s,g)=> s + g.items().length, 0);

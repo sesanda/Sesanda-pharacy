@@ -141,3 +141,25 @@ test('no Chart of Accounts yet: load it, Retry all posts failed bills/GRNs/payme
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('Retry all with many bills: runs side by side, each bill posted once, unique journal numbers', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.glJournals = []; fx.collections.grns = []; fx.collections.customers = [];
+  fx.collections.invoices = Array.from({length:60}, (_,i)=> ({ id:'iv'+i, billNo:'B'+i, customerId:null, customerName:'NC', payment:'cash',
+    totalToPay:100+i, paidAmount:100+i, paid:true, createdAtMs: Date.UTC(2026, 9, 1+(i%20), 6), accountingStatus:'FAILED', items:[{ itemId:'it1', qty:1, lineTotal:100+i, costTotal:50 }] }));
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await page.getByText('Finance (Setup)', { exact:true }).first().click();
+    await page.getByTestId('health-check').waitFor();
+    await page.getByRole('button', { name:/Retry all failed \(60\)/ }).click();
+    await page.waitForFunction(()=> (window.firebase.__store.glJournals||[]).filter(j=> j.status==='POSTED').length===60, null, { timeout:60000 });
+    const js = await page.evaluate(()=> window.firebase.__store.glJournals);
+    assert.equal(new Set(js.map(j=> j.sourceId)).size, 60);
+    assert.equal(new Set(js.map(j=> j.journalNo)).size, 60);
+    await page.waitForFunction(()=> /Failed postings waiting for retry: 0/.test(document.body.innerText));
+    assert.match(await page.getByTestId('health-check').innerText(), /Trial Balance balanced/);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
