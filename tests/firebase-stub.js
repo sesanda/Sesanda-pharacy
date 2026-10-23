@@ -12,11 +12,19 @@
   const listeners = new Set();
   const notify = (name)=> listeners.forEach(l=>{ if(l.name===name && !l.closed) l.next(snap(name)); });
   function canRead(name){ if(failCollections.has(name)) return 'unavailable'; if(!currentUser && !PUBLIC.has(name)) return 'permission-denied'; return null; }
+  // Writes are logged in window.__writes AND applied to the in-memory store (live listeners are
+  // notified), so flows that write then read back — e.g. create a journal, then post it — work.
+  const apply = {
+    set(name, id, v){ const list = store[name] || (store[name] = []); const i = list.findIndex(x=>x.id===id); const doc = {...v, id}; if(i>=0) list[i] = doc; else list.push(doc); notify(name); },
+    update(name, id, v){ const d = (store[name]||[]).find(x=>x.id===id); if(d) Object.assign(d, v); notify(name); },
+    delete(name, id){ if(store[name]) store[name] = store[name].filter(x=>x.id!==id); notify(name); },
+  };
   function docRef(name, id){
     id = id || ('auto' + Math.random().toString(36).slice(2,8));
-    return { id, get: async()=>{ const d=(store[name]||[]).find(x=>x.id===id); return {exists:!!d, id, data:()=>d?{...d}:undefined}; },
-      set: async(v)=>{ window.__writes.push({op:'set',name,id,v}); }, update: async(v)=>{ window.__writes.push({op:'update',name,id,v}); },
-      delete: async()=>{ window.__writes.push({op:'delete',name,id}); }, onSnapshot(){ return ()=>{}; } };
+    return { id, __name:name, get: async()=>{ const d=(store[name]||[]).find(x=>x.id===id); return {exists:!!d, id, data:()=>d?{...d}:undefined}; },
+      set: async(v, o)=>{ window.__writes.push({op:'set',name,id,v}); if(o && o.merge){ const d=(store[name]||[]).find(x=>x.id===id); apply.set(name, id, {...(d||{}), ...v}); } else apply.set(name, id, v); },
+      update: async(v)=>{ window.__writes.push({op:'update',name,id,v}); apply.update(name, id, v); },
+      delete: async()=>{ window.__writes.push({op:'delete',name,id}); apply.delete(name, id); }, onSnapshot(){ return ()=>{}; } };
   }
   function query(name){
     const q = { where:()=>q, orderBy:()=>q, limit:()=>q,
@@ -26,12 +34,19 @@
         setTimeout(()=>{ const c=canRead(name); if(c){ l.closed = true; onErr && onErr(err(c)); } else next(snap(name)); }, 5);
         return ()=>{ l.closed = true; listeners.delete(l); };
       },
-      add: async(v)=>{ window.__writes.push({op:'add',name,v}); return docRef(name); },
+      add: async(v)=>{ window.__writes.push({op:'add',name,v}); const r = docRef(name); apply.set(name, r.id, v); return r; },
       doc: (id)=> docRef(name, id) };
     return q;
   }
-  const db = { collection: query, batch: ()=>({ set(){}, update(r,v){ window.__writes.push({op:'batch.update',v}); }, delete(){}, commit: async()=>{} }),
-    runTransaction: async(fn)=> fn({ get: async(r)=> r.get(), set(){}, update(){} }) };
+  const db = { collection: query,
+    batch: ()=>{ const ops = []; return {
+      set(r,v,o){ ops.push(()=> o&&o.merge ? apply.set(r.__name, r.id, {...((store[r.__name]||[]).find(x=>x.id===r.id)||{}), ...v}) : apply.set(r.__name, r.id, v)); window.__writes.push({op:'batch.set',name:r.__name,v}); },
+      update(r,v){ ops.push(()=> apply.update(r.__name, r.id, v)); window.__writes.push({op:'batch.update',name:r.__name,v}); },
+      delete(r){ ops.push(()=> apply.delete(r.__name, r.id)); window.__writes.push({op:'batch.delete',name:r.__name}); },
+      commit: async()=>{ ops.forEach(f=>f()); } }; },
+    runTransaction: async(fn)=> fn({ get: async(r)=> r.get(),
+      set(r,v,o){ window.__writes.push({op:'tx.set',name:r.__name,v}); const d=(store[r.__name]||[]).find(x=>x.id===r.id); apply.set(r.__name, r.id, o&&o.merge ? {...(d||{}), ...v} : v); },
+      update(r,v){ window.__writes.push({op:'tx.update',name:r.__name,v}); apply.update(r.__name, r.id, v); } }) };
   const firestore = ()=> db; firestore.FieldValue = { serverTimestamp: ()=>({__ts:true}), increment:n=>n, arrayUnion:(...a)=>a, delete:()=>null };
   firestore.Timestamp = { now: ()=>({toMillis:()=>Date.now()}) };
   const auth = ()=>({

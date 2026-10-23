@@ -1141,7 +1141,7 @@ async function postJournal(journalId, glAccounts, existingJournals){
   const check = validateJournal(j, glAccounts);
   if(!check.valid) throw new Error(check.errors.join('; '));
   if(j.sourceType && j.sourceId){
-    const dup = (existingJournals||[]).find(o=> o.id!==journalId && o.sourceType===j.sourceType && o.sourceId===j.sourceId && o.status!=='REVERSED');
+    const dup = (existingJournals||[]).find(o=> o.id!==journalId && o.sourceType===j.sourceType && o.sourceId===j.sourceId && glIsLiveJournal(o));
     if(dup) throw new Error('A journal already exists for ' + j.sourceType + ' ' + j.sourceId + ' (' + dup.journalNo + ')');
   }
   await ref.update({ status:'POSTED', postedAt: firebase.firestore.FieldValue.serverTimestamp(), updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
@@ -1169,6 +1169,11 @@ async function reverseJournal(journalId, glAccounts, reason){
   return reversalRef.id;
 }
 
+// A journal still "in force" for its source document: POSTED and not itself a reversal. Used for
+// duplicate-posting guards and for finding the journal to reverse — a REVERSED original and its
+// reversal journal cancel each other out and neither one counts as the source's live entry.
+function glIsLiveJournal(j){ return !!j && j.status==='POSTED' && !j.reversalOfJournalId; }
+
 /* ---------- GRN → Accounting integration (Step 2) ----------
    The ONLY thing GRN's save() calls for accounting. All debit/credit decisions and the actual
    posting still go through the Step 1 centralized createJournal()/postJournal() — this function
@@ -1183,7 +1188,7 @@ function findGlAccountByCode(glAccounts, code){
 
 async function postGrnAccounting(grn, glAccounts, existingJournals){
   const sourceType = 'GRN', sourceId = grn.id;
-  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && j.status!=='REVERSED');
+  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j));
   if(dup) return { status:'ALREADY_POSTED', journalId: dup.id, journalNo: dup.journalNo };
 
   const amount = Number(grn.totalAmount)||0;
@@ -1226,7 +1231,7 @@ async function postGrnAccounting(grn, glAccounts, existingJournals){
    accountingStatus:'FAILED' rather than treating the bill save itself as failed. */
 async function postSaleAccounting(invoice, glAccounts, existingJournals){
   const sourceType = 'SALE', sourceId = invoice.id;
-  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && j.status!=='REVERSED');
+  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j));
   if(dup) return { status:'ALREADY_POSTED', journalId: dup.id, journalNo: dup.journalNo };
 
   const revenueAcc = findGlAccountByCode(glAccounts, '4000');
@@ -1282,7 +1287,7 @@ function glCashAccountCodeForMethod(method){ return method==='card' ? '1010' : '
 
 async function postCustomerPaymentAccounting(payment, glAccounts, existingJournals){
   const sourceType = 'CUSTOMER_PAYMENT', sourceId = payment.id;
-  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && j.status!=='REVERSED');
+  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j));
   if(dup) return { status:'ALREADY_POSTED', journalId: dup.id, journalNo: dup.journalNo };
 
   const amount = Number(payment.amount)||0;
@@ -1306,7 +1311,7 @@ async function postCustomerPaymentAccounting(payment, glAccounts, existingJourna
 
 async function postSupplierPaymentAccounting(payment, glAccounts, existingJournals){
   const sourceType = 'SUPPLIER_PAYMENT', sourceId = payment.id;
-  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && j.status!=='REVERSED');
+  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j));
   if(dup) return { status:'ALREADY_POSTED', journalId: dup.id, journalNo: dup.journalNo };
 
   const amount = Number(payment.amount)||0;
@@ -1364,7 +1369,7 @@ function validateExpense(expense, glAccounts){
 
 async function postExpenseAccounting(expense, glAccounts, existingJournals){
   const sourceType = 'EXPENSE', sourceId = expense.id;
-  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && j.status!=='REVERSED');
+  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j));
   if(dup) return { status:'ALREADY_POSTED', journalId: dup.id, journalNo: dup.journalNo };
 
   const check = validateExpense(expense, glAccounts);
@@ -1441,7 +1446,7 @@ function validateCapitalLoanTxn(txn, glAccounts){
 // calling this once — not a second accounting engine, just factoring out identical boilerplate.
 async function _postCapitalLoanEntry(txn, glAccounts, existingJournals, sourceType, debitAccountId, creditAccountId, descPrefix){
   const sourceId = txn.id;
-  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && j.status!=='REVERSED');
+  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j));
   if(dup) return { status:'ALREADY_POSTED', journalId: dup.id, journalNo: dup.journalNo };
   const amount = Number(txn.amount)||0;
   if(amount <= 0) throw new Error('Amount must be greater than zero');
@@ -1522,7 +1527,7 @@ async function postCapitalLoanAccounting(txn, glAccounts, existingJournals){
    accountingError update at write-off time, so no new collection was needed just to track this. */
 async function postInventoryWriteOffAccounting(writeOff, glAccounts, existingJournals){
   const sourceType = 'INVENTORY_WRITEOFF', sourceId = writeOff.id;
-  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && j.status!=='REVERSED');
+  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j));
   if(dup) return { status:'ALREADY_POSTED', journalId: dup.id, journalNo: dup.journalNo };
 
   const amount = Number(writeOff.amount)||0;
@@ -1543,6 +1548,114 @@ async function postInventoryWriteOffAccounting(writeOff, glAccounts, existingJou
   return { status:'POSTED', journalId, journalNo: null };
 }
 
+/* ---------- Sales Return / GRN Return / Bill delete → Accounting ----------
+   Returns used to change only the operational records (invoice total, customer due, GRN total,
+   stock), so Revenue, Accounts Receivable, Inventory and Supplier Payables in the books drifted
+   away from the shop's real figures. These post the matching journal through the same
+   createJournal()/postJournal() path. A return is only posted when its original SALE/GRN journal
+   is live in the books — a return against a bill/GRN from before accounting started would
+   otherwise credit AR/AP for a charge the books never recorded (those are covered by the
+   opening-balance entries from the Finance health check instead). */
+
+// Pure: journal lines for a sales return. dueReduction/cashRefund come straight from
+// applySalesReturnToInvoice() (they sum to the return value); restockCost is the cost of the
+// resellable units put back on the shelf (damaged units stay expensed in COGS, as before).
+function buildSalesReturnLines({dueReduction, cashRefund, restockCost, payment, desc}, glAccounts){
+  const need = (code)=>{ const a = findGlAccountByCode(glAccounts, code); if(!a) throw new Error('Chart of Accounts has no active ' + code + ' account — load/check it in Finance'); return a; };
+  const due = Math.max(0, Number(dueReduction)||0), cash = Math.max(0, Number(cashRefund)||0), cost = Math.max(0, Number(restockCost)||0);
+  const value = due + cash;
+  if(value <= 0.001 && cost <= 0.001) throw new Error('Return value is zero — nothing to post');
+  const lines = [];
+  if(value > 0.001){
+    lines.push({ accountId: need('4000').id, debit: value, credit: 0, description: desc });
+    if(due > 0.001) lines.push({ accountId: need('1100').id, debit: 0, credit: due, description: desc });
+    if(cash > 0.001) lines.push({ accountId: need(payment==='card' ? '1010' : '1000').id, debit: 0, credit: cash, description: desc });
+  }
+  if(cost > 0.001){
+    lines.push({ accountId: need('1210').id, debit: cost, credit: 0, description: desc });
+    lines.push({ accountId: need('5000').id, debit: 0, credit: cost, description: desc });
+  }
+  return lines;
+}
+
+// ret: {id (first salesReturns doc id), invoiceId, billNo, customerName, payment, dueReduction, cashRefund, restockCost, date}
+async function postSalesReturnAccounting(ret, glAccounts, existingJournals){
+  const sourceType = 'SALES_RETURN', sourceId = ret.id;
+  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j));
+  if(dup) return { status:'ALREADY_POSTED', journalId: dup.id, journalNo: dup.journalNo };
+  const sale = (existingJournals||[]).find(j=> j.sourceType==='SALE' && j.sourceId===ret.invoiceId && glIsLiveJournal(j));
+  if(!sale) return { status:'SKIPPED', journalId:null, journalNo:null, reason:'Bill ' + (ret.billNo||ret.invoiceId) + ' has no sale entry in the books (before accounting started)' };
+  const desc = 'Sales return — Bill ' + (ret.billNo||ret.invoiceId) + (ret.customerName? (' — '+ret.customerName) : '');
+  const lines = buildSalesReturnLines({ dueReduction:ret.dueReduction, cashRefund:ret.cashRefund, restockCost:ret.restockCost, payment:ret.payment, desc }, glAccounts);
+  const journalId = await createJournal({ date: ret.date || todayISO(), description: desc, sourceType, sourceId, lines }, glAccounts);
+  await postJournal(journalId, glAccounts, existingJournals);
+  return { status:'POSTED', journalId, journalNo: null };
+}
+
+// ret: {id (first grnReturns doc id), grnId, grnNo, supplierName, amount, date}. Goods go back to
+// the supplier at cost: Inventory down, and the supplier owes us (or we owe them less) — DR 2100.
+async function postGrnReturnAccounting(ret, glAccounts, existingJournals){
+  const sourceType = 'GRN_RETURN', sourceId = ret.id;
+  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j));
+  if(dup) return { status:'ALREADY_POSTED', journalId: dup.id, journalNo: dup.journalNo };
+  const grnJ = (existingJournals||[]).find(j=> j.sourceType==='GRN' && j.sourceId===ret.grnId && glIsLiveJournal(j));
+  if(!grnJ) return { status:'SKIPPED', journalId:null, journalNo:null, reason:'GRN ' + (ret.grnNo||ret.grnId) + ' has no entry in the books (before accounting started)' };
+  const amount = Number(ret.amount)||0;
+  if(amount <= 0) throw new Error('Return value is zero — nothing to post');
+  const apAcc = findGlAccountByCode(glAccounts, '2100');
+  if(!apAcc) throw new Error('Chart of Accounts has no active 2100 Supplier Payables account — load/check it in Finance');
+  const invAcc = findGlAccountByCode(glAccounts, '1210');
+  if(!invAcc) throw new Error('Chart of Accounts has no active 1210 Pharmacy Inventory account — load/check it in Finance');
+  const desc = 'GRN return — ' + (ret.grnNo||ret.grnId) + (ret.supplierName? (' — '+ret.supplierName) : '');
+  const lines = [
+    { accountId: apAcc.id, debit: amount, credit: 0, description: desc },
+    { accountId: invAcc.id, debit: 0, credit: amount, description: desc },
+  ];
+  const journalId = await createJournal({ date: ret.date || todayISO(), description: desc, sourceType, sourceId, lines }, glAccounts);
+  await postJournal(journalId, glAccounts, existingJournals);
+  return { status:'POSTED', journalId, journalNo: null };
+}
+
+// A deleted bill must leave the books too: reverse its live SALE journal (revenue, cash/AR and
+// COGS/inventory all swing back — matching the restock deleteInvoice() does). No-op if the bill
+// was never in the books.
+async function reverseSaleForDeletedInvoice(invoiceId, billNo, glAccounts, existingJournals){
+  const sale = (existingJournals||[]).find(j=> j.sourceType==='SALE' && j.sourceId===invoiceId && glIsLiveJournal(j));
+  if(!sale) return { status:'NOT_IN_BOOKS' };
+  const reversalId = await reverseJournal(sale.id, glAccounts, 'Bill ' + (billNo||invoiceId) + ' deleted');
+  return { status:'REVERSED', journalId: reversalId };
+}
+
+// Opening-balance entry from the Finance health check: moves one control account (1100 AR,
+// 1210 Inventory, 2100 Supplier Payables) to the shop's real figure, against 3000 Owner Capital —
+// the standard way to bring balances that existed before the books started into the books.
+// delta is in the account's natural direction (asset: +debit, liability: +credit).
+function buildOpeningBalanceLines(accountCode, delta, glAccounts, desc){
+  const acc = findGlAccountByCode(glAccounts, accountCode);
+  if(!acc) throw new Error('Chart of Accounts has no active ' + accountCode + ' account — load/check it in Finance');
+  const equity = findGlAccountByCode(glAccounts, '3000');
+  if(!equity) throw new Error('Chart of Accounts has no active 3000 Owner Capital account — load/check it in Finance');
+  const amt = Math.round(Math.abs(Number(delta)||0)*100)/100;
+  if(amt <= 0) throw new Error('Nothing to adjust');
+  const isLiability = acc.accountType==='LIABILITY';
+  const accDebit = isLiability ? delta < 0 : delta > 0;
+  return [
+    { accountId: acc.id, debit: accDebit ? amt : 0, credit: accDebit ? 0 : amt, description: desc },
+    { accountId: equity.id, debit: accDebit ? 0 : amt, credit: accDebit ? amt : 0, description: desc },
+  ];
+}
+
+async function postOpeningBalanceAdjustment(accountCode, delta, glAccounts, existingJournals){
+  const sourceType = 'OPENING_BALANCE', sourceId = accountCode + '-' + todayISO();
+  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j));
+  if(dup) throw new Error('An opening-balance entry for ' + accountCode + ' was already posted today (' + dup.journalNo + ') — reverse it first if it was wrong');
+  const desc = 'Opening balance adjustment — ' + accountCode;
+  const lines = buildOpeningBalanceLines(accountCode, delta, glAccounts, desc);
+  const journalId = await createJournal({ date: todayISO(), description: desc, sourceType, sourceId, lines }, glAccounts);
+  await postJournal(journalId, glAccounts, existingJournals);
+  return { status:'POSTED', journalId };
+}
+
 /* ========================================================================
    REPORTING (Step 4) — General Ledger + Trial Balance. READ-ONLY: these
    functions never write to Firestore and never touch glAccounts/glJournals/
@@ -1553,11 +1666,12 @@ async function postInventoryWriteOffAccounting(writeOff, glAccounts, existingJou
    accounting calculation engine.
    ======================================================================== */
 
-// Only POSTED journals are "active" for reporting. DRAFT never counts; a REVERSED journal is, by
-// definition, no longer POSTED, so this filter alone keeps it out of every balance below — its
-// offsetting reversal journal (itself POSTED, tagged reversalOfJournalId) is what remains counted.
+// Journals that count for reporting: POSTED and REVERSED. DRAFT never counts. A REVERSED journal
+// still counts because its reversal journal (POSTED, tagged reversalOfJournalId, every line
+// swapped) is also counted — the pair nets to exactly zero on every account, and both stay
+// visible in the ledger. (Counting only the reversal would subtract the original a second time.)
 function glActivePostedJournals(glJournals){
-  return (glJournals||[]).filter(j=> j.status==='POSTED');
+  return (glJournals||[]).filter(j=> j.status==='POSTED' || j.status==='REVERSED');
 }
 
 function glDateRangePreset(preset, customFrom, customTo){
@@ -1869,7 +1983,8 @@ function glSubledgerLines(glAccounts, glJournals, accountCode, asOfDate, resolve
       if(l.accountId !== acc.id) return;
       const debit = Number(l.debit)||0, credit = Number(l.credit)||0;
       totalDebit += debit; totalCredit += credit;
-      const row = { journalId:j.id||null, journalNo:j.journalNo, date:j.date, debit, credit, sourceType:j.sourceType||'', sourceId:j.sourceId||'' };
+      const row = { journalId:j.id||null, journalNo:j.journalNo, date:j.date, debit, credit, sourceType:j.sourceType||'', sourceId:j.sourceId||'',
+        reversed: j.status==='REVERSED' || !!j.reversalOfJournalId }; // a reversed entry and its reversal net to zero
       const resolver = (resolvers||[]).find(r=> r.sourceType===j.sourceType);
       const doc = resolver ? (resolver.docs||[]).find(d=>d.id===j.sourceId) : null;
       if(doc && doc[resolver.idField]) allocated.push({ ...row, refId:doc[resolver.idField], refName:doc[resolver.nameField]||'', refNo:(resolver.refField && doc[resolver.refField])||j.sourceId, sourceDoc:doc, kind:resolver.sourceType });
@@ -1882,11 +1997,11 @@ function glSubledgerLines(glAccounts, glJournals, accountCode, asOfDate, resolve
 // Per-invoice accounting-supported paid amounts, derived from POSTED CUSTOMER_PAYMENT journals'
 // own source payment document's appliedTo breakdown (billNo -> applied amount) — the payment doc
 // IS the source document the journal references (sourceId), so this is accounting-supported
-// information, not a guess from invoice.paidAmount. A reversed payment's journal is no longer
-// POSTED so its applied amounts drop out automatically.
+// information, not a guess from invoice.paidAmount. Only live journals count, so a reversed
+// payment's applied amounts drop out automatically.
 function glARPaidByInvoice(glJournals, payments, asOfDate){
   const map = {};
-  glActivePostedJournals(glJournals).filter(j=> j.date<=asOfDate && j.sourceType==='CUSTOMER_PAYMENT').forEach(j=>{
+  (glJournals||[]).filter(j=> glIsLiveJournal(j) && j.date<=asOfDate && j.sourceType==='CUSTOMER_PAYMENT').forEach(j=>{
     const pay = (payments||[]).find(p=>p.id===j.sourceId);
     if(!pay || !Array.isArray(pay.appliedTo)) return;
     pay.appliedTo.forEach(a=>{ if(a.billNo) map[a.billNo] = (map[a.billNo]||0) + (Number(a.applied)||0); });
@@ -1898,7 +2013,7 @@ function glARPaidByInvoice(glJournals, payments, asOfDate){
 // single grnId (unlike customer payments, which can span multiple bills), so this is a direct sum.
 function glAPPaidByGrn(glJournals, supplierPayments, asOfDate){
   const map = {};
-  glActivePostedJournals(glJournals).filter(j=> j.date<=asOfDate && j.sourceType==='SUPPLIER_PAYMENT').forEach(j=>{
+  (glJournals||[]).filter(j=> glIsLiveJournal(j) && j.date<=asOfDate && j.sourceType==='SUPPLIER_PAYMENT').forEach(j=>{
     const pay = (supplierPayments||[]).find(p=>p.id===j.sourceId);
     if(!pay || !pay.grnId) return;
     map[pay.grnId] = (map[pay.grnId]||0) + (Number(pay.amount)||0);
@@ -1907,10 +2022,11 @@ function glAPPaidByGrn(glJournals, supplierPayments, asOfDate){
 }
 
 // Accounts Receivable — 1100, sourced from SALE journals joined to invoices.
-function computeAR(glAccounts, glJournals, invoices, payments, asOfDate){
+function computeAR(glAccounts, glJournals, invoices, payments, asOfDate, salesReturns){
   const resolvers = [
     { sourceType:'SALE', docs:invoices, idField:'customerId', nameField:'customerName', refField:'billNo' },
     { sourceType:'CUSTOMER_PAYMENT', docs:payments, idField:'customerId', nameField:'customerName', refField:null },
+    { sourceType:'SALES_RETURN', docs:salesReturns, idField:'customerId', nameField:'customerName', refField:'billNo' },
   ];
   const sub = glSubledgerLines(glAccounts, glJournals, '1100', asOfDate, resolvers);
   if(!sub) return null;
@@ -1930,9 +2046,12 @@ function computeAR(glAccounts, glJournals, invoices, payments, asOfDate){
       outstanding: glCentsToAmount(outstandingCents), invoiceCount: c.invoiceIds.size };
   }).filter(c=> glToCents(c.outstanding)!==0).sort((a,b)=> b.outstanding-a.outstanding);
 
-  const details = sub.allocated.filter(r=> r.kind==='SALE' && r.debit>0).map(r=>{
+  // Returns reduce what is still owed on the bill they came from (AR credit of each live return).
+  const returnedByBill = {};
+  sub.allocated.filter(r=> r.kind==='SALES_RETURN' && !r.reversed).forEach(r=>{ returnedByBill[r.refNo] = (returnedByBill[r.refNo]||0) + r.credit - r.debit; });
+  const details = sub.allocated.filter(r=> r.kind==='SALE' && r.debit>0 && !r.reversed).map(r=>{
     const age = glAgeInDays(r.date, asOfDate);
-    const paid = paidByInvoice[r.refNo] || 0;
+    const paid = (paidByInvoice[r.refNo] || 0) + (returnedByBill[r.refNo] || 0);
     const outstanding = Math.max(0, glCentsToAmount(glToCents(r.debit) - glToCents(paid)));
     return { customerId:r.refId, customerName:r.refName, ref:r.refNo, date:r.date,
       amount:r.debit, paid, outstanding, age, bucket:glAgingBucket(age),
@@ -1948,10 +2067,11 @@ function computeAR(glAccounts, glJournals, invoices, payments, asOfDate){
 }
 
 // Accounts Payable — 2100, sourced from GRN journals joined to grns.
-function computeAP(glAccounts, glJournals, grns, supplierPayments, asOfDate){
+function computeAP(glAccounts, glJournals, grns, supplierPayments, asOfDate, grnReturns){
   const resolvers = [
     { sourceType:'GRN', docs:grns, idField:'supplierId', nameField:'supplierName', refField:'grnNo' },
     { sourceType:'SUPPLIER_PAYMENT', docs:supplierPayments, idField:'supplierId', nameField:'supplierName', refField:null },
+    { sourceType:'GRN_RETURN', docs:grnReturns, idField:'supplierId', nameField:'supplierName', refField:'grnNo' },
   ];
   const sub = glSubledgerLines(glAccounts, glJournals, '2100', asOfDate, resolvers);
   if(!sub) return null;
@@ -1971,9 +2091,11 @@ function computeAP(glAccounts, glJournals, grns, supplierPayments, asOfDate){
       outstanding: glCentsToAmount(outstandingCents), grnCount: s.grnIds.size };
   }).filter(s=> glToCents(s.outstanding)!==0).sort((a,b)=> b.outstanding-a.outstanding);
 
-  const details = sub.allocated.filter(r=> r.kind==='GRN' && r.credit>0).map(r=>{
+  const returnedByGrn = {};
+  sub.allocated.filter(r=> r.kind==='GRN_RETURN' && !r.reversed).forEach(r=>{ const g = r.sourceDoc && r.sourceDoc.grnId; if(g) returnedByGrn[g] = (returnedByGrn[g]||0) + r.debit - r.credit; });
+  const details = sub.allocated.filter(r=> r.kind==='GRN' && r.credit>0 && !r.reversed).map(r=>{
     const age = glAgeInDays(r.date, asOfDate);
-    const paid = paidByGrn[r.sourceId] || 0;
+    const paid = (paidByGrn[r.sourceId] || 0) + (returnedByGrn[r.sourceId] || 0);
     const outstanding = Math.max(0, glCentsToAmount(glToCents(r.credit) - glToCents(paid)));
     return { supplierId:r.refId, supplierName:r.refName, ref:r.refNo, date:r.date,
       amount:r.credit, paid, outstanding, age, bucket:glAgingBucket(age),
@@ -2032,6 +2154,8 @@ function glClassifyCashLine(sourceType){
   if(sourceType==='LOAN_RECEIVED') return { section:'financing', label:'Loan Proceeds Received' };
   if(sourceType==='LOAN_REPAYMENT') return { section:'financing', label:'Loan Principal Repayments' };
   if(sourceType==='LOAN_INTEREST') return { section:'operating', label:'Loan Interest Paid' };
+  if(sourceType==='SALES_RETURN') return { section:'operating', label:'Customer Refunds (Sales Returns)' };
+  if(sourceType==='OPENING_BALANCE') return { section:'financing', label:'Opening Balance Entries' };
   return null;
 }
 
@@ -2122,6 +2246,60 @@ function validateCashFlow(cf){
     financingTotal: cf.financing.total, netCashMovement, calculatedClosingCash,
     actualClosingCash: cf.cashAndBankClosing, difference: glCentsToAmount(diffCents), reconciled: diffCents===0,
   };
+}
+
+/* ---------- Accounts Health Check (Finance) — READ-ONLY ----------
+   Compares what the books say with what the shop's own records say, for the three control
+   accounts that have an operational twin: 1100 AR vs unpaid bills, 1210 Inventory vs stock on
+   hand at cost, 2100 Supplier Payables vs unpaid credit GRNs. Also lists source documents that
+   never reached the books and live journals whose source document was deleted. Nothing here
+   writes; the Finance screen offers the fixes (retry, reverse, opening-balance entry). */
+function computeAccountsHealth(d, asOfDate){
+  const glAccounts = d.glAccounts||[], glJournals = d.glJournals||[];
+  const r2 = (n)=> Math.round((Number(n)||0)*100)/100;
+  const tb = computeTrialBalance(glAccounts, glJournals, asOfDate);
+  const bal = (code)=>{
+    const row = tb.rows.find(x=> x.accountCode===code);
+    if(!row) return 0;
+    return r2(row.accountType==='LIABILITY' || row.accountType==='EQUITY' || row.accountType==='REVENUE' ? row.credit - row.debit : row.debit - row.credit);
+  };
+  const live = {};
+  glJournals.forEach(j=>{ if(glIsLiveJournal(j) && j.sourceType && j.sourceId) live[j.sourceType+'|'+j.sourceId] = j; });
+  const inBooks = (type, id)=> !!live[type+'|'+id];
+
+  const outstanding = computeCustomerOutstanding(d.customers, d.invoices);
+  const arShop = r2(outstanding.total + outstanding.unlinked.reduce((s,u)=> s + u.balance, 0));
+  const stockShop = r2((d.batches||[]).filter(b=> !b.writtenOff).reduce((s,b)=> s + (Number(b.remainingUnits)||0)*(Number(b.unitCost)||0), 0));
+  const apShop = r2((d.grns||[]).filter(g=> g.payment==='credit' && !g.paid).reduce((s,g)=> s + Math.max(0, (Number(g.totalAmount)||0) - (Number(g.paidAmount)||0)), 0));
+  const control = [
+    { code:'1100', label:'Accounts Receivable (customer dues)', books: bal('1100'), shop: arShop, shopLabel:'Unpaid bills' },
+    { code:'1210', label:'Pharmacy Inventory (stock at cost)', books: bal('1210'), shop: stockShop, shopLabel:'Stock on hand × cost' },
+    { code:'2100', label:'Supplier Payables (owed to suppliers)', books: bal('2100'), shop: apShop, shopLabel:'Unpaid credit GRNs' },
+  ].map(c=> ({ ...c, diff: r2(c.shop - c.books) }));
+
+  const pending = (docs, type, amountOf, isCandidate)=>{
+    const rows = (docs||[]).filter(x=> isCandidate(x) && !inBooks(type, x.id));
+    const failed = rows.filter(x=> x.accountingStatus==='FAILED');
+    const never = rows.filter(x=> x.accountingStatus!=='FAILED');
+    return { failed, never, failedAmount: r2(failed.reduce((s,x)=>s+amountOf(x),0)), neverAmount: r2(never.reduce((s,x)=>s+amountOf(x),0)) };
+  };
+  const unposted = {
+    bills: pending(d.invoices, 'SALE', x=> Number(x.totalToPay)||0, x=> (Number(x.totalToPay)||0) > 0),
+    grns: pending(d.grns, 'GRN', x=> Number(x.totalAmount)||0, x=> (Number(x.totalAmount)||0) > 0),
+    customerPayments: pending(d.payments, 'CUSTOMER_PAYMENT', x=> Number(x.amount)||0, x=> (Number(x.amount)||0) > 0),
+    supplierPayments: pending(d.supplierPayments, 'SUPPLIER_PAYMENT', x=> Number(x.amount)||0, x=> (Number(x.amount)||0) > 0),
+    salesReturns: pending(d.salesReturns, 'SALES_RETURN', x=> (Number(x.glReturn && x.glReturn.dueReduction)||0) + (Number(x.glReturn && x.glReturn.cashRefund)||0), x=> !!x.glReturn && x.accountingStatus!=='SKIPPED'),
+    grnReturns: pending(d.grnReturns, 'GRN_RETURN', x=> Number(x.glReturn && x.glReturn.amount)||0, x=> !!x.glReturn && x.accountingStatus!=='SKIPPED'),
+  };
+
+  const invoiceIds = new Set((d.invoices||[]).map(x=>x.id)), grnIds = new Set((d.grns||[]).map(x=>x.id));
+  const orphans = glJournals.filter(j=> glIsLiveJournal(j) && ((j.sourceType==='SALE' && !invoiceIds.has(j.sourceId)) || (j.sourceType==='GRN' && !grnIds.has(j.sourceId))));
+
+  const tbCheck = validateTrialBalance(tb.rows);
+  const bsCheck = validateBalanceSheet(computeBalanceSheet(glAccounts, glJournals, asOfDate));
+  return { asOfDate, hasChart: glAccounts.length>0, journalCount: glJournals.length,
+    trialBalance: tbCheck, balanceSheet: bsCheck, cash: bal('1000'), bank: bal('1010'),
+    control, unposted, orphans };
 }
 
 /* ---------- General Ledger — minimum screen to browse per-account activity (Step 4) ---------- */
@@ -2447,14 +2625,14 @@ function BalanceSheet({glAccounts, glJournals}){
 }
 
 /* ---------- Accounts Receivable — customer outstanding + aging (Step 7) ---------- */
-function AccountsReceivable({glAccounts, glJournals, invoices, payments}){
+function AccountsReceivable({glAccounts, glJournals, invoices, payments, salesReturns}){
   const [preset,setPreset] = useState('today');
   const [customTo,setCustomTo] = useState(todayISO());
   const [customerFilter,setCustomerFilter] = useState('');
   const [bucketFilter,setBucketFilter] = useState('');
   const asOfDate = preset==='custom' ? (customTo||todayISO()) : glDateRangePreset(preset).to;
 
-  const ar = computeAR(glAccounts, glJournals, invoices, payments, asOfDate);
+  const ar = computeAR(glAccounts, glJournals, invoices, payments, asOfDate, salesReturns);
   const fmt = (n)=> (isFinite(n) ? Number(n).toFixed(2) : '0.00');
 
   if(!ar) return <div className="card"><div className="empty">1100 Accounts Receivable account එක Chart of Accounts එකේ නැහැ — Finance tab එකෙන් load කරන්න.</div></div>;
@@ -2585,14 +2763,14 @@ function AccountsReceivable({glAccounts, glJournals, invoices, payments}){
 }
 
 /* ---------- Accounts Payable — supplier outstanding + aging (Step 7) ---------- */
-function AccountsPayable({glAccounts, glJournals, grns, supplierPayments}){
+function AccountsPayable({glAccounts, glJournals, grns, supplierPayments, grnReturns}){
   const [preset,setPreset] = useState('today');
   const [customTo,setCustomTo] = useState(todayISO());
   const [supplierFilter,setSupplierFilter] = useState('');
   const [bucketFilter,setBucketFilter] = useState('');
   const asOfDate = preset==='custom' ? (customTo||todayISO()) : glDateRangePreset(preset).to;
 
-  const ap = computeAP(glAccounts, glJournals, grns, supplierPayments, asOfDate);
+  const ap = computeAP(glAccounts, glJournals, grns, supplierPayments, asOfDate, grnReturns);
   const fmt = (n)=> (isFinite(n) ? Number(n).toFixed(2) : '0.00');
 
   if(!ap) return <div className="card"><div className="empty">2100 Supplier Payables account එක Chart of Accounts එකේ නැහැ — Finance tab එකෙන් load කරන්න.</div></div>;
@@ -3195,7 +3373,7 @@ function CapitalLoans({glAccounts, glJournals, capitalLoanTxns, notify}){
 }
 
 /* ---------- Finance — minimum UI to verify Step 1 (Chart of Accounts + test posting) ---------- */
-function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPayments, expenses, capitalLoanTxns, batches, notify}){
+function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPayments, expenses, capitalLoanTxns, batches, customers, salesReturns, grnReturns, notify}){
   const [seeding,setSeeding] = useState(false);
   const [newAcc,setNewAcc] = useState({accountCode:'', accountName:'', accountType:'EXPENSE'});
   const [tj,setTj] = useState({date:todayISO(), description:'', debitAccountId:'', creditAccountId:'', amount:''});
@@ -3387,8 +3565,97 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
   const activeAccounts = glAccounts.filter(a=>a.isActive!==false);
   const grouped = GL_ACCOUNT_TYPES.map(t=>({type:t, accounts: glAccounts.filter(a=>a.accountType===t).slice().sort((a,b)=>a.accountCode<b.accountCode?-1:1)}));
 
+  // ---- Accounts Health Check ----
+  const health = computeAccountsHealth({glAccounts, glJournals, customers, invoices, grns, batches, payments, supplierPayments, salesReturns, grnReturns}, todayISO());
+  const [healthBusy,setHealthBusy] = useState(null);
+  const postOpening = async (c)=>{
+    if(!window.confirm(`${c.code} ${c.label}\n\nBooks: Rs. ${c.books.toFixed(2)}\nShop records: Rs. ${c.shop.toFixed(2)}\n\n`+
+      `Opening-balance entry එකක් post කරලා books එක Rs. ${c.shop.toFixed(2)} ට ගේනවා (difference Rs. ${c.diff.toFixed(2)} → 3000 Owner Capital).\n`+
+      `මේක කරන්න ඕන accounting පටන් ගන්න කලින් තිබ්බ balances වලට විතරයි. Retry කරන්න ඕන failed items තියෙනවා නම් මුලින් ඒවා retry කරන්න. Post කරන්නද?`)) return;
+    setHealthBusy('ob-'+c.code);
+    try{ await postOpeningBalanceAdjustment(c.code, c.diff, glAccounts, glJournals); notify('✓ ' + c.code + ' opening balance posted'); }
+    catch(err){ console.error(err); notify('❌ ' + err.message); }
+    setHealthBusy(null);
+  };
+  const reverseOrphan = async (j)=>{
+    if(!window.confirm(j.journalNo + ' — ' + j.description + '\n\nමේ entry එකේ ' + (j.sourceType==='SALE'?'bill':'GRN') + ' එක delete කරලා. Books වලින් reverse කරන්නද?')) return;
+    setHealthBusy('or-'+j.id);
+    try{ await reverseJournal(j.id, glAccounts, (j.sourceType==='SALE'?'Bill':'GRN') + ' no longer exists'); notify('✓ Reversed'); }
+    catch(err){ console.error(err); notify('❌ ' + err.message); }
+    setHealthBusy(null);
+  };
+  const retryReturn = async (coll, ret)=>{
+    setHealthBusy('rt-'+ret.id);
+    try{
+      const acct = coll==='salesReturns'
+        ? await postSalesReturnAccounting({ id: ret.id, ...ret.glReturn }, glAccounts, glJournals)
+        : await postGrnReturnAccounting({ id: ret.id, ...ret.glReturn }, glAccounts, glJournals);
+      await db.collection(coll).doc(ret.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null, accountingError: acct.reason||null }).catch(e=>console.error(e));
+      notify(acct.status==='SKIPPED' ? ('ℹ ' + acct.reason) : '✓ Return accounting ' + (acct.status==='ALREADY_POSTED'?'already posted':'posted'));
+    }catch(err){
+      console.error(err);
+      await db.collection(coll).doc(ret.id).update({ accountingStatus:'FAILED', accountingError: err.message }).catch(()=>{});
+      notify('❌ ' + err.message);
+    }
+    setHealthBusy(null);
+  };
+  const pendingReturns = [...health.unposted.salesReturns.failed, ...health.unposted.salesReturns.never].map(r=>({coll:'salesReturns', r}))
+    .concat([...health.unposted.grnReturns.failed, ...health.unposted.grnReturns.never].map(r=>({coll:'grnReturns', r})));
+  const ok = (good)=> <span style={{color: good ? 'var(--accent)' : 'var(--red)', fontWeight:700}}>{good ? '✓' : '⚠'}</span>;
+
   return (
     <div>
+      {health.hasChart && (
+      <div className="card" data-testid="health-check">
+        <h3>🩺 Accounts Health Check <span style={{fontWeight:400, fontSize:12, color:'var(--ink-soft)'}}>as of {health.asOfDate}</span></h3>
+        <p style={{fontSize:12, color:'var(--ink-soft)', marginTop:0}}>Books (accounts) සහ shop records (bills, stock, GRNs) ගැලපෙනවද කියලා බලනවා. මේ check එක කිසි දෙයක් වෙනස් කරන්නේ නැහැ.</p>
+        <div style={{display:'grid', gap:4, marginBottom:12, fontSize:13}}>
+          <div>{ok(health.trialBalance.balanced)} Trial Balance {health.trialBalance.balanced ? 'balanced' : ('out by Rs. ' + health.trialBalance.difference.toFixed(2))}</div>
+          <div>{ok(health.balanceSheet.balanced)} Balance Sheet {health.balanceSheet.balanced ? 'balanced' : ('out by Rs. ' + health.balanceSheet.difference.toFixed(2))}</div>
+          <div>{ok(health.orphans.length===0)} Deleted bills/GRNs still in the books: {health.orphans.length}</div>
+          <div>{ok(health.unposted.bills.failed.length + health.unposted.grns.failed.length + health.unposted.customerPayments.failed.length + health.unposted.supplierPayments.failed.length===0)} Failed postings waiting for retry (below): {health.unposted.bills.failed.length + health.unposted.grns.failed.length + health.unposted.customerPayments.failed.length + health.unposted.supplierPayments.failed.length}</div>
+          <div>ℹ Cash in books: <b>Rs. {health.cash.toFixed(2)}</b> · Bank in books: <b>Rs. {health.bank.toFixed(2)}</b> — drawer එකේ සල්ලි / bank statement එකත් එක්ක ගලපලා බලන්න.</div>
+        </div>
+        <table data-testid="health-control">
+          <thead><tr><th>Account</th><th>Books</th><th>Shop records</th><th>Difference</th><th></th></tr></thead>
+          <tbody>
+            {health.control.map(c=>(
+              <tr key={c.code}>
+                <td>{c.code} — {c.label}</td>
+                <td>Rs. {c.books.toFixed(2)}</td>
+                <td>Rs. {c.shop.toFixed(2)} <span style={{fontSize:11, color:'var(--ink-soft)'}}>({c.shopLabel})</span></td>
+                <td style={{fontWeight:700, color: Math.abs(c.diff)<0.01 ? 'var(--accent)' : 'var(--red)'}}>{Math.abs(c.diff)<0.01 ? '✓ matches' : ('Rs. ' + c.diff.toFixed(2))}</td>
+                <td>{Math.abs(c.diff)>=0.01 && (
+                  <button className="btn btn-ghost btn-sm" disabled={!!healthBusy} onClick={()=>postOpening(c)}>{healthBusy==='ob-'+c.code ? 'Posting…' : 'Post opening balance'}</button>
+                )}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {(health.unposted.bills.never.length>0 || health.unposted.grns.never.length>0) && (
+          <p style={{fontSize:12, color:'#c9820a'}}>
+            ℹ Books වල නැති bills {health.unposted.bills.never.length}ක් (Rs. {health.unposted.bills.neverAmount.toFixed(2)}) සහ GRNs {health.unposted.grns.never.length}ක් (Rs. {health.unposted.grns.neverAmount.toFixed(2)}) තියෙනවා —
+            සාමාන්‍යයෙන් accounting පටන් ගන්න කලින් හදපු ඒවා. ඒවා නිසා ඇති වෙන difference එක "Post opening balance" එකෙන් හදන්න පුළුවන්.
+          </p>
+        )}
+        {health.orphans.length>0 && (<>
+          <h4 style={{margin:'12px 0 6px'}}>Deleted bills / GRNs still in the books</h4>
+          <table><tbody>{health.orphans.map(j=>(
+            <tr key={j.id}><td>{j.journalNo}</td><td>{j.date}</td><td>{j.description}</td>
+              <td><button className="btn btn-danger btn-sm" disabled={!!healthBusy} onClick={()=>reverseOrphan(j)}>{healthBusy==='or-'+j.id ? 'Reversing…' : '↩ Reverse'}</button></td></tr>
+          ))}</tbody></table>
+        </>)}
+        {pendingReturns.length>0 && (<>
+          <h4 style={{margin:'12px 0 6px'}}>Returns not yet in the books ({pendingReturns.length})</h4>
+          <table><tbody>{pendingReturns.map(({coll, r})=>(
+            <tr key={r.id}><td>{coll==='salesReturns' ? 'Sales return' : 'GRN return'}</td><td>{r.billNo || r.grnNo}</td><td>{r.date}</td>
+              <td style={{fontSize:11, color:'var(--red)'}}>{r.accountingError||''}</td>
+              <td><button className="btn btn-primary btn-sm" disabled={!!healthBusy} onClick={()=>retryReturn(coll, r)}>{healthBusy==='rt-'+r.id ? 'Posting…' : '🔁 Post'}</button></td></tr>
+          ))}</tbody></table>
+        </>)}
+      </div>
+      )}
+
       <div className="card">
         <h3>💰 Chart of Accounts</h3>
         {glAccounts.length===0 ? (
@@ -3431,10 +3698,10 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
       </div>
 
       <div className="card">
-        <h3>🧪 Post a Test Journal</h3>
+        <h3>✍ Manual Journal</h3>
         <p style={{fontSize:11.5, color:'var(--ink-soft)'}}>
-          මේකෙන් accounting engine එක verify කරන්න පුළුවන් (Step 1 foundation) — GRN/Billing
-          තවම මෙකට connect කරලා නැහැ, ඒ integration පස්සේ step එකකින්.
+          ⚠ මේක ඇත්ත books වලට post වෙනවා (test එකක් නෙවෙයි). Opening cash/bank balance (Dr 1000 Cash / Cr 3000 Owner Capital)
+          හෝ වැරදීමක් හදන්න වගේ වෙලාවට විතරක් පාවිච්චි කරන්න. Bills, GRNs, payments, expenses auto post වෙනවා — ඒවා මෙතනින් දාන්න එපා.
         </p>
         <div className="grid c2">
           <div><label>Debit Account</label>
@@ -3613,7 +3880,8 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
                     return <div key={i} style={{fontSize:11}}>{acc?acc.accountCode:l.accountId}: {l.debit? ('Dr '+Number(l.debit).toFixed(2)) : ('Cr '+Number(l.credit).toFixed(2))}</div>;
                   })}
                 </td>
-                <td>{j.status==='POSTED' && <button className="btn btn-danger btn-sm" onClick={()=>doReverse(j)}>↩ Reverse</button>}</td>
+                <td>{j.status==='POSTED' && !j.reversalOfJournalId && <button className="btn btn-danger btn-sm" onClick={()=>doReverse(j)}>↩ Reverse</button>}
+                  {j.reversalOfJournalId && <span className="tag out">REVERSAL</span>}</td>
               </tr>
             ))}
           </tbody>
@@ -3861,7 +4129,7 @@ function StaffApp({onExit}){
                 onDraftChange={(patch)=>updateGrnDraft(activeGrnDraftId, patch)} />
             </div>
           )}
-          {tab==='returns' && <Returns invoices={invoices} customers={customers} batches={batches} items={items} grns={grns} suppliers={suppliers} salesReturns={salesReturns} grnReturns={grnReturns} notify={notify}/>}
+          {tab==='returns' && <Returns invoices={invoices} customers={customers} batches={batches} items={items} grns={grns} suppliers={suppliers} salesReturns={salesReturns} grnReturns={grnReturns} glAccounts={glAccounts} glJournals={glJournals} notify={notify}/>}
           {tab==='opening' && <OpeningStock items={items} batches={batches} notify={notify}/>}
           {tab==='stock' && <StockView items={items} batches={batches}/>}
           {tab==='suppliers' && <Suppliers suppliers={suppliers} notify={notify}/>}
@@ -3873,13 +4141,13 @@ function StaffApp({onExit}){
             suppliers={suppliers} expenses={expenses} adjustments={adjustments} salesReturns={salesReturns} grnReturns={grnReturns}
             glAccounts={glAccounts} glJournals={glJournals} customers={customers} payments={payments} notify={notify}/>}
           {tab==='cashcontrol' && <CashControl invoices={invoices} payments={payments} cashChecks={cashChecks} notify={notify} />}
-          {tab==='finance' && <Finance glAccounts={glAccounts} glJournals={glJournals} grns={grns} invoices={invoices} payments={payments} supplierPayments={supplierPayments} expenses={opExpenses} capitalLoanTxns={capitalLoanTxns} batches={batches} notify={notify} />}
+          {tab==='finance' && <Finance glAccounts={glAccounts} glJournals={glJournals} grns={grns} invoices={invoices} payments={payments} supplierPayments={supplierPayments} expenses={opExpenses} capitalLoanTxns={capitalLoanTxns} batches={batches} customers={customers} salesReturns={salesReturns} grnReturns={grnReturns} notify={notify} />}
           {tab==='ledger' && <GeneralLedger glAccounts={glAccounts} glJournals={glJournals} />}
           {tab==='trialbalance' && <TrialBalance glAccounts={glAccounts} glJournals={glJournals} />}
           {tab==='pnl' && <ProfitAndLoss glAccounts={glAccounts} glJournals={glJournals} />}
           {tab==='balancesheet' && <BalanceSheet glAccounts={glAccounts} glJournals={glJournals} />}
-          {tab==='ar' && <AccountsReceivable glAccounts={glAccounts} glJournals={glJournals} invoices={invoices} payments={payments} />}
-          {tab==='ap' && <AccountsPayable glAccounts={glAccounts} glJournals={glJournals} grns={grns} supplierPayments={supplierPayments} />}
+          {tab==='ar' && <AccountsReceivable glAccounts={glAccounts} glJournals={glJournals} invoices={invoices} payments={payments} salesReturns={salesReturns} />}
+          {tab==='ap' && <AccountsPayable glAccounts={glAccounts} glJournals={glJournals} grns={grns} supplierPayments={supplierPayments} grnReturns={grnReturns} />}
           {tab==='cashflow' && <CashFlowStatement glAccounts={glAccounts} glJournals={glJournals} />}
           {tab==='expenses' && <ExpenseManagement glAccounts={glAccounts} glJournals={glJournals} expenses={opExpenses} notify={notify} />}
           {tab==='capitalloans' && <CapitalLoans glAccounts={glAccounts} glJournals={glJournals} capitalLoanTxns={capitalLoanTxns} notify={notify} />}
@@ -5222,7 +5490,7 @@ function Customers({customers, invoices, payments, items, medReminders, notify, 
 }
 
 /* ---------- Returns (Sales Return + GRN Return — stock, refund/due and P&L all kept in sync) ---------- */
-function Returns({invoices, customers, batches, items, grns, suppliers, salesReturns, grnReturns, notify}){
+function Returns({invoices, customers, batches, items, grns, suppliers, salesReturns, grnReturns, glAccounts, glJournals, notify}){
   const [subTab,setSubTab] = useState('sales'); // 'sales' | 'grn'
 
   /* ----- Sales Return ----- */
@@ -5262,16 +5530,26 @@ function Returns({invoices, customers, batches, items, grns, suppliers, salesRet
     setSrSaving(true);
     try{
       const batch = db.batch();
-      let totalRefund = 0;
+      // First pass: totals, so the accounting figures can go into the first return doc's own set().
+      let totalRefund = 0, restockCost = 0, firstRetRef = null;
+      rows.forEach(r=>{
+        const qty = Number(r.qty), unitPrice = r.item.qty>0 ? r.item.lineTotal/r.item.qty : 0;
+        totalRefund += +(unitPrice*qty).toFixed(2);
+        if(r.condition==='resellable') restockCost += +(estimateItemUnitCost(r.item.itemId, batches)*qty).toFixed(2);
+      });
+      const {update, dueReduction, cashRefundDue} = applySalesReturnToInvoice(foundInvoice, totalRefund);
+      const acctRet = { invoiceId: foundInvoice.id, billNo: foundInvoice.billNo, customerName: foundInvoice.customerName,
+        payment: foundInvoice.payment, dueReduction, cashRefund: cashRefundDue, restockCost: +restockCost.toFixed(2), date: todayISO() };
       for(const r of rows){
         const qty = Number(r.qty);
         const unitPrice = r.item.qty>0 ? r.item.lineTotal/r.item.qty : 0;
         const refundAmount = +(unitPrice*qty).toFixed(2);
         const unitCost = estimateItemUnitCost(r.item.itemId, batches);
         const costImpact = +(unitCost*qty).toFixed(2);
-        totalRefund += refundAmount;
         const retRef = db.collection('salesReturns').doc();
-        batch.set(retRef, {
+        const acctFields = firstRetRef ? {} : { glReturn: acctRet, accountingStatus: 'PENDING' };
+        if(!firstRetRef) firstRetRef = retRef;
+        batch.set(retRef, { ...acctFields,
           invoiceId: foundInvoice.id, billNo: foundInvoice.billNo,
           customerId: foundInvoice.customerId||null, customerName: foundInvoice.customerName, customerTel: foundInvoice.customerTel||'',
           itemId: r.item.itemId, itemCode: r.item.itemCode||'', brandName: r.item.brandName,
@@ -5297,7 +5575,6 @@ function Returns({invoices, customers, batches, items, grns, suppliers, salesRet
           });
         }
       }
-      const {update, dueReduction, cashRefundDue} = applySalesReturnToInvoice(foundInvoice, totalRefund);
       batch.update(db.collection('invoices').doc(foundInvoice.id), update);
       if(foundInvoice.customerId && dueReduction>0){
         const custRef = db.collection('customers').doc(foundInvoice.customerId);
@@ -5305,11 +5582,22 @@ function Returns({invoices, customers, batches, items, grns, suppliers, salesRet
         const currentDue = custSnap.exists ? (custSnap.data().dueAmount||0) : 0;
         batch.update(custRef, {dueAmount: Math.max(0, currentDue - dueReduction)});
       }
+      // The first return doc of this event carries the figures the accounting entry needs (glReturn),
+      // so a failed posting can be retried from Finance with exactly the same numbers.
       await batch.commit();
       let msg = `✓ Return processed — Value: ${fmt(totalRefund)}`;
       if(cashRefundDue>0.001) msg += ` — 💵 Cash refund to give: ${fmt(cashRefundDue)}`;
       else if(dueReduction>0.001) msg += ` — Customer due reduced by ${fmt(dueReduction)}`;
       notify(msg);
+      // Accounting runs only after the return itself is saved; a failure never undoes the return.
+      let acct = null;
+      try{ acct = await postSalesReturnAccounting({ id: firstRetRef.id, ...acctRet }, glAccounts, glJournals); }
+      catch(err){
+        console.error('Sales return accounting failed', err);
+        await db.collection('salesReturns').doc(firstRetRef.id).update({ accountingStatus:'FAILED', accountingError: err.message }).catch(()=>{});
+        notify('⚠ Return saved, but accounting entry failed — retry from Finance: ' + err.message);
+      }
+      if(acct) await db.collection('salesReturns').doc(firstRetRef.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null, accountingError: acct.reason||null }).catch(e=> console.error(e));
       setFoundInvoice(null); setBillQuery(''); setReturnRows([]);
     }catch(e){
       console.error('processSalesReturn failed', e);
@@ -5351,14 +5639,18 @@ function Returns({invoices, customers, batches, items, grns, suppliers, salesRet
     setGrSaving(true);
     try{
       const batch = db.batch();
-      let totalRefund = 0;
+      let totalRefund = 0, firstRetRef = null;
+      const acctTotal = rows.reduce((s,r)=> s + +((r.batch.unitCost||0)*Number(r.qty)).toFixed(2), 0);
+      const acctRet = { grnId: foundGrn.id, grnNo: foundGrn.grnNo, supplierName: foundGrn.supplierName, amount: +acctTotal.toFixed(2), date: todayISO() };
       for(const r of rows){
         const qty = Number(r.qty);
         const unitCost = r.batch.unitCost||0;
         const refundAmount = +(unitCost*qty).toFixed(2);
         totalRefund += refundAmount;
         const retRef = db.collection('grnReturns').doc();
-        batch.set(retRef, {
+        const acctFields = firstRetRef ? {} : { glReturn: acctRet, accountingStatus: 'PENDING' };
+        if(!firstRetRef) firstRetRef = retRef;
+        batch.set(retRef, { ...acctFields,
           grnId: foundGrn.id, grnNo: foundGrn.grnNo, supplierId: foundGrn.supplierId||null, supplierName: foundGrn.supplierName,
           batchId: r.batch.id, itemId: r.batch.itemId, brandName: r.batch.brandName, batchCode: r.batch.batchCode,
           qty, unitCost, refundAmount, reason: r.reason||'', originalPayment: foundGrn.payment,
@@ -5376,6 +5668,14 @@ function Returns({invoices, customers, batches, items, grns, suppliers, salesRet
       }
       await batch.commit();
       notify(`✓ GRN Return processed — Value: ${fmt(totalRefund)}${dueEffect}`);
+      let acct = null;
+      try{ acct = await postGrnReturnAccounting({ id: firstRetRef.id, ...acctRet }, glAccounts, glJournals); }
+      catch(err){
+        console.error('GRN return accounting failed', err);
+        await db.collection('grnReturns').doc(firstRetRef.id).update({ accountingStatus:'FAILED', accountingError: err.message }).catch(()=>{});
+        notify('⚠ GRN return saved, but accounting entry failed — retry from Finance: ' + err.message);
+      }
+      if(acct) await db.collection('grnReturns').doc(firstRetRef.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null, accountingError: acct.reason||null }).catch(e=> console.error(e));
       setFoundGrn(null); setGrnQuery(''); setGrnReturnRows([]);
     }catch(e){
       console.error('processGrnReturn failed', e);
@@ -7183,6 +7483,8 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
       batch.delete(db.collection('invoices').doc(inv.id));
       await batch.commit();
       notify('🗑 ' + inv.billNo + ' delete කළා — stock ආපහු එකතු කළා');
+      try{ await reverseSaleForDeletedInvoice(inv.id, inv.billNo, glAccounts, glJournals); }
+      catch(err){ console.error('Reversing deleted bill in the books failed', err); notify('⚠ Bill deleted, but its accounting entry was not reversed — use Finance → Health Check: ' + err.message); }
     }catch(e){
       console.error('deleteInvoice failed', e);
       notify('❌ Delete වුනේ නැහැ: ' + (e.message||e));

@@ -8,7 +8,13 @@ export const html = fs.readFileSync(path.join(here, '..', 'index.html'), 'utf8')
 export function extractFunction(name){
   const start = html.indexOf('\nfunction ' + name + '(');
   if(start<0) throw new Error('function not found: ' + name);
-  let i = html.indexOf('{', start), depth = 0;
+  // skip the parameter list first (it may contain destructuring braces), then match the body
+  let i = html.indexOf('(', start), depth = 0;
+  for(; i<html.length; i++){
+    if(html[i]==='(') depth++;
+    else if(html[i]===')'){ depth--; if(depth===0) break; }
+  }
+  i = html.indexOf('{', i); depth = 0;
   for(; i<html.length; i++){
     const ch = html[i];
     if(ch==='{') depth++;
