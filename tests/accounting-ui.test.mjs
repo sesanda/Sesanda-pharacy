@@ -103,3 +103,41 @@ test('deleted bill: its sale entry is reversed in the books', { skip }, async()=
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('no Chart of Accounts yet: load it, Retry all posts failed bills/GRNs/payments on their own dates', { skip }, async()=>{
+  const d1 = Date.UTC(2026, 8, 5, 6), d2 = Date.UTC(2026, 9, 1, 6);
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.glAccounts = []; fx.collections.glJournals = [];
+  fx.collections.invoices = [
+    { id:'inv1', billNo:'B1', customerId:'c1', customerName:'Alpha Test', payment:'credit', totalToPay:1000, paidAmount:0, paid:false, createdAtMs:d1,
+      accountingStatus:'FAILED', accountingError:'Chart of Accounts has no active 4000 Sales Revenue account', items:[{ itemId:'it1', brandName:'Testamol', qty:10, lineTotal:1000, costTotal:600 }] },
+    { id:'inv2', billNo:'B2', customerId:null, customerName:'NC', payment:'cash', totalToPay:300, paidAmount:300, paid:true, createdAtMs:d2,
+      accountingStatus:'FAILED', items:[{ itemId:'it1', brandName:'Testamol', qty:3, lineTotal:300, costTotal:180 }] },
+  ];
+  fx.collections.grns = [{ ...fixture.collections.grns[0], accountingStatus:'FAILED', date:'2026-09-01' }];
+  fx.collections.payments = [
+    { id:'p1', customerId:'c1', customerName:'Alpha Test', amount:400, method:'cash', appliedTo:[{ billNo:'B1', applied:400 }], createdAtMs:d2, accountingStatus:'FAILED' },
+    { id:'p0', customerId:'c1', customerName:'Alpha Test', amount:0, method:'cash', accountingStatus:'FAILED' },
+  ];
+  fx.collections.customers = [{ id:'c1', name:'Alpha Test', dueAmount:600 }];
+  fx.collections.invoices[0].paidAmount = 400;
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await page.getByText('Finance (Setup)', { exact:true }).first().click();
+    await page.getByText('Accounts are not set up yet').waitFor();
+    await page.getByRole('button', { name:'🌱 Load default Chart of Accounts' }).click();
+    await page.getByTestId('health-check').waitFor();
+    await page.getByRole('button', { name:/Retry all failed \(4\)/ }).click();         // 1 GRN + 2 bills + 1 payment (the Rs 0 one is not listed)
+    await page.waitForFunction(()=> (window.firebase.__store.glJournals||[]).filter(j=> j.status==='POSTED').length===4, null, { timeout:30000 });
+    const js = await page.evaluate(()=> window.firebase.__store.glJournals.map(j=> [j.sourceType, j.sourceId, j.date]).sort());
+    assert.deepEqual(js, [['CUSTOMER_PAYMENT','p1','2026-10-01'], ['GRN','g1','2026-09-01'], ['SALE','inv1','2026-09-05'], ['SALE','inv2','2026-10-01']]);
+    await page.waitForFunction(()=> !document.body.innerText.includes('Posting '));
+    const t = await page.getByTestId('health-check').innerText();
+    assert.match(t, /Failed postings waiting for retry: 0/);
+    assert.match(t, /Trial Balance balanced/);
+    assert.match(t, /1100[^\n]*Rs\. 600\.00\s+Rs\. 600\.00/);                            // 1000 billed − 400 paid
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});

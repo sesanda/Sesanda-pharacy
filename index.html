@@ -1174,6 +1174,15 @@ async function reverseJournal(journalId, glAccounts, reason){
 // reversal journal cancel each other out and neither one counts as the source's live entry.
 function glIsLiveJournal(j){ return !!j && j.status==='POSTED' && !j.reversalOfJournalId; }
 
+// The business date of a source document, so a posting (or a later retry) lands in the period the
+// sale/payment actually happened, not the day it was posted: an explicit date field, else the
+// document's own creation time, else today.
+function glDocDate(doc){
+  if(doc && doc.date) return doc.date;
+  const ms = doc && (doc.createdAtMs || (doc.createdAt && typeof doc.createdAt.toMillis==='function' ? doc.createdAt.toMillis() : null));
+  return ms ? localDateStr(new Date(ms)) : todayISO();
+}
+
 /* ---------- GRN → Accounting integration (Step 2) ----------
    The ONLY thing GRN's save() calls for accounting. All debit/credit decisions and the actual
    posting still go through the Step 1 centralized createJournal()/postJournal() — this function
@@ -1272,7 +1281,7 @@ async function postSaleAccounting(invoice, glAccounts, existingJournals){
     lines.push({ accountId: inventoryAcc.id, debit: 0, credit: totalCOGS, description: desc });
   }
 
-  const journalId = await createJournal({ date: todayISO(), description: desc, sourceType, sourceId, lines }, glAccounts);
+  const journalId = await createJournal({ date: glDocDate(invoice), description: desc, sourceType, sourceId, lines }, glAccounts);
   await postJournal(journalId, glAccounts, existingJournals);
   return { status:'POSTED', journalId, journalNo: null };
 }
@@ -1304,7 +1313,7 @@ async function postCustomerPaymentAccounting(payment, glAccounts, existingJourna
     { accountId: cashAcc.id, debit: amount, credit: 0, description: desc },
     { accountId: arAcc.id, debit: 0, credit: amount, description: desc },
   ];
-  const journalId = await createJournal({ date: payment.date || todayISO(), description: desc, sourceType, sourceId, lines }, glAccounts);
+  const journalId = await createJournal({ date: glDocDate(payment), description: desc, sourceType, sourceId, lines }, glAccounts);
   await postJournal(journalId, glAccounts, existingJournals);
   return { status:'POSTED', journalId, journalNo: null };
 }
@@ -1328,7 +1337,7 @@ async function postSupplierPaymentAccounting(payment, glAccounts, existingJourna
     { accountId: apAcc.id, debit: amount, credit: 0, description: desc },
     { accountId: cashAcc.id, debit: 0, credit: amount, description: desc },
   ];
-  const journalId = await createJournal({ date: payment.date || todayISO(), description: desc, sourceType, sourceId, lines }, glAccounts);
+  const journalId = await createJournal({ date: glDocDate(payment), description: desc, sourceType, sourceId, lines }, glAccounts);
   await postJournal(journalId, glAccounts, existingJournals);
   return { status:'POSTED', journalId, journalNo: null };
 }
@@ -1651,7 +1660,11 @@ async function postOpeningBalanceAdjustment(accountCode, delta, glAccounts, exis
   if(dup) throw new Error('An opening-balance entry for ' + accountCode + ' was already posted today (' + dup.journalNo + ') — reverse it first if it was wrong');
   const desc = 'Opening balance adjustment — ' + accountCode;
   const lines = buildOpeningBalanceLines(accountCode, delta, glAccounts, desc);
-  const journalId = await createJournal({ date: todayISO(), description: desc, sourceType, sourceId, lines }, glAccounts);
+  // Dated at the start of the books (the earliest journal), so balance sheets for earlier dates
+  // don't show e.g. negative stock from sales posted before the opening stock was brought in.
+  const first = (existingJournals||[]).filter(j=> j.status==='POSTED' || j.status==='REVERSED').map(j=> j.date).filter(Boolean).sort()[0];
+  const date = first && first < todayISO() ? first : todayISO();
+  const journalId = await createJournal({ date, description: desc, sourceType, sourceId, lines }, glAccounts);
   await postJournal(journalId, glAccounts, existingJournals);
   return { status:'POSTED', journalId };
 }
@@ -3476,7 +3489,8 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
   // postCustomerPaymentAccounting()/postSupplierPaymentAccounting() path, so duplicate protection
   // still applies.
   const [retryingCustPay,setRetryingCustPay] = useState(null);
-  const failedCustPays = (payments||[]).filter(p=> p.accountingStatus==='FAILED');
+  // a zero-amount payment record has nothing to post (it can never succeed), so it isn't listed
+  const failedCustPays = (payments||[]).filter(p=> p.accountingStatus==='FAILED' && (Number(p.amount)||0) > 0);
   const retryCustPay = async (p)=>{
     setRetryingCustPay(p.id);
     try{
@@ -3492,7 +3506,7 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
   };
 
   const [retryingSupPay,setRetryingSupPay] = useState(null);
-  const failedSupPays = (supplierPayments||[]).filter(p=> p.accountingStatus==='FAILED');
+  const failedSupPays = (supplierPayments||[]).filter(p=> p.accountingStatus==='FAILED' && (Number(p.amount)||0) > 0);
   const retrySupPay = async (p)=>{
     setRetryingSupPay(p.id);
     try{
@@ -3505,6 +3519,48 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
       notify('❌ ' + err.message);
     }
     setRetryingSupPay(null);
+  };
+
+  // Retry all — the same per-item posting path as each row's Retry button, one item at a time
+  // (journal numbers come from a counter transaction, so in sequence, not in parallel). Needed
+  // when many postings failed at once, e.g. hundreds of bills saved before the Chart of Accounts
+  // was loaded. Each item still carries its own date (glDocDate), so the books land in the right
+  // periods; an item that fails again simply stays in its list.
+  const [bulk,setBulk] = useState(null); // {label, done, total, failed}
+  const BULK_GROUPS = [
+    { label:'GRNs', coll:'grns', items: ()=> failedGrns, post: postGrnAccounting },
+    { label:'Bills', coll:'invoices', items: ()=> failedBills, post: postSaleAccounting },
+    { label:'Customer payments', coll:'payments', items: ()=> failedCustPays, post: postCustomerPaymentAccounting },
+    { label:'Supplier payments', coll:'supplierPayments', items: ()=> failedSupPays, post: postSupplierPaymentAccounting },
+  ];
+  const retryAll = async (groups)=>{
+    const total = groups.reduce((s,g)=> s + g.items().length, 0);
+    if(total===0) return;
+    if(!window.confirm(total + ' items books වලට post කරන්නද? (විනාඩි කිහිපයක් යයි — page එක close කරන්න එපා)')) return;
+    let done = 0, failed = 0;
+    setBulk({label: groups.map(g=>g.label).join(', '), done, total, failed});
+    for(const g of groups){
+      for(const it of g.items()){
+        try{
+          const acct = await g.post(it, glAccounts, glJournals);
+          await db.collection(g.coll).doc(it.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null, accountingError: null });
+        }catch(err){
+          failed++;
+          console.error('Retry all —', g.label, it.id, err);
+          await db.collection(g.coll).doc(it.id).update({ accountingError: err.message }).catch(()=>{});
+        }
+        done++;
+        setBulk({label: g.label, done, total, failed});
+      }
+    }
+    setBulk(null);
+    notify(failed ? ('⚠ ' + (done-failed) + ' posted, ' + failed + ' still failing — see the Error column') : ('✓ ' + done + ' items posted to the books'));
+  };
+  const bulkButton = (groups, label)=>{
+    const n = groups.reduce((s,g)=> s + g.items().length, 0);
+    if(n===0) return null;
+    return <button className="btn btn-primary btn-sm" disabled={!!bulk || glAccounts.length===0} onClick={()=>retryAll(groups)} style={{marginLeft:8}}>
+      {bulk ? ('Posting ' + bulk.done + ' / ' + bulk.total + '…') : ('🔁 ' + (label||'Retry all') + ' (' + n + ')')}</button>;
   };
 
   // Same pattern for Expenses (Step 10) — retry uses the exact same centralized
@@ -3613,7 +3669,7 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
           <div>{ok(health.trialBalance.balanced)} Trial Balance {health.trialBalance.balanced ? 'balanced' : ('out by Rs. ' + health.trialBalance.difference.toFixed(2))}</div>
           <div>{ok(health.balanceSheet.balanced)} Balance Sheet {health.balanceSheet.balanced ? 'balanced' : ('out by Rs. ' + health.balanceSheet.difference.toFixed(2))}</div>
           <div>{ok(health.orphans.length===0)} Deleted bills/GRNs still in the books: {health.orphans.length}</div>
-          <div>{ok(health.unposted.bills.failed.length + health.unposted.grns.failed.length + health.unposted.customerPayments.failed.length + health.unposted.supplierPayments.failed.length===0)} Failed postings waiting for retry (below): {health.unposted.bills.failed.length + health.unposted.grns.failed.length + health.unposted.customerPayments.failed.length + health.unposted.supplierPayments.failed.length}</div>
+          <div>{ok(BULK_GROUPS.every(g=> g.items().length===0))} Failed postings waiting for retry: {BULK_GROUPS.reduce((s,g)=> s + g.items().length, 0)}{bulkButton(BULK_GROUPS, 'Retry all failed')}</div>
           <div>ℹ Cash in books: <b>Rs. {health.cash.toFixed(2)}</b> · Bank in books: <b>Rs. {health.bank.toFixed(2)}</b> — drawer එකේ සල්ලි / bank statement එකත් එක්ක ගලපලා බලන්න.</div>
         </div>
         <table data-testid="health-control">
@@ -3654,6 +3710,14 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
           ))}</tbody></table>
         </>)}
       </div>
+      )}
+
+      {!health.hasChart && (
+        <div className="card" style={{borderLeft:'4px solid var(--red)'}}>
+          <h3 style={{color:'var(--red)'}}>⚠ Accounts are not set up yet</h3>
+          <p style={{fontSize:13}}>Chart of Accounts එක load කරලා නැති නිසා bills, GRNs, payments කිසිවක් books වලට යන්නේ නැහැ (පහළ "Pending Accounting" lists).
+            පහළ <b>🌱 Load default Chart of Accounts</b> ඔබලා, ඊට පස්සේ උඩට එන Health Check එකේ <b>🔁 Retry all failed</b> ඔබන්න.</p>
+        </div>
       )}
 
       <div className="card">
@@ -3723,7 +3787,7 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
       </div>
 
       <div className="card">
-        <h3>⚠ GRNs Pending Accounting ({failedGrns.length})</h3>
+        <h3>⚠ GRNs Pending Accounting ({failedGrns.length}){bulkButton([BULK_GROUPS[0]])}</h3>
         {failedGrns.length===0 ? <div className="empty">Accounting posting fail වුනු GRN නැහැ.</div> :
         <table>
           <thead><tr><th>GRN No</th><th>Date</th><th>Supplier</th><th>Total</th><th>Error</th><th></th></tr></thead>
@@ -3743,7 +3807,7 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
       </div>
 
       <div className="card">
-        <h3>⚠ Bills Pending Accounting ({failedBills.length})</h3>
+        <h3>⚠ Bills Pending Accounting ({failedBills.length}){bulkButton([BULK_GROUPS[1]])}</h3>
         {failedBills.length===0 ? <div className="empty">Accounting posting fail වුනු Bill නැහැ.</div> :
         <table>
           <thead><tr><th>Bill No</th><th>Customer</th><th>Total</th><th>Error</th><th></th></tr></thead>
@@ -3763,7 +3827,7 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
       </div>
 
       <div className="card">
-        <h3>⚠ Pending/Failed Customer Payment Accounting ({failedCustPays.length})</h3>
+        <h3>⚠ Pending/Failed Customer Payment Accounting ({failedCustPays.length}){bulkButton([BULK_GROUPS[2]])}</h3>
         {failedCustPays.length===0 ? <div className="empty">Accounting posting fail වුනු Customer Payment නැහැ.</div> :
         <table>
           <thead><tr><th>Customer</th><th>Amount</th><th>Method</th><th>Error</th><th></th></tr></thead>
@@ -3782,7 +3846,7 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
       </div>
 
       <div className="card">
-        <h3>⚠ Pending/Failed Supplier Payment Accounting ({failedSupPays.length})</h3>
+        <h3>⚠ Pending/Failed Supplier Payment Accounting ({failedSupPays.length}){bulkButton([BULK_GROUPS[3]])}</h3>
         {failedSupPays.length===0 ? <div className="empty">Accounting posting fail වුනු Supplier Payment නැහැ.</div> :
         <table>
           <thead><tr><th>Supplier</th><th>GRN</th><th>Amount</th><th>Method</th><th>Error</th><th></th></tr></thead>
