@@ -3871,7 +3871,7 @@ function StaffApp({onExit}){
             onConvertToInvoice={(s)=>{ setBillPrefill({customerName:s.customerName, customerTel:s.customerTel, sourceSpecialOrderId:s.id}); setTab('billing'); }} />}
           {tab==='reports' && <Reports invoices={invoices} journal={journal} batches={batches} items={items} grns={grns}
             suppliers={suppliers} expenses={expenses} adjustments={adjustments} salesReturns={salesReturns} grnReturns={grnReturns}
-            glAccounts={glAccounts} glJournals={glJournals} notify={notify}/>}
+            glAccounts={glAccounts} glJournals={glJournals} customers={customers} payments={payments} notify={notify}/>}
           {tab==='cashcontrol' && <CashControl invoices={invoices} payments={payments} cashChecks={cashChecks} notify={notify} />}
           {tab==='finance' && <Finance glAccounts={glAccounts} glJournals={glJournals} grns={grns} invoices={invoices} payments={payments} supplierPayments={supplierPayments} expenses={opExpenses} capitalLoanTxns={capitalLoanTxns} batches={batches} notify={notify} />}
           {tab==='ledger' && <GeneralLedger glAccounts={glAccounts} glJournals={glJournals} />}
@@ -4746,6 +4746,44 @@ function reconcileReportCsv(report){
   section('Customers whose stored due differs from their bills', report.mismatches);
   section('Unpaid bills not linked to a customer record', report.unlinked);
   return lines.join('\n');
+}
+
+// "To Collect" report (Reports tab) — money still owed by customers, from their unpaid bills.
+// Read-only. Uses the same per-bill balance and customer linking as computeCustomerOutstanding,
+// so its total always equals the Customers tab / Dashboard figure.
+function buildCollectionsReport(customers, invoices, payments, nowMs){
+  const info = computeCustomerOutstanding(customers, invoices);
+  const DAY = 86400000;
+  const buckets = [{label:'0–30 days', max:30, amount:0, bills:0}, {label:'31–60 days', max:60, amount:0, bills:0},
+    {label:'61–90 days', max:90, amount:0, bills:0}, {label:'Over 90 days', max:Infinity, amount:0, bills:0}];
+  const byCust = {}, seen = new Set(), custIds = new Set((customers||[]).map(c=>c.id));
+  (invoices||[]).forEach(inv=>{
+    if(!inv || !inv.id || seen.has(inv.id)) return;
+    seen.add(inv.id);
+    const {balance} = invoiceBalanceInfo(inv);
+    if(balance<=0.001 || !inv.customerId || !custIds.has(inv.customerId)) return;
+    const ms = inv.createdAtMs || reconcileToMs(inv.createdAt);
+    const days = ms ? Math.max(0, Math.floor((nowMs - ms)/DAY)) : null;
+    const b = buckets.find(x=> (days==null ? Infinity : days) <= x.max);
+    b.amount += balance; b.bills += 1;
+    const r = byCust[inv.customerId] || (byCust[inv.customerId] = {oldestMs:null});
+    if(ms && (r.oldestMs==null || ms < r.oldestMs)) r.oldestMs = ms;
+  });
+  const lastPay = {};
+  (payments||[]).forEach(p=>{
+    const ms = reconcileToMs(p.createdAt);
+    if(p.customerId && (!lastPay[p.customerId] || (ms||0) > (lastPay[p.customerId].ms||0))) lastPay[p.customerId] = {ms, amount:Number(p.amount)||0};
+  });
+  const rows = (customers||[]).filter(c=> info.byId[c.id].outstanding>0.001).map(c=>{
+    const r = info.byId[c.id], o = (byCust[c.id]||{}).oldestMs, lp = lastPay[c.id];
+    return { id:c.id, name:c.name||'(no name)', tel:c.tel||'', outstanding:r.outstanding, openBills:r.openBills,
+      oldestBill: reconcileDay(o), oldestDays: o ? Math.max(0, Math.floor((nowMs - o)/DAY)) : null,
+      lastPayment: lp ? reconcileDay(lp.ms) : '', lastPaymentAmount: lp ? lp.amount : null };
+  }).sort((a,b)=> b.outstanding - a.outstanding);
+  buckets.forEach(b=>{ b.amount = Math.round(b.amount*100)/100; });
+  return { total: info.total, customersOwing: rows.length, openBills: rows.reduce((s,r)=>s+r.openBills,0),
+    unlinkedBills: info.unlinked.length, unlinkedAmount: Math.round(info.unlinked.reduce((s,u)=>s+u.balance,0)*100)/100,
+    buckets, rows };
 }
 
 // Null-safe customer search over name / tel / code (records missing a field are never dropped or crash the list).
@@ -7102,7 +7140,7 @@ function StaffSpecialOrders({specialOrders, notify, onConvertToInvoice}){
 }
 
 /* ---------- Reports: Sales / Purchasing / Item Ledger / P&L / Expired Write-Off ---------- */
-function Reports({invoices, journal, batches, items, grns, suppliers, expenses, adjustments, salesReturns, grnReturns, glAccounts, glJournals, notify}){
+function Reports({invoices, journal, batches, items, grns, suppliers, expenses, adjustments, salesReturns, grnReturns, glAccounts, glJournals, customers, payments, notify}){
   const [reportTab,setReportTab] = useState('overview');
   const [fromDate,setFromDate] = useState(todayISO());
   const [toDate,setToDate] = useState(todayISO());
@@ -7310,7 +7348,18 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
     {id:'purchasing', label:'📦 Purchasing Report'},
     {id:'ledger', label:'📒 Item Ledger'},
     {id:'writeoff', label:'🗑 Expired Write-Off'},
+    {id:'collect', label:'💰 To Collect'},
   ];
+  const collections = reportTab==='collect' ? buildCollectionsReport(customers, invoices, payments, Date.now()) : null;
+  const downloadBalanceCheck = ()=>{
+    const report = buildReconcileReport(customers, invoices, payments);
+    const url = URL.createObjectURL(new Blob([reconcileReportCsv(report)], {type:'text/csv'}));
+    const a = document.createElement('a');
+    a.href = url; a.download = 'reconcile-customer-balances-' + todayISO() + '.csv';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(()=>URL.revokeObjectURL(url), 5000);
+    notify(`📥 Balance check downloaded — ${report.summary.mismatchedCustomers} mismatch(es), ${report.summary.unlinkedUnpaidBills} unlinked bill(s). Nothing was changed.`);
+  };
 
   return (
     <div>
@@ -7320,7 +7369,7 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
         ))}
       </div>
 
-      {reportTab!=='writeoff' && (
+      {reportTab!=='writeoff' && reportTab!=='collect' && (
         <div className="card">
           <div className="grid c2">
             <div><label>From</label><input type="date" value={fromDate} onChange={e=>setFromDate(e.target.value)} /></div>
@@ -7549,6 +7598,44 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
               </div>
             </React.Fragment>
           )}
+        </div>
+      )}
+
+      {reportTab==='collect' && collections && (
+        <div className="card" data-testid="collect-report">
+          <h3>💰 To Collect — customer dues (as of {todayISO()})</h3>
+          <p style={{fontSize:12, color:'var(--ink-soft)', marginTop:0}}>
+            ණයට ගත්ත customers ලාගෙන් තාම ලැබෙන්න තියෙන සල්ලි — ගෙවලා නැති bills වලින් ගණන් කරලා. (Read-only — මෙතනින් කිසිම දෙයක් වෙනස් වෙන්නේ නැහැ.)
+          </p>
+          <div className="grid c3" style={{marginBottom:14}}>
+            <div className="card" style={{margin:0}}><div style={{fontSize:12,color:'var(--ink-soft)'}}>Total to collect</div><div data-testid="collect-total" style={{fontSize:18,fontWeight:700,color:'var(--red)'}}>{fmt(collections.total)}</div></div>
+            <div className="card" style={{margin:0}}><div style={{fontSize:12,color:'var(--ink-soft)'}}>Customers owing</div><div style={{fontSize:18,fontWeight:700}}>{collections.customersOwing}</div></div>
+            <div className="card" style={{margin:0}}><div style={{fontSize:12,color:'var(--ink-soft)'}}>Open bills</div><div style={{fontSize:18,fontWeight:700}}>{collections.openBills}</div></div>
+          </div>
+          <h4 style={{margin:'6px 0'}}>How long it has been owed</h4>
+          <table style={{marginBottom:14}}>
+            <thead><tr><th>Bill age</th><th>Bills</th><th>Amount</th></tr></thead>
+            <tbody>{collections.buckets.map(b=>(
+              <tr key={b.label}><td>{b.label}</td><td>{b.bills}</td><td style={{color: b.max>60 && b.amount>0 ? 'var(--red)' : undefined, fontWeight: b.max>60 && b.amount>0 ? 700 : 400}}>{fmt(b.amount)}</td></tr>
+            ))}</tbody>
+          </table>
+          <h4 style={{margin:'6px 0'}}>By customer (largest first)</h4>
+          <table>
+            <thead><tr><th>Customer</th><th>Tel</th><th>Open bills</th><th>Oldest bill</th><th>To collect</th><th>Last payment</th></tr></thead>
+            <tbody>
+              {collections.rows.length===0 ? <tr><td colSpan="6" style={{textAlign:'center', color:'var(--ink-soft)'}}>ලැබෙන්න තියෙන සල්ලි නැහැ 🎉</td></tr> :
+              collections.rows.map(r=>(
+                <tr key={r.id}><td>{r.name}</td><td>{r.tel}</td><td>{r.openBills}</td>
+                  <td>{r.oldestBill}{r.oldestDays!=null && <span style={{fontSize:11, color: r.oldestDays>60?'var(--red)':'var(--ink-soft)'}}> ({r.oldestDays} days)</span>}</td>
+                  <td style={{fontWeight:700}}>{fmt(r.outstanding)}</td>
+                  <td>{r.lastPayment ? r.lastPayment + ' — ' + fmt(r.lastPaymentAmount) : '—'}</td></tr>
+              ))}
+            </tbody>
+          </table>
+          {collections.unlinkedBills>0 && (
+            <p style={{fontSize:12, color:'#c9820a'}}>⚠ Customer කෙනෙක්ට link වෙලා නැති ගෙවලා නැති bills {collections.unlinkedBills}ක් ({fmt(collections.unlinkedAmount)}) — මේ total එකට එකතු කරලා නැහැ.</p>
+          )}
+          <button data-testid="report-balance-check" className="btn btn-ghost btn-sm" onClick={downloadBalanceCheck} style={{marginTop:8}}>⬇ Download balance check (CSV)</button>
         </div>
       )}
 
