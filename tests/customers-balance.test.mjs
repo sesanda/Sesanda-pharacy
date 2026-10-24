@@ -3,8 +3,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadHelpers } from './_extract.mjs';
-const { invoiceBalanceInfo, computeCustomerOutstanding, customerMatchesQuery, applySalesReturnToInvoice } =
-  (()=>{ globalThis.todayISO = ()=>'2026-10-20'; return loadHelpers(['invoiceBalanceInfo','computeCustomerOutstanding','customerMatchesQuery','applySalesReturnToInvoice']); })();
+const { invoiceBalanceInfo, computeCustomerOutstanding, customerMatchesQuery, applySalesReturnToInvoice, billMatchesQuery } =
+  (()=>{ globalThis.todayISO = ()=>'2026-10-20'; return loadHelpers(['invoiceBalanceInfo','computeCustomerOutstanding','customerMatchesQuery','applySalesReturnToInvoice','billMatchesQuery']); })();
 
 const cust = (id, extra={}) => ({ id, name:'Test '+id, tel:'07700000'+id.slice(-2), dueAmount:0, ...extra });
 const inv = (id, customerId, extra={}) => ({ id, customerId, billNo:'INV-'+id, payment:'credit', totalToPay:1000, paidAmount:0, paid:false, createdAtMs:1, ...extra });
@@ -120,4 +120,19 @@ test('customer search: name / tel / code, case-insensitive, null-safe', ()=>{
   assert.deepEqual(f('0722'), ['c']);
   assert.deepEqual(f('sun'), ['d']);
   assert.deepEqual(f('  '), ['a','b','c','d']);
+});
+
+test('bill search: number with or without INV-, customer name, tel', ()=>{
+  const bills = [
+    { id:'a', billNo:'INV-2264', customerName:'AJITH AIYA NEW', customerTel:'0722663129' },
+    { id:'b', billNo:'INV-226', customerName:'NC', customerTel:'' },
+    { id:'c', billNo:'INV-1500', customerName:null },
+  ];
+  const f = q => bills.filter(b=> billMatchesQuery(b, q)).map(b=>b.id);
+  assert.deepEqual(f('INV-2264'), ['a']);
+  assert.deepEqual(f('inv-226'), ['a','b']);      // partial number matches both
+  assert.deepEqual(f('2264'), ['a']);
+  assert.deepEqual(f('ajith'), ['a']);
+  assert.deepEqual(f('0722663129'), ['a']);
+  assert.deepEqual(f(''), ['a','b','c']);
 });
