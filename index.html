@@ -4047,6 +4047,8 @@ function StaffApp({onExit}){
   const [activeBillDraftId,setActiveBillDraftId] = useState(1);
   const [grnDrafts,setGrnDrafts] = useState([{id:1}]);
   const [activeGrnDraftId,setActiveGrnDraftId] = useState(1);
+  const [subGrnDrafts,setSubGrnDrafts] = useState([{id:1}]);
+  const [activeSubGrnDraftId,setActiveSubGrnDraftId] = useState(1);
   const notify = (msg)=>{ setToast(msg); setTimeout(()=>setToast(null), 3200); };
 
   const updateBillDraft = (id, patch)=> setBillDrafts(ds=> ds.map(d=> d.id===id? {...d, ...patch} : d));
@@ -4093,6 +4095,28 @@ function StaffApp({onExit}){
     if(!d) return 'GRN';
     if(d.rows && d.rows.length) return 'GRN (' + d.rows.length + ')';
     return d.invoiceNum || 'New GRN';
+  };
+  const updateSubGrnDraft = (id, patch)=> setSubGrnDrafts(ds=> ds.map(d=> d.id===id? {...d, ...patch} : d));
+  const newSubGrnDraft = ()=>{
+    const id = Date.now();
+    setSubGrnDrafts(ds=>[...ds, {id}]);
+    setActiveSubGrnDraftId(id);
+  };
+  const closeSubGrnDraft = (id)=>{
+    setSubGrnDrafts(ds=>{
+      const rest = ds.filter(d=>d.id!==id);
+      return rest.length? rest : [{id:Date.now()}];
+    });
+    setActiveSubGrnDraftId(prevId=>{
+      if(prevId!==id) return prevId;
+      const rest = subGrnDrafts.filter(d=>d.id!==id);
+      return rest.length? rest[rest.length-1].id : Date.now();
+    });
+  };
+  const subGrnDraftLabel = (d)=>{
+    if(!d) return 'Sub GRN';
+    if(d.rows && d.rows.length) return 'Sub GRN (' + d.rows.length + ')';
+    return d.invoiceNum || 'New Sub GRN';
   };
 
   useEffect(()=>{
@@ -4200,6 +4224,7 @@ function StaffApp({onExit}){
     {id:'items', label:'Item Registration', ic:'💊'},
     {id:'purchaseOrders', label:'Purchase Orders', ic:'📋'},
     {id:'grn', label:'GRN Entry', ic:'📦'},
+    {id:'subgrn', label:'Sub GRN Entry', ic:'🧩'},
     {id:'returns', label:'Returns', ic:'↩️'},
     {id:'opening', label:'Opening Stock', ic:'📥'},
     {id:'stock', label:'Stock', ic:'📋'},
@@ -4269,6 +4294,16 @@ function StaffApp({onExit}){
                 glAccounts={glAccounts} glJournals={glJournals}
                 initialDraft={grnDrafts.find(d=>d.id===activeGrnDraftId)}
                 onDraftChange={(patch)=>updateGrnDraft(activeGrnDraftId, patch)} />
+            </div>
+          )}
+          {tab==='subgrn' && (
+            <div>
+              <DraftTabBar drafts={subGrnDrafts} activeId={activeSubGrnDraftId} label={subGrnDraftLabel}
+                onSwitch={setActiveSubGrnDraftId} onNew={newSubGrnDraft} onClose={closeSubGrnDraft} icon="🧩" />
+              <GRNEntry key={'sub'+activeSubGrnDraftId} subMode items={items} batches={batches} suppliers={suppliers} notify={notify}
+                glAccounts={glAccounts} glJournals={glJournals}
+                initialDraft={subGrnDrafts.find(d=>d.id===activeSubGrnDraftId)}
+                onDraftChange={(patch)=>updateSubGrnDraft(activeSubGrnDraftId, patch)} />
             </div>
           )}
           {tab==='returns' && <Returns invoices={invoices} customers={customers} batches={batches} items={items} grns={grns} suppliers={suppliers} salesReturns={salesReturns} grnReturns={grnReturns} glAccounts={glAccounts} glJournals={glJournals} notify={notify}/>}
@@ -6113,10 +6148,12 @@ async function nextGrnNo(){
 }
 
 function emptyGrnEntry(){
-  return {itemId:'', itemCode:'', itemName:'', unit:'', packSize:0, pktQty:'', pktCost:'', pktSales:'', freeQty:'', expiry:'', looseQty:'', barcode:''};
+  return {itemId:'', itemCode:'', itemName:'', unit:'', packSize:0, pktQty:'', pktCost:'', pktSales:'', freeQty:'', expiry:'', looseQty:'', barcode:'', qty:'', unitCost:'', unitSales:''};
 }
 
-function GRNEntry({items, batches, suppliers, notify, initialDraft, onDraftChange, glAccounts, glJournals}){
+// subMode = "Sub GRN": same board, but items are received by plain unit quantity (Qty of items)
+// with a per-unit cost / selling price — no pack size, pkt qty, free qty, pkt cost or pkt sales.
+function GRNEntry({items, batches, suppliers, notify, initialDraft, onDraftChange, glAccounts, glJournals, subMode}){
   const d = initialDraft || {};
   const [supplierId,setSupplierId] = useState(d.supplierId||'');
   const [invoiceNum,setInvoiceNum] = useState(d.invoiceNum||'');
@@ -6150,16 +6187,18 @@ function GRNEntry({items, batches, suppliers, notify, initialDraft, onDraftChang
   };
   const stockFor = (itemId)=> itemId ? batches.filter(b=>b.itemId===itemId).reduce((s,b)=>s+(b.remainingUnits||0),0) : 0;
 
-  const qtyUnits = (Number(entry.pktQty)||0) * (Number(entry.packSize)||0);
-  const freeUnits = (Number(entry.freeQty)||0) * (Number(entry.packSize)||0);
-  const unitCost = entry.packSize ? (Number(entry.pktCost)||0)/entry.packSize : 0;
-  const unitSales = entry.packSize ? (Number(entry.pktSales)||0)/entry.packSize : 0;
-  const entryTotalCost = (Number(entry.pktQty)||0) * (Number(entry.pktCost)||0);
-  const entryTotalSales = (Number(entry.pktQty)||0) * (Number(entry.pktSales)||0);
+  const qtyUnits = subMode ? (Number(entry.qty)||0) : (Number(entry.pktQty)||0) * (Number(entry.packSize)||0);
+  const freeUnits = subMode ? 0 : (Number(entry.freeQty)||0) * (Number(entry.packSize)||0);
+  const unitCost = subMode ? (Number(entry.unitCost)||0) : entry.packSize ? (Number(entry.pktCost)||0)/entry.packSize : 0;
+  const unitSales = subMode ? (Number(entry.unitSales)||0) : entry.packSize ? (Number(entry.pktSales)||0)/entry.packSize : 0;
+  const entryTotalCost = subMode ? qtyUnits * unitCost : (Number(entry.pktQty)||0) * (Number(entry.pktCost)||0);
+  const entryTotalSales = subMode ? qtyUnits * unitSales : (Number(entry.pktQty)||0) * (Number(entry.pktSales)||0);
 
   const addRow = ()=>{
     if(!entry.itemId) return notify('Item එකක් තෝරන්න');
-    if(!entry.pktQty || !entry.pktCost || !entry.pktSales) return notify('Pkt Qty, Pkt Cost, Pkt Sales පුරවන්න');
+    if(subMode){
+      if(!(qtyUnits>0) || entry.unitCost==='' || entry.unitSales==='') return notify('Qty of items, Unit Cost, Unit Sales පුරවන්න');
+    } else if(!entry.pktQty || !entry.pktCost || !entry.pktSales) return notify('Pkt Qty, Pkt Cost, Pkt Sales පුරවන්න');
     if(!entry.expiry) return notify('Expire Date එක ඕන');
     if(purchaseOrderId && poRemainingMap[entry.itemId]!=null && qtyUnits > poRemainingMap[entry.itemId]){
       const ok = window.confirm('Purchase Order එකේ ඉතිරිව තිබුණේ ' + poRemainingMap[entry.itemId] + ' units විතරයි — ඊට වඩා receive කරනවා. ඉදිරියට යනවද?');
@@ -6200,17 +6239,25 @@ function GRNEntry({items, batches, suppliers, notify, initialDraft, onDraftChang
         discountType, discountVal:Number(discountVal)||0, discountAmount,
         totalAmount: grandTotal, payment, paid: payment!=='credit',
         purchaseOrderId: purchaseOrderId || null, purchaseOrderNumber: purchaseOrderNumber || '',
+        ...(subMode ? {grnType:'sub'} : {}),
         createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       });
       for(const r of rows){
         const existingBatches = batches.filter(b=>b.itemId===r.itemId).length + rows.filter(rr=>rr.itemId===r.itemId && rows.indexOf(rr)<rows.indexOf(r)).length;
         const batchCode = batchPrefix(existingBatches) + r.itemCode;
         const totalUnits = r.qtyUnits + r.freeUnits;
+        const pk = Number(r.packSize)||1;
         await db.collection('batches').add({
           batchCode, itemId:r.itemId, brandName:r.itemName,
-          costPricePerPack:Number(r.pktCost), sellPricePerPack:Number(r.pktSales),
+          ...(subMode ? {
+            costPricePerPack:r.unitCost*pk, sellPricePerPack:r.unitSales*pk,
+            qtyPacks:Math.floor(r.qtyUnits/pk), freePacks:0, looseQty:r.qtyUnits%pk,
+          } : {
+            costPricePerPack:Number(r.pktCost), sellPricePerPack:Number(r.pktSales),
+            qtyPacks:Number(r.pktQty), freePacks:Number(r.freeQty)||0,
+          }),
           unitCost:r.unitCost, unitSell:r.unitSales,
-          expiryDate:r.expiry, qtyPacks:Number(r.pktQty), freePacks:Number(r.freeQty)||0,
+          expiryDate:r.expiry,
           qtyUnits: totalUnits, remainingUnits: totalUnits,
           supplierId, supplierName:sup.name, grnId:grnRef.id, grnNo, invoiceNum,
           purchaseOrderId: purchaseOrderId || null, purchaseOrderNumber: purchaseOrderNumber || '',
@@ -6260,7 +6307,7 @@ function GRNEntry({items, batches, suppliers, notify, initialDraft, onDraftChang
   return (
     <div>
       <div className="card">
-        <h3>📦 Purchase / GRN Entry</h3>
+        <h3>{subMode ? '🧩 Sub GRN Entry (units)' : '📦 Purchase / GRN Entry'}</h3>
         {purchaseOrderId && (
           <div style={{fontSize:12.5, color:'var(--accent)', marginTop:-6, marginBottom:8}}>
             🔗 Converted from Purchase Order <b>{purchaseOrderNumber}</b>
@@ -6282,7 +6329,7 @@ function GRNEntry({items, batches, suppliers, notify, initialDraft, onDraftChang
         <h3 style={{color:'var(--accent)'}}>➕ Add Item</h3>
         <GrnEntryStrip entry={entry} patchEntry={patchEntry} pickItem={pickItem} items={items}
           stockFor={stockFor} qtyUnits={qtyUnits} freeUnits={freeUnits} unitCost={unitCost} unitSales={unitSales}
-          entryTotalCost={entryTotalCost} itemSearchRef={itemSearchRef} onAdd={addRow} notify={notify} />
+          entryTotalCost={entryTotalCost} itemSearchRef={itemSearchRef} onAdd={addRow} notify={notify} subMode={subMode} />
         <div style={{display:'flex', gap:10, marginTop:14}}>
           <button className="btn btn-primary" onClick={addRow}>+ Add</button>
           <button className="btn btn-ghost" onClick={()=>setEntry(emptyGrnEntry())}>Clear</button>
@@ -6295,15 +6342,18 @@ function GRNEntry({items, batches, suppliers, notify, initialDraft, onDraftChang
         <div style={{overflowX:'auto'}}>
           <table>
             <thead><tr>
-              <th>No</th><th>Code</th><th>Item Name</th><th>Unit</th><th>Pkt Qty</th><th>Free</th>
-              <th>Pkt Cost</th><th>Pkt Sales</th><th>Total Cost</th><th>Expiry</th><th></th>
+              <th>No</th><th>Code</th><th>Item Name</th><th>Unit</th>
+              {subMode ? <><th>Qty</th><th>Unit Cost</th><th>Unit Sales</th></>
+                : <><th>Pkt Qty</th><th>Free</th><th>Pkt Cost</th><th>Pkt Sales</th></>}
+              <th>Total Cost</th><th>Expiry</th><th></th>
             </tr></thead>
             <tbody>
               {rows.map((r,i)=>(
                 <tr key={i}>
                   <td>{i+1}</td><td>{r.itemCode}</td><td>{r.itemName}</td><td>{r.unit}</td>
-                  <td>{r.pktQty}</td><td>{r.freeQty||0}</td>
-                  <td>{Number(r.pktCost).toFixed(2)}</td><td>{Number(r.pktSales).toFixed(2)}</td>
+                  {subMode ? <><td>{r.qtyUnits}</td><td>{Number(r.unitCost).toFixed(2)}</td><td>{Number(r.unitSales).toFixed(2)}</td></>
+                    : <><td>{r.pktQty}</td><td>{r.freeQty||0}</td>
+                  <td>{Number(r.pktCost).toFixed(2)}</td><td>{Number(r.pktSales).toFixed(2)}</td></>}
                   <td>{fmt(r.totalCost)}</td><td>{r.expiry}</td>
                   <td><button className="btn btn-danger btn-sm" onClick={()=>removeRow(i)}>✕</button></td>
                 </tr>
@@ -6526,7 +6576,7 @@ function OpeningStockEntryStrip({entry, patchEntry, pickItem, items, stockFor, q
   );
 }
 
-function GrnEntryStrip({entry, patchEntry, pickItem, items, stockFor, qtyUnits, freeUnits, unitCost, unitSales, entryTotalCost, itemSearchRef, onAdd, notify, showLooseQty}){
+function GrnEntryStrip({entry, patchEntry, pickItem, items, stockFor, qtyUnits, freeUnits, unitCost, unitSales, entryTotalCost, itemSearchRef, onAdd, notify, showLooseQty, subMode}){
   const [query,setQuery] = useState('');
   const [open,setOpen] = useState(false);
   const [hi,setHi] = useState(0);
@@ -6603,6 +6653,17 @@ function GrnEntryStrip({entry, patchEntry, pickItem, items, stockFor, qtyUnits, 
         </div>
       </div>
 
+      {subMode ? (
+      <div className="grid c4" style={{marginTop:12}}>
+        <div><label>Qty of items ({entry.unit||'units'})</label><input ref={pktQtyRef} type="number" data-testid="sub-grn-qty" value={entry.qty||''} onChange={e=>patchEntry({qty:e.target.value})}
+          onKeyDown={e=>e.key==='Enter' && costRef.current.focus()} /></div>
+        <div><label>Unit Cost (Rs.)</label><input ref={costRef} type="number" data-testid="sub-grn-unit-cost" value={entry.unitCost||''} onChange={e=>patchEntry({unitCost:e.target.value})}
+          onKeyDown={e=>e.key==='Enter' && salesRef.current.focus()} /></div>
+        <div><label>Unit Sales (Rs.)</label><input ref={salesRef} type="number" data-testid="sub-grn-unit-sales" value={entry.unitSales||''} onChange={e=>patchEntry({unitSales:e.target.value})}
+          onKeyDown={e=>{ if(e.key==='Enter'){ e.preventDefault(); expRef.current.focus(); } }} /></div>
+        <div><label>Stock (current)</label><input readOnly style={{background:'var(--card)'}} value={entry.itemId? stockFor(entry.itemId):0} /></div>
+      </div>
+      ) : (<>
       <div className="grid c4" style={{marginTop:12}}>
         <div><label>Pack Size</label><input readOnly style={{background:'var(--card)'}} value={entry.packSize||''} /></div>
         <div><label>Pkt Qty (full packs)</label><input ref={pktQtyRef} type="number" value={entry.pktQty} onChange={e=>patchEntry({pktQty:e.target.value})}
@@ -6624,10 +6685,11 @@ function GrnEntryStrip({entry, patchEntry, pickItem, items, stockFor, qtyUnits, 
         <div><label>Unit Cost</label><input readOnly style={{background:'var(--card)'}} value={unitCost.toFixed(2)} /></div>
         <div><label>Unit Sales</label><input readOnly style={{background:'var(--card)'}} value={unitSales.toFixed(2)} /></div>
       </div>
+      </>)}
 
       <div className="grid c3" style={{marginTop:12}}>
         <div><label>Qty (units)</label><input readOnly style={{background:'var(--card)'}} value={qtyUnits} /></div>
-        <div><label>Free (units)</label><input readOnly style={{background:'var(--card)'}} value={freeUnits} /></div>
+        {!subMode && <div><label>Free (units)</label><input readOnly style={{background:'var(--card)'}} value={freeUnits} /></div>}
         <div><label>Amount (Rs.)</label><input readOnly style={{background:'var(--card)', fontWeight:700}} value={entryTotalCost.toFixed(2)} /></div>
       </div>
     </div>
