@@ -667,6 +667,27 @@ async function deductStockFEFO(itemId, qtyToDeduct, batches){
 }
 // Blended average unit cost for an item across its current batches — used to value stock
 // coming back in (resellable sales returns) or going out (loss write-offs).
+// Selling price per unit for billing: the FEFO batch's own price, or — when that batch carries no
+// price (stock put back by a return or a deleted bill before returns kept their price) — the most
+// recent priced batch of the same item, so a restocked unit never bills at Rs 0.00.
+function itemSellPrice(itemId, batches){
+  const mine = (batches||[]).filter(b=> b.itemId===itemId);
+  const fefo = mine.filter(b=> b.remainingUnits>0).sort((a,b)=>(a.expiryDate||'')<(b.expiryDate||'')?-1:1)[0];
+  if(fefo && Number(fefo.unitSell) > 0) return Number(fefo.unitSell);
+  const priced = mine.filter(b=> Number(b.unitSell) > 0).sort((a,b)=> (b.createdAt?.seconds||0) - (a.createdAt?.seconds||0));
+  return priced.length ? Number(priced[0].unitSell) : 0;
+}
+
+// Price, cost and expiry for stock put back on the shelf from a sold bill line (sales return,
+// deleted bill): the price it was sold at, its batch's expiry when that batch is known, so the
+// unit bills again at a real price and keeps its FEFO place.
+function restockBatchFields(line, batches, fallbackUnitCost){
+  const src = (batches||[]).find(b=> b.itemId===line.itemId && line.batchCode && b.batchCode===line.batchCode);
+  const unitSell = Number(line.unitPrice) > 0 ? Number(line.unitPrice) : (src && Number(src.unitSell)) || itemSellPrice(line.itemId, batches);
+  const unitCost = fallbackUnitCost!=null ? fallbackUnitCost : (Number(line.unitCost) || (src && src.unitCost) || 0);
+  return { unitSell, unitCost, expiryDate: (src && src.expiryDate) || '' };
+}
+
 function estimateItemUnitCost(itemId, batches){
   const relevant = (batches||[]).filter(b=>b.itemId===itemId);
   if(relevant.length===0) return 0;
@@ -1221,8 +1242,11 @@ async function postGrnAccounting(grn, glAccounts, existingJournals){
   const amount = Number(grn.totalAmount)||0;
   if(amount <= 0) throw new Error('GRN total is zero — nothing to post');
 
-  const inventoryAcc = findGlAccountByCode(glAccounts, '1210');
-  if(!inventoryAcc) throw new Error('Chart of Accounts has no active 1210 Pharmacy Inventory account — load/check it in Finance');
+  // An old unpaid supplier bill entered without stock (isOpeningBalance) is money owed from before the
+  // books started — its goods are already in the opening stock — so it debits 3000 Owner Capital.
+  const debitCode = grn.isOpeningBalance ? '3000' : '1210';
+  const inventoryAcc = findGlAccountByCode(glAccounts, debitCode);
+  if(!inventoryAcc) throw new Error('Chart of Accounts has no active ' + debitCode + ' account — load/check it in Finance');
 
   // Existing GRN payment field only distinguishes 'cash' vs 'credit' (no separate bank option) —
   // credit purchases owe the supplier (2100), everything else is treated as an immediate cash
@@ -1611,7 +1635,7 @@ async function postSalesReturnAccounting(ret, glAccounts, existingJournals){
   const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j));
   if(dup) return { status:'ALREADY_POSTED', journalId: dup.id, journalNo: dup.journalNo };
   const sale = (existingJournals||[]).find(j=> j.sourceType==='SALE' && j.sourceId===ret.invoiceId && glIsLiveJournal(j));
-  if(!sale) return { status:'SKIPPED', journalId:null, journalNo:null, reason:'Bill ' + (ret.billNo||ret.invoiceId) + ' has no sale entry in the books (before accounting started)' };
+  if(!sale && !glOpeningBalancesPosted(existingJournals)) return { status:'SKIPPED', journalId:null, journalNo:null, reason:'Bill ' + (ret.billNo||ret.invoiceId) + ' has no sale entry in the books (before accounting started)' };
   const desc = 'Sales return — Bill ' + (ret.billNo||ret.invoiceId) + (ret.customerName? (' — '+ret.customerName) : '');
   const lines = buildSalesReturnLines({ dueReduction:ret.dueReduction, cashRefund:ret.cashRefund, restockCost:ret.restockCost, payment:ret.payment, desc }, glAccounts);
   const journalId = await createJournal({ date: ret.date || todayISO(), description: desc, sourceType, sourceId, lines }, glAccounts);
@@ -1626,21 +1650,36 @@ async function postGrnReturnAccounting(ret, glAccounts, existingJournals){
   const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j));
   if(dup) return { status:'ALREADY_POSTED', journalId: dup.id, journalNo: dup.journalNo };
   const grnJ = (existingJournals||[]).find(j=> j.sourceType==='GRN' && j.sourceId===ret.grnId && glIsLiveJournal(j));
-  if(!grnJ) return { status:'SKIPPED', journalId:null, journalNo:null, reason:'GRN ' + (ret.grnNo||ret.grnId) + ' has no entry in the books (before accounting started)' };
-  const amount = Number(ret.amount)||0;
-  if(amount <= 0) throw new Error('Return value is zero — nothing to post');
-  const apAcc = findGlAccountByCode(glAccounts, '2100');
-  if(!apAcc) throw new Error('Chart of Accounts has no active 2100 Supplier Payables account — load/check it in Finance');
-  const invAcc = findGlAccountByCode(glAccounts, '1210');
-  if(!invAcc) throw new Error('Chart of Accounts has no active 1210 Pharmacy Inventory account — load/check it in Finance');
+  if(!grnJ && !glOpeningBalancesPosted(existingJournals)) return { status:'SKIPPED', journalId:null, journalNo:null, reason:'GRN ' + (ret.grnNo||ret.grnId) + ' has no entry in the books (before accounting started)' };
   const desc = 'GRN return — ' + (ret.grnNo||ret.grnId) + (ret.supplierName? (' — '+ret.supplierName) : '');
-  const lines = [
-    { accountId: apAcc.id, debit: amount, credit: 0, description: desc },
-    { accountId: invAcc.id, debit: 0, credit: amount, description: desc },
-  ];
+  const lines = buildGrnReturnLines(ret, glAccounts, desc);
   const journalId = await createJournal({ date: ret.date || todayISO(), description: desc, sourceType, sourceId, lines }, glAccounts);
   await postJournal(journalId, glAccounts, existingJournals);
   return { status:'POSTED', journalId, journalNo: null };
+}
+
+// Pure: journal lines for goods returned to a supplier. Inventory leaves at cost (ret.cost, or
+// ret.amount for returns saved before a separate credit value existed); the supplier owes us /
+// we owe them less by the credit value they give (ret.amount). A credit above cost is a gain
+// (4100 Other Income), below cost a loss (6600 Other Expenses).
+function buildGrnReturnLines(ret, glAccounts, desc){
+  const need = (code)=>{ const a = findGlAccountByCode(glAccounts, code); if(!a) throw new Error('Chart of Accounts has no active ' + code + ' account — load/check it in Finance'); return a; };
+  const credit = Math.round((Number(ret.amount)||0)*100)/100;
+  const cost = Math.round((ret.cost!=null ? Number(ret.cost)||0 : credit)*100)/100;
+  if(credit <= 0 && cost <= 0) throw new Error('Return value is zero — nothing to post');
+  const lines = [];
+  if(credit > 0) lines.push({ accountId: need('2100').id, debit: credit, credit: 0, description: desc });
+  if(cost > 0) lines.push({ accountId: need('1210').id, debit: 0, credit: cost, description: desc });
+  const diff = Math.round((credit - cost)*100)/100;
+  if(diff > 0) lines.push({ accountId: need('4100').id, debit: 0, credit: diff, description: desc + ' (credit above cost)' });
+  if(diff < 0) lines.push({ accountId: need('6600').id, debit: -diff, credit: 0, description: desc + ' (credit below cost)' });
+  return lines;
+}
+
+// Opening-balance entries exist once the books were brought up to the shop's real figures; from
+// then on bills/GRNs from before accounting started are covered, so their returns post too.
+function glOpeningBalancesPosted(journals){
+  return (journals||[]).some(j=> glIsLiveJournal(j) && j.sourceType==='OPENING_BALANCE');
 }
 
 // A deleted bill must leave the books too: reverse its live SALE journal (revenue, cash/AR and
@@ -4235,7 +4274,7 @@ function StaffApp({onExit}){
           {tab==='returns' && <Returns invoices={invoices} customers={customers} batches={batches} items={items} grns={grns} suppliers={suppliers} salesReturns={salesReturns} grnReturns={grnReturns} glAccounts={glAccounts} glJournals={glJournals} notify={notify}/>}
           {tab==='opening' && <OpeningStock items={items} batches={batches} notify={notify}/>}
           {tab==='stock' && <StockView items={items} batches={batches}/>}
-          {tab==='suppliers' && <Suppliers suppliers={suppliers} notify={notify}/>}
+          {tab==='suppliers' && <Suppliers suppliers={suppliers} grns={grns} glAccounts={glAccounts} glJournals={glJournals} notify={notify}/>}
           {tab==='customers' && <Customers customers={customers} invoices={invoices} payments={payments} items={items} medReminders={medReminders} notify={notify} glAccounts={glAccounts} glJournals={glJournals} customersLoading={customersLoading} customersError={customersError} invoicesError={invoicesError}/>}
           {tab==='orders' && <OrdersBoard orders={orders} items={items} batches={batches} notify={notify}/>}
           {tab==='special' && <StaffSpecialOrders specialOrders={specialOrders} notify={notify}
@@ -4687,8 +4726,44 @@ function ItemRegistration({items, batches, notify}){
 /* ---------- Suppliers ---------- */
 function emptySalesRepEntry(){ return {name:'', tel:''}; }
 
-function Suppliers({suppliers, notify}){
+function Suppliers({suppliers, grns, glAccounts, glJournals, notify}){
   const [f,setF] = useState({name:'',code:'',tel:'',address:'',credit:''});
+
+  // Old unpaid supplier bill from before the system — only the amount owed, no stock (its goods are
+  // already counted in Opening Stock). Saved as a credit GRN marked isOpeningBalance, so it shows in
+  // supplier dues, can be paid with "Mark Paid", or settled by a GRN Return; in the books it moves
+  // 3000 Owner Capital → 2100 Supplier Payables (postGrnAccounting).
+  const [ob,setOb] = useState({supplierId:'', invoiceNum:'', date: todayISO(), amount:''});
+  const [obSaving,setObSaving] = useState(false);
+  const saveOldBill = async ()=>{
+    const sup = suppliers.find(s=> s.id===ob.supplierId);
+    const amount = Math.round((Number(ob.amount)||0)*100)/100;
+    if(!sup) return notify('Supplier එකක් තෝරන්න');
+    if(amount<=0) return notify('Amount එක දාන්න');
+    if(!window.confirm(sup.name + ' ට ගෙවන්න තියෙන පරණ bill එකක් — ' + fmt(amount) + '\nStock එකට එකතු වෙන්නේ නැහැ. Save කරන්නද?')) return;
+    setObSaving(true);
+    try{
+      const grnNo = 'OLD-' + (await nextGrnNo());
+      const doc = { grnNo, supplierId: sup.id, supplierName: sup.name, invoiceNum: ob.invoiceNum||'', date: ob.date || todayISO(),
+        discountType:'amount', discountVal:0, discountAmount:0, totalAmount: amount, payment:'credit', paid:false, paidAmount:0,
+        isOpeningBalance:true, createdAt: firebase.firestore.FieldValue.serverTimestamp() };
+      const ref = await db.collection('grns').add(doc);
+      notify('✓ ' + grnNo + ' saved — ' + sup.name + ' ට ගෙවන්න ' + fmt(amount));
+      setOb({supplierId:'', invoiceNum:'', date: todayISO(), amount:''});
+      if(glAccounts && glAccounts.length){
+        try{
+          const acct = await postGrnAccounting({id: ref.id, ...doc}, glAccounts, glJournals);
+          await db.collection('grns').doc(ref.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null });
+        }catch(err){
+          console.error('Old supplier bill accounting failed', err);
+          await db.collection('grns').doc(ref.id).update({ accountingStatus:'FAILED', accountingError: err.message }).catch(()=>{});
+          notify('⚠ Saved, but accounting entry failed — retry from Finance: ' + err.message);
+        }
+      }
+    }catch(e){ console.error(e); notify('❌ Save වුනේ නැහැ: ' + (e.message||e)); }
+    setObSaving(false);
+  };
+  const oldBills = (grns||[]).filter(g=> g.isOpeningBalance).sort((a,b)=> (b.date||'')<(a.date||'')?-1:1);
   const [newReps,setNewReps] = useState([]); // sales reps added while creating this new supplier
   const [repEntry,setRepEntry] = useState(emptySalesRepEntry());
 
@@ -4738,6 +4813,33 @@ function Suppliers({suppliers, notify}){
         </div>
 
         <button className="btn btn-primary" style={{marginTop:14}} onClick={save}>Save Supplier</button>
+      </div>
+      <div className="card" data-testid="old-supplier-bill">
+        <h3>📜 පරණ ගෙවන්න තියෙන Supplier Bill (stock නැතුව)</h3>
+        <p style={{fontSize:12, color:'var(--ink-soft)', marginTop:0}}>
+          System එකට කලින් ගත්ත, තාම ගෙවලා නැති bill එකක ගාණ විතරක් දාන්න. Stock එකට එකතු වෙන්නේ නැහැ (ඒ බඩු Opening Stock එකේ දැනටමත් තියෙනවා).
+          පස්සේ Dashboard එකේ "Mark Paid" එකෙන් ගෙවන්න, නැත්නම් Returns → GRN Return එකෙන් බඩු return කරලා settle කරන්න පුළුවන්.
+        </p>
+        <div className="grid c2">
+          <div><label>Supplier</label>
+            <select value={ob.supplierId} onChange={e=>setOb({...ob, supplierId:e.target.value})}>
+              <option value="">-- Select --</option>
+              {suppliers.slice().sort((a,b)=> String(a.name||'').localeCompare(String(b.name||''))).map(s=> <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select></div>
+          <div><label>Supplier invoice no</label><input value={ob.invoiceNum} onChange={e=>setOb({...ob, invoiceNum:e.target.value})} placeholder="e.g. INV-5521"/></div>
+          <div><label>Bill date</label><input type="date" value={ob.date} onChange={e=>setOb({...ob, date:e.target.value})}/></div>
+          <div><label>ගෙවන්න තියෙන ගාණ (Rs.)</label><input type="number" value={ob.amount} onChange={e=>setOb({...ob, amount:e.target.value})}/></div>
+        </div>
+        <button className="btn btn-primary" style={{marginTop:12}} disabled={obSaving} onClick={saveOldBill}>{obSaving ? 'Saving…' : '💾 Save Old Bill'}</button>
+        {oldBills.length>0 && (
+          <table style={{marginTop:12}}>
+            <thead><tr><th>No</th><th>Date</th><th>Supplier</th><th>Invoice</th><th>Amount</th><th>Paid</th></tr></thead>
+            <tbody>{oldBills.map(g=>(
+              <tr key={g.id}><td>{g.grnNo}</td><td>{g.date}</td><td>{g.supplierName}</td><td>{g.invoiceNum}</td>
+                <td>{fmt(g.totalAmount||0)}</td><td>{g.paid ? '✓' : fmt(g.paidAmount||0)}</td></tr>
+            ))}</tbody>
+          </table>
+        )}
       </div>
       <div className="card">
         <h3>Suppliers ({suppliers.length})</h3>
@@ -5692,10 +5794,11 @@ function Returns({invoices, customers, batches, items, grns, suppliers, salesRet
         });
         if(r.condition==='resellable'){
           const newBatchRef = db.collection('batches').doc();
+          const rb = restockBatchFields(r.item, batches, unitCost);
           batch.set(newBatchRef, {
             batchCode:'RET-'+Date.now()+'-'+r.item.itemId.slice(0,4), itemId:r.item.itemId, brandName:r.item.brandName,
-            costPricePerPack:0, sellPricePerPack:0, unitCost, unitSell:0,
-            expiryDate:'', qtyPacks:0, qtyUnits:qty, remainingUnits:qty,
+            costPricePerPack:0, sellPricePerPack:0, unitCost, unitSell: rb.unitSell,
+            expiryDate: rb.expiryDate, qtyPacks:0, qtyUnits:qty, remainingUnits:qty,
             supplierId:'', supplierName:'Sales Return', invoiceNum:'', grnId:null, isReturn:true,
             createdAt: firebase.firestore.FieldValue.serverTimestamp(),
           });
@@ -5757,10 +5860,23 @@ function Returns({invoices, customers, batches, items, grns, suppliers, salesRet
     setGrnReturnRows(rows);
   };
   const patchGrnRow = (idx, patch)=> setGrnReturnRows(rows=> rows.map((r,i)=> i===idx? {...r, ...patch} : r));
+  // Cost of what goes back (stock leaves the books at cost)
   const grnReturnTotal = grnReturnRows.reduce((s,r)=>{
     const qty = Number(r.qty)||0;
     return qty>0 ? s + qty*(r.batch.unitCost||0) : s;
   },0);
+  // Any item in stock can be sent back against this GRN/bill — not only this GRN's own batches —
+  // e.g. to settle a supplier's bill with goods instead of cash.
+  const [otherQuery,setOtherQuery] = useState('');
+  const otherMatches = otherQuery.trim().length>1
+    ? (batches||[]).filter(b=> (b.remainingUnits||0)>0 && !grnReturnRows.some(r=> r.batch.id===b.id)
+        && String(b.brandName||'').toLowerCase().includes(otherQuery.trim().toLowerCase())).slice(0,8)
+    : [];
+  const addOtherBatch = (b)=>{ setGrnReturnRows(rows=> [...rows, {batch:b, maxQty: Math.max(0, b.remainingUnits||0), qty:'', reason:'', other:true}]); setOtherQuery(''); };
+  // What the supplier actually credits for the goods (defaults to our cost); a different figure is
+  // booked as a gain/loss on the return.
+  const [grnCreditValue,setGrnCreditValue] = useState('');
+  const grnCredit = grnCreditValue==='' ? grnReturnTotal : Math.max(0, Number(grnCreditValue)||0);
 
   const processGrnReturn = async ()=>{
     if(!foundGrn) return notify('GRN එකක් search කරන්න');
@@ -5774,7 +5890,8 @@ function Returns({invoices, customers, batches, items, grns, suppliers, salesRet
       const batch = db.batch();
       let totalRefund = 0, firstRetRef = null;
       const acctTotal = rows.reduce((s,r)=> s + +((r.batch.unitCost||0)*Number(r.qty)).toFixed(2), 0);
-      const acctRet = { grnId: foundGrn.id, grnNo: foundGrn.grnNo, supplierName: foundGrn.supplierName, amount: +acctTotal.toFixed(2), date: todayISO() };
+      const creditValue = grnCreditValue==='' ? +acctTotal.toFixed(2) : Math.round((Math.max(0, Number(grnCreditValue)||0))*100)/100;
+      const acctRet = { grnId: foundGrn.id, grnNo: foundGrn.grnNo, supplierName: foundGrn.supplierName, amount: creditValue, cost: +acctTotal.toFixed(2), date: todayISO() };
       for(const r of rows){
         const qty = Number(r.qty);
         const unitCost = r.batch.unitCost||0;
@@ -5793,14 +5910,15 @@ function Returns({invoices, customers, batches, items, grns, suppliers, salesRet
       }
       let dueEffect = '';
       if(foundGrn.payment==='credit' && !foundGrn.paid){
-        const newTotal = Math.max(0, (foundGrn.totalAmount||0) - totalRefund);
-        batch.update(db.collection('grns').doc(foundGrn.id), {totalAmount:newTotal});
-        dueEffect = ` — Amount owed to supplier reduced to ${fmt(newTotal)}`;
+        const newTotal = Math.max(0, (foundGrn.totalAmount||0) - creditValue);
+        const settled = newTotal <= (Number(foundGrn.paidAmount)||0) + 0.001;
+        batch.update(db.collection('grns').doc(foundGrn.id), settled ? {totalAmount:newTotal, paid:true} : {totalAmount:newTotal});
+        dueEffect = settled ? ' — ✓ Supplier bill settled by this return' : ` — Amount owed to supplier reduced to ${fmt(newTotal)}`;
       } else {
-        dueEffect = ` — 💵 Refund/credit note expected from supplier: ${fmt(totalRefund)}`;
+        dueEffect = ` — 💵 Refund/credit note expected from supplier: ${fmt(creditValue)}`;
       }
       await batch.commit();
-      notify(`✓ GRN Return processed — Value: ${fmt(totalRefund)}${dueEffect}`);
+      notify(`✓ GRN Return processed — Cost: ${fmt(totalRefund)}, supplier credit: ${fmt(creditValue)}${dueEffect}`);
       let acct = null;
       try{ acct = await postGrnReturnAccounting({ id: firstRetRef.id, ...acctRet }, glAccounts, glJournals); }
       catch(err){
@@ -5809,7 +5927,7 @@ function Returns({invoices, customers, batches, items, grns, suppliers, salesRet
         notify('⚠ GRN return saved, but accounting entry failed — retry from Finance: ' + err.message);
       }
       if(acct) await db.collection('grnReturns').doc(firstRetRef.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null, accountingError: acct.reason||null }).catch(e=> console.error(e));
-      setFoundGrn(null); setGrnQuery(''); setGrnReturnRows([]);
+      setFoundGrn(null); setGrnQuery(''); setGrnReturnRows([]); setGrnCreditValue(''); setOtherQuery('');
     }catch(e){
       console.error('processGrnReturn failed', e);
       notify('❌ GRN Return process වුනේ නැහැ: ' + (e.message||e));
@@ -5906,14 +6024,25 @@ function Returns({invoices, customers, batches, items, grns, suppliers, salesRet
 
           {foundGrn && (
             <div className="card">
-              <h3>{foundGrn.grnNo} — {foundGrn.supplierName} <span style={{fontSize:12, fontWeight:400, color:'var(--ink-soft)'}}>({foundGrn.payment}{foundGrn.payment==='credit' && (foundGrn.paid? ', paid':', due')})</span></h3>
-              {grnReturnRows.length===0 ? <div className="empty">මේ GRN එකට batches නැහැ</div> : (
+              <h3>{foundGrn.grnNo} — {foundGrn.supplierName} <span style={{fontSize:12, fontWeight:400, color:'var(--ink-soft)'}}>({foundGrn.payment}{foundGrn.payment==='credit' && (foundGrn.paid? ', paid':', due ' + fmt(Math.max(0,(foundGrn.totalAmount||0)-(foundGrn.paidAmount||0))))})</span></h3>
+              <div className="autocomplete" style={{marginBottom:10}}>
+                <label>➕ වෙන item එකක් return කරන්න (මේ GRN එකේ නැති වුණත්)</label>
+                <input data-testid="grn-return-other" value={otherQuery} onChange={e=>setOtherQuery(e.target.value)} placeholder="Item name..." autoComplete="off"/>
+                {otherMatches.length>0 && (
+                  <div className="ac-list">{otherMatches.map(b=>(
+                    <div key={b.id} className="ac-item" onMouseDown={()=>addOtherBatch(b)}>
+                      <b>{b.brandName}</b> — {b.batchCode} · stock {b.remainingUnits} · cost {fmt(b.unitCost||0)}{b.supplierName ? ' · ' + b.supplierName : ''}
+                    </div>
+                  ))}</div>
+                )}
+              </div>
+              {grnReturnRows.length===0 ? <div className="empty">මේ GRN එකට batches නැහැ — උඩින් item එකක් එකතු කරන්න</div> : (
                 <table>
                   <thead><tr><th>Item</th><th>Batch</th><th>In Stock</th><th>Qty to Return</th><th>Reason</th></tr></thead>
                   <tbody>
                     {grnReturnRows.map((r,idx)=>(
                       <tr key={idx}>
-                        <td>{r.batch.brandName}</td>
+                        <td>{r.batch.brandName}{r.other && <span className="tag" style={{marginLeft:6}}>other</span>}</td>
                         <td>{r.batch.batchCode}</td>
                         <td>{r.maxQty}</td>
                         <td><input type="number" style={{width:80}} min="0" max={r.maxQty} value={r.qty}
@@ -5925,13 +6054,18 @@ function Returns({invoices, customers, batches, items, grns, suppliers, salesRet
                 </table>
               )}
               <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', marginTop:14}}>
-                <div style={{fontSize:15, fontWeight:700}}>Return Value: {fmt(grnReturnTotal)}</div>
+                <div>
+                  <div style={{fontSize:15, fontWeight:700}}>Return Value (cost): {fmt(grnReturnTotal)}</div>
+                  <label style={{marginTop:6}}>Supplier දෙන credit එක (Rs.)</label>
+                  <input data-testid="grn-credit-value" type="number" style={{width:160}} value={grnCreditValue} onChange={e=>setGrnCreditValue(e.target.value)} placeholder={grnReturnTotal.toFixed(2)}/>
+                </div>
                 <button className="btn btn-primary" disabled={grSaving || grnReturnTotal<=0} onClick={processGrnReturn}>
                   {grSaving? 'Processing…' : '↩️ Process GRN Return'}
                 </button>
               </div>
               <p style={{fontSize:11, color:'var(--ink-soft)', marginTop:8}}>
-                Stock එකෙන් ප්‍රමාණය අඩු වෙනවා. Credit GRN එකක් තාම pay කරලා නැත්නම්, supplier ට ගෙවන්න ඕන amount එකෙන් auto අඩු වෙනවා.
+                Stock එකෙන් ප්‍රමාණය අඩු වෙනවා. Credit GRN එකක් තාම pay කරලා නැත්නම්, supplier දෙන credit එක ගෙවන්න ඕන amount එකෙන් auto අඩු වෙනවා (සම්පූර්ණයෙන් අඩු වුණොත් bill එක settle වෙනවා).
+                Supplier දෙන credit එක cost එකට වඩා වැඩි/අඩු නම්, ඒ වෙනස books වල Other Income / Other Expenses විදිහට යනවා.
                 කලින් pay කරපු GRN එකක් නම්, supplier ගෙන් refund/credit note එකක් අපේක්ෂා කරන්න ඕන බව සටහන් වෙනවා.
               </p>
             </div>
@@ -7016,10 +7150,7 @@ function NewBill({items, batches, customers, invoices, notify, staffUser, prefil
     const bs = batches.filter(b=>b.itemId===itemId && b.remainingUnits>0).sort((a,b)=>(a.expiryDate||'')<(b.expiryDate||'')?-1:1);
     return bs[0] || null;
   };
-  const priceFor = (itemId)=>{
-    const b = batchFor(itemId);
-    return b ? Number(b.unitSell).toFixed(2) : '0.00';
-  };
+  const priceFor = (itemId)=> itemSellPrice(itemId, batches).toFixed(2);
   const stockFor = (itemId)=> itemId ? batches.filter(b=>b.itemId===itemId).reduce((s,b)=>s+(b.remainingUnits||0),0) : 0;
 
   const patchEntry = (p)=> setEntry(e=>({...e,...p}));
@@ -7646,10 +7777,11 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
       const batch = db.batch();
       for(const it of (inv.items||[])){
         const newBatchRef = db.collection('batches').doc();
+        const rb = restockBatchFields(it, batches);
         batch.set(newBatchRef, {
           batchCode:'DEL-'+Date.now()+'-'+(it.itemId||'').slice(0,4), itemId:it.itemId, brandName:it.brandName,
-          costPricePerPack:0, sellPricePerPack:0, unitCost: it.unitCost||0, unitSell:0,
-          expiryDate:'', qtyPacks:0, qtyUnits: it.qty, remainingUnits: it.qty,
+          costPricePerPack:0, sellPricePerPack:0, unitCost: it.unitCost||0, unitSell: rb.unitSell,
+          expiryDate: rb.expiryDate, qtyPacks:0, qtyUnits: it.qty, remainingUnits: it.qty,
           supplierId:'', supplierName:'Invoice Deleted — Restock', invoiceNum:'', grnId:null, isReturn:true,
           createdAt: firebase.firestore.FieldValue.serverTimestamp(),
         });
@@ -8939,10 +9071,7 @@ function CustomerApp({onExit}){
   if(!profile) return <CustomerLogin onDone={setProfile} onExit={onExit} />;
 
   const stockFor = (itemId)=> batches.filter(b=>b.itemId===itemId).reduce((s,b)=>s+(b.remainingUnits||0),0);
-  const priceFor = (itemId)=>{
-    const bs = batches.filter(b=>b.itemId===itemId && b.remainingUnits>0).sort((a,b)=>(a.expiryDate||'')<(b.expiryDate||'')?-1:1);
-    return bs[0]? bs[0].unitSell : 0;
-  };
+  const priceFor = (itemId)=> itemSellPrice(itemId, batches);
 
   const cartCount = Object.values(cart).reduce((s,q)=>s+q,0);
   const cartLines = Object.entries(cart).filter(([,q])=>q>0).map(([itemId,qty])=>{

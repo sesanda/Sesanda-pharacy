@@ -24,9 +24,9 @@ const fixture = { collections:{
   ],
   customers: [{ id:'c1', name:'Alpha Test', tel:'0770000001', dueAmount:1000 }],
   invoices: [{ id:'inv1', billNo:'B1', customerId:'c1', customerName:'Alpha Test', payment:'credit', totalToPay:1000, paidAmount:0, paid:false,
-    accountingStatus:'POSTED', createdAtMs:1, items:[{ itemId:'it1', brandName:'Testamol', qty:10, lineTotal:1000, costTotal:600, unitCost:60 }] }],
+    accountingStatus:'POSTED', createdAtMs:1, items:[{ itemId:'it1', brandName:'Testamol', qty:10, unitPrice:100, lineTotal:1000, costTotal:600, unitCost:60, batchCode:'B-1' }] }],
   grns: [{ id:'g1', grnNo:'GRN-1', supplierId:'s1', supplierName:'Supp', payment:'credit', paid:false, totalAmount:1800, paidAmount:0, accountingStatus:'POSTED', date:'2026-10-01' }],
-  batches: [{ id:'b1', itemId:'it1', brandName:'Testamol', remainingUnits:20, unitCost:60, grnId:'g1', batchCode:'B-1' }],
+  batches: [{ id:'b1', itemId:'it1', brandName:'Testamol', remainingUnits:20, unitCost:60, unitSell:100, expiryDate:'2027-05-01', grnId:'g1', batchCode:'B-1' }],
   items: [{ id:'it1', brandName:'Testamol' }],
   salesReturns: [], grnReturns: [], payments: [], supplierPayments: [],
 }};
@@ -76,6 +76,8 @@ test('sales return posts to the books and the health check still matches the sho
     const j = await page.evaluate(()=> window.firebase.__store.glJournals.find(j=> j.sourceType==='SALES_RETURN'));
     assert.deepEqual(j.lines.map(l=>[l.accountId, l.debit, l.credit]), [['a4000',200,0],['a1100',0,200],['a1210',120,0],['a5000',0,120]]);
     await page.waitForFunction(()=> (window.firebase.__store.salesReturns||[]).some(r=> r.accountingStatus==='POSTED'));
+    const ret = await page.evaluate(()=> window.firebase.__store.batches.find(b=> b.isReturn));
+    assert.deepEqual([ret.unitSell, ret.expiryDate, ret.remainingUnits], [100, '2027-05-01', 2]);   // bills again at its real price
 
     await page.getByText('Finance (Setup)', { exact:true }).first().click();
     t = await controlRows(page);
@@ -219,6 +221,50 @@ test('Sales Report: change a walk-in cash bill to credit for a customer — due,
     await page.getByText('Finance (Setup)', { exact:true }).first().click();
     const t = await page.getByTestId('health-control').innerText();
     assert.match(t, /1100[^\n]*Rs\. 1300\.00\s+Rs\. 1300\.00/);
+    assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('Suppliers: old unpaid bill with no stock → supplier due and books, stock untouched', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.suppliers = [{ id:'s1', name:'Supp', credit:30 }];
+  fx.collections.glAccounts.push({ id:'a4100', accountCode:'4100', accountName:'Other Income', accountType:'REVENUE', isActive:true },
+    { id:'a6600', accountCode:'6600', accountName:'Other Expenses', accountType:'EXPENSE', isActive:true });
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await page.getByText('Suppliers', { exact:true }).first().click();
+    const card = page.getByTestId('old-supplier-bill');
+    await card.locator('select').selectOption('s1');
+    await card.locator('input[type=number]').fill('500');
+    await card.getByRole('button', { name:'💾 Save Old Bill' }).click();
+    await page.waitForFunction(()=> (window.firebase.__store.glJournals||[]).some(j=> j.sourceType==='GRN' && j.description.includes('OLD-')));
+    const g = await page.evaluate(()=> window.firebase.__store.grns.find(g=> g.isOpeningBalance));
+    assert.deepEqual([g.payment, g.paid, g.totalAmount], ['credit', false, 500]);
+    const j = await page.evaluate((id)=> window.firebase.__store.glJournals.find(j=> j.sourceId===id), g.id);
+    assert.deepEqual(j.lines.map(l=>[l.accountId, l.debit, l.credit]), [['a3000',500,0],['a2100',0,500]]);
+    assert.equal(await page.evaluate(()=> window.firebase.__store.batches.length), 1);               // no stock added
+
+    // settle it with goods from another GRN; the supplier credits Rs 500 for stock that cost Rs 300
+    await page.getByText('Returns', { exact:true }).first().click();
+    await page.getByRole('button', { name:'📦 GRN Return' }).click();
+    await page.getByPlaceholder('GRN No').fill(g.grnNo);
+    await page.getByRole('button', { name:'🔍 Find GRN' }).click();
+    await page.getByTestId('grn-return-other').fill('Testa');
+    await page.locator('.ac-item', { hasText:'Testamol' }).first().dispatchEvent('mousedown');
+    await page.locator('tr', { hasText:'Testamol' }).locator('input[type=number]').fill('5');
+    await page.getByTestId('grn-credit-value').fill('500');
+    await page.getByRole('button', { name:'↩️ Process GRN Return' }).click();
+    await page.waitForFunction(()=> (window.firebase.__store.glJournals||[]).some(j=> j.sourceType==='GRN_RETURN' && j.status==='POSTED'));
+    const g2 = await page.evaluate((id)=> window.firebase.__store.grns.find(x=> x.id===id), g.id);
+    assert.deepEqual([g2.totalAmount, g2.paid], [0, true]);                                              // bill settled
+    const rj = await page.evaluate(()=> window.firebase.__store.glJournals.find(j=> j.sourceType==='GRN_RETURN'));
+    assert.deepEqual(rj.lines.map(l=>[l.accountId, l.debit, l.credit]), [['a2100',500,0],['a1210',0,300],['a4100',0,200]]);
+    assert.equal(await page.evaluate(()=> window.firebase.__store.batches.find(b=> b.id==='b1').remainingUnits), 15);
+    await page.getByText('Finance (Setup)', { exact:true }).first().click();
+    const t = await page.getByTestId('health-control').innerText();
     assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
