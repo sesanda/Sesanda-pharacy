@@ -2315,10 +2315,10 @@ function computeAccountsHealth(d, asOfDate){
     return { failed, never, failedAmount: r2(failed.reduce((s,x)=>s+amountOf(x),0)), neverAmount: r2(never.reduce((s,x)=>s+amountOf(x),0)) };
   };
   const unposted = {
-    bills: pending(d.invoices, 'SALE', x=> Number(x.totalToPay)||0, x=> (Number(x.totalToPay)||0) > 0),
-    grns: pending(d.grns, 'GRN', x=> Number(x.totalAmount)||0, x=> (Number(x.totalAmount)||0) > 0),
-    customerPayments: pending(d.payments, 'CUSTOMER_PAYMENT', x=> Number(x.amount)||0, x=> (Number(x.amount)||0) > 0),
-    supplierPayments: pending(d.supplierPayments, 'SUPPLIER_PAYMENT', x=> Number(x.amount)||0, x=> (Number(x.amount)||0) > 0),
+    bills: pending(d.invoices, 'SALE', x=> Number(x.totalToPay)||0, x=> glToCents(x.totalToPay) > 0),
+    grns: pending(d.grns, 'GRN', x=> Number(x.totalAmount)||0, x=> glToCents(x.totalAmount) > 0),
+    customerPayments: pending(d.payments, 'CUSTOMER_PAYMENT', x=> Number(x.amount)||0, x=> glToCents(x.amount) > 0),
+    supplierPayments: pending(d.supplierPayments, 'SUPPLIER_PAYMENT', x=> Number(x.amount)||0, x=> glToCents(x.amount) > 0),
     salesReturns: pending(d.salesReturns, 'SALES_RETURN', x=> (Number(x.glReturn && x.glReturn.dueReduction)||0) + (Number(x.glReturn && x.glReturn.cashRefund)||0), x=> !!x.glReturn && x.accountingStatus!=='SKIPPED'),
     grnReturns: pending(d.grnReturns, 'GRN_RETURN', x=> Number(x.glReturn && x.glReturn.amount)||0, x=> !!x.glReturn && x.accountingStatus!=='SKIPPED'),
   };
@@ -2328,7 +2328,8 @@ function computeAccountsHealth(d, asOfDate){
 
   const tbCheck = validateTrialBalance(tb.rows);
   const bsCheck = validateBalanceSheet(computeBalanceSheet(glAccounts, glJournals, asOfDate));
-  return { asOfDate, hasChart: glAccounts.length>0, journalCount: glJournals.length,
+  const openingPosted = glJournals.some(j=> glIsLiveJournal(j) && j.sourceType==='OPENING_BALANCE');
+  return { asOfDate, hasChart: glAccounts.length>0, journalCount: glJournals.length, openingPosted,
     trialBalance: tbCheck, balanceSheet: bsCheck, cash: bal('1000'), bank: bal('1010'),
     control, unposted, orphans };
 }
@@ -3470,7 +3471,9 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
   // centralized postGrnAccounting()/createJournal()/postJournal() path, so duplicate protection
   // still applies if a journal somehow already exists.
   const [retrying,setRetrying] = useState(null);
-  const failedGrns = (grns||[]).filter(g=> g.accountingStatus==='FAILED');
+  // A zero-value document (e.g. a bill fully cancelled by returns) has nothing to post and can never
+  // succeed, so the Pending lists leave it out — same rule as the health check (whole cents > 0).
+  const failedGrns = (grns||[]).filter(g=> g.accountingStatus==='FAILED' && glToCents(g.totalAmount) > 0);
   const retryGrn = async (g)=>{
     setRetrying(g.id);
     try{
@@ -3488,7 +3491,7 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
   // Same pattern for Bills (Step 3) — retry uses the exact same centralized postSaleAccounting()/
   // createJournal()/postJournal() path, so duplicate protection still applies.
   const [retryingBill,setRetryingBill] = useState(null);
-  const failedBills = (invoices||[]).filter(iv=> iv.accountingStatus==='FAILED');
+  const failedBills = (invoices||[]).filter(iv=> iv.accountingStatus==='FAILED' && glToCents(iv.totalToPay) > 0);
   const retryBill = async (iv)=>{
     setRetryingBill(iv.id);
     try{
@@ -3507,8 +3510,7 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
   // postCustomerPaymentAccounting()/postSupplierPaymentAccounting() path, so duplicate protection
   // still applies.
   const [retryingCustPay,setRetryingCustPay] = useState(null);
-  // a zero-amount payment record has nothing to post (it can never succeed), so it isn't listed
-  const failedCustPays = (payments||[]).filter(p=> p.accountingStatus==='FAILED' && (Number(p.amount)||0) > 0);
+  const failedCustPays = (payments||[]).filter(p=> p.accountingStatus==='FAILED' && glToCents(p.amount) > 0);
   const retryCustPay = async (p)=>{
     setRetryingCustPay(p.id);
     try{
@@ -3524,7 +3526,7 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
   };
 
   const [retryingSupPay,setRetryingSupPay] = useState(null);
-  const failedSupPays = (supplierPayments||[]).filter(p=> p.accountingStatus==='FAILED' && (Number(p.amount)||0) > 0);
+  const failedSupPays = (supplierPayments||[]).filter(p=> p.accountingStatus==='FAILED' && glToCents(p.amount) > 0);
   const retrySupPay = async (p)=>{
     setRetryingSupPay(p.id);
     try{
@@ -3723,7 +3725,7 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
             ))}
           </tbody>
         </table>
-        {(health.unposted.bills.never.length>0 || health.unposted.grns.never.length>0) && (
+        {!health.openingPosted && (health.unposted.bills.never.length>0 || health.unposted.grns.never.length>0) && (
           <p style={{fontSize:12, color:'#c9820a'}}>
             ℹ Books වල නැති bills {health.unposted.bills.never.length}ක් (Rs. {health.unposted.bills.neverAmount.toFixed(2)}) සහ GRNs {health.unposted.grns.never.length}ක් (Rs. {health.unposted.grns.neverAmount.toFixed(2)}) තියෙනවා —
             සාමාන්‍යයෙන් accounting පටන් ගන්න කලින් හදපු ඒවා. ඒවා නිසා ඇති වෙන difference එක "Post opening balance" එකෙන් හදන්න පුළුවන්.
