@@ -5289,6 +5289,16 @@ function buildBillToCreditLines(inv, glAccounts){
   ];
 }
 
+// Bill search: bill number (with or without the INV- prefix — "2264" finds INV-2264), customer name
+// or tel. Null-safe like customerMatchesQuery.
+function billMatchesQuery(inv, query){
+  const q = String(query||'').trim().toLowerCase();
+  if(!q) return true;
+  const billNo = String(inv.billNo||'').toLowerCase();
+  if(billNo===q || billNo.replace(/^inv-?/,'')===q.replace(/^inv-?/,'') || billNo.includes(q)) return true;
+  return customerMatchesQuery({ name: inv.customerName, tel: inv.customerTel }, q);
+}
+
 // Null-safe customer search over name / tel / code (records missing a field are never dropped or crash the list).
 function customerMatchesQuery(c, query){
   const q = String(query||'').trim().toLowerCase();
@@ -7818,6 +7828,9 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
   const inRange = (d)=> d && d>=fromDate && d<=toDate;
 
   const periodInvoices = invoices.filter(inv=> inRange(dateOf(inv.createdAtMs)));
+  // Sales Report search: a typed bill no / customer name / tel searches ALL bills, any date.
+  const [billSearch,setBillSearch] = useState('');
+  const salesRows = billSearch.trim() ? invoices.filter(inv=> billMatchesQuery(inv, billSearch)) : periodInvoices;
   const periodGrns = (grns||[]).filter(g=> inRange(g.date));
   const periodExpenses = (expenses||[]).filter(e=> inRange(e.date));
   const periodLosses = (journal||[]).filter(j=> j.type==='loss' && inRange(j.date));
@@ -8072,6 +8085,9 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
       {reportTab==='sales' && (
         <div className="card">
           <h3>🧾 Sales Report ({fromDate} → {toDate})</h3>
+          <input data-testid="bill-search" value={billSearch} onChange={e=>setBillSearch(e.target.value)} autoComplete="off" style={{marginBottom:12}}
+            placeholder="🔍 Bill No (e.g. 2264 / INV-2264), customer name or tel — ඕනම දවසක bill එකක් හොයන්න" />
+          {billSearch.trim() && <p style={{fontSize:12, color:'var(--ink-soft)', marginTop:-6}}>"{billSearch.trim()}" — bills {salesRows.length}ක් හම්බුණා (හැම දවසකම). Date range එකට ආපහු යන්න search එක මකන්න.</p>}
           <div className="grid c3" style={{marginBottom:14}}>
             <div className="card" style={{margin:0}}><div style={{fontSize:12,color:'var(--ink-soft)'}}>Total Sales</div><div style={{fontSize:18,fontWeight:700}}>{fmt(netCollected)}</div></div>
             <div className="card" style={{margin:0}}><div style={{fontSize:12,color:'var(--ink-soft)'}}>Bills</div><div style={{fontSize:18,fontWeight:700}}>{periodInvoices.length}</div></div>
@@ -8080,8 +8096,8 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
           <table>
             <thead><tr><th>Bill No</th><th>Date</th><th>Customer</th><th>Payment</th><th>Total</th><th>Status</th><th>Action</th></tr></thead>
             <tbody>
-              {periodInvoices.length===0? <tr><td colSpan="7" style={{textAlign:'center', color:'var(--ink-soft)'}}>Bills නැහැ</td></tr> :
-              periodInvoices.slice().sort((a,b)=>(b.createdAtMs||0)-(a.createdAtMs||0)).map(inv=>{
+              {salesRows.length===0? <tr><td colSpan="7" style={{textAlign:'center', color:'var(--ink-soft)'}}>Bills නැහැ</td></tr> :
+              salesRows.slice().sort((a,b)=>(b.createdAtMs||0)-(a.createdAtMs||0)).slice(0, billSearch.trim() ? 100 : undefined).map(inv=>{
                 const paidAmt = inv.paidAmount!=null ? inv.paidAmount : (inv.payment!=='credit' || inv.paid ? (inv.totalToPay||0) : 0);
                 const balance = Math.max(0, (inv.totalToPay||0) - paidAmt);
                 const isPaid = inv.payment!=='credit' ? true : (inv.paid || balance<=0);

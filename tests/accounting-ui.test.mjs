@@ -269,3 +269,16 @@ test('Suppliers: old unpaid bill with no stock → supplier due and books, stock
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('Sales Report search finds a bill from any date by its number', { skip }, async()=>{
+  const { browser, page, errors } = await signIn();
+  try{
+    await page.getByText('Reports', { exact:true }).first().click();
+    await page.getByRole('button', { name:'🧾 Sales Report' }).click();
+    assert.ok(!(await page.locator('tbody').innerText()).includes('B1'));          // 1970 bill is outside today's range
+    await page.getByTestId('bill-search').fill('b1');
+    await page.locator('tr', { hasText:'Alpha Test' }).first().waitFor();
+    assert.match(await page.locator('body').innerText(), /bills 1ක් හම්බුණා/);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
