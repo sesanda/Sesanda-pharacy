@@ -131,3 +131,15 @@ test('health check: books vs shop records, unposted documents and deleted-bill j
   assert.ok(h2.control.every(x=> Math.abs(x.diff) < 0.01));
   assert.equal(h2.balanceSheet.balanced, true);
 });
+
+test('zero-value documents are not listed as unposted; opening balances are detected', ()=>{
+  const base = { glAccounts: CHART, glJournals: [], customers: [], grns: [], batches: [], supplierPayments: [], salesReturns: [], grnReturns: [] };
+  const h = H.computeAccountsHealth({ ...base,
+    invoices: [{ id:'z', totalToPay:0, accountingStatus:'FAILED' }, { id:'b', totalToPay:50, accountingStatus:'FAILED' }],
+    payments: [{ id:'p', amount:0.0000001, accountingStatus:'FAILED' }] }, '2026-12-31');
+  assert.deepEqual(h.unposted.bills.failed.map(x=>x.id), ['b']);
+  assert.equal(h.unposted.customerPayments.failed.length, 0);
+  assert.equal(h.openingPosted, false);
+  const ob = J('OPENING_BALANCE','1100-x', H.buildOpeningBalanceLines('1100', 10, CHART, 'ob'));
+  assert.equal(H.computeAccountsHealth({ ...base, invoices:[], payments:[], glJournals:[ob] }, '2026-12-31').openingPosted, true);
+});
