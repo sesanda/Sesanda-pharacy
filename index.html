@@ -2058,6 +2058,7 @@ function computeAR(glAccounts, glJournals, invoices, payments, asOfDate, salesRe
     { sourceType:'SALE', docs:invoices, idField:'customerId', nameField:'customerName', refField:'billNo' },
     { sourceType:'CUSTOMER_PAYMENT', docs:payments, idField:'customerId', nameField:'customerName', refField:null },
     { sourceType:'SALES_RETURN', docs:salesReturns, idField:'customerId', nameField:'customerName', refField:'billNo' },
+    { sourceType:'BILL_TO_CREDIT', docs:invoices, idField:'customerId', nameField:'customerName', refField:'billNo' },
   ];
   const sub = glSubledgerLines(glAccounts, glJournals, '1100', asOfDate, resolvers);
   if(!sub) return null;
@@ -2080,7 +2081,7 @@ function computeAR(glAccounts, glJournals, invoices, payments, asOfDate, salesRe
   // Returns reduce what is still owed on the bill they came from (AR credit of each live return).
   const returnedByBill = {};
   sub.allocated.filter(r=> r.kind==='SALES_RETURN' && !r.reversed).forEach(r=>{ returnedByBill[r.refNo] = (returnedByBill[r.refNo]||0) + r.credit - r.debit; });
-  const details = sub.allocated.filter(r=> r.kind==='SALE' && r.debit>0 && !r.reversed).map(r=>{
+  const details = sub.allocated.filter(r=> (r.kind==='SALE' || r.kind==='BILL_TO_CREDIT') && r.debit>0 && !r.reversed).map(r=>{
     const age = glAgeInDays(r.date, asOfDate);
     const paid = (paidByInvoice[r.refNo] || 0) + (returnedByBill[r.refNo] || 0);
     const outstanding = Math.max(0, glCentsToAmount(glToCents(r.debit) - glToCents(paid)));
@@ -2186,6 +2187,7 @@ function glClassifyCashLine(sourceType){
   if(sourceType==='LOAN_REPAYMENT') return { section:'financing', label:'Loan Principal Repayments' };
   if(sourceType==='LOAN_INTEREST') return { section:'operating', label:'Loan Interest Paid' };
   if(sourceType==='SALES_RETURN') return { section:'operating', label:'Customer Refunds (Sales Returns)' };
+  if(sourceType==='BILL_TO_CREDIT') return { section:'operating', label:'Customer Sales Receipts' };
   if(sourceType==='OPENING_BALANCE') return { section:'financing', label:'Opening Balance Entries' };
   return null;
 }
@@ -4211,7 +4213,7 @@ function StaffApp({onExit}){
             <div>
               <DraftTabBar drafts={billDrafts} activeId={activeBillDraftId} label={billDraftLabel}
                 onSwitch={setActiveBillDraftId} onNew={newBillDraft} onClose={closeBillDraft} icon="🧾" />
-              <NewBill key={activeBillDraftId} items={items} batches={batches} customers={customers} notify={notify} staffUser={user}
+              <NewBill key={activeBillDraftId} items={items} batches={batches} customers={customers} invoices={invoices} notify={notify} staffUser={user}
                 glAccounts={glAccounts} glJournals={glJournals}
                 prefill={billPrefill} clearPrefill={()=>setBillPrefill(null)}
                 initialDraft={billDrafts.find(d=>d.id===activeBillDraftId)}
@@ -5153,6 +5155,36 @@ function buildCollectionsReport(customers, invoices, payments, nowMs){
   return { total: info.total, customersOwing: rows.length, openBills: rows.reduce((s,r)=>s+r.openBills,0),
     unlinkedBills: info.unlinked.length, unlinkedAmount: Math.round(info.unlinked.reduce((s,u)=>s+u.balance,0)*100)/100,
     buckets, rows };
+}
+
+
+// True when this customer normally buys on credit: they still owe on a bill, or at least half of
+// their last 10 bills were credit bills. New Bill asks before saving a fully-paid cash/card bill for
+// such a customer, because a credit sale entered as cash by mistake is the common slip.
+function customerUsuallyBuysOnCredit(customer, invoices){
+  if(!customer) return false;
+  const mine = (invoices||[]).filter(iv=> iv && iv.customerId===customer.id && glToCents(iv.totalToPay) > 0)
+    .sort((a,b)=> (b.createdAtMs||0) - (a.createdAtMs||0));
+  if(mine.some(iv=> invoiceBalanceInfo(iv).balance > 0.001)) return true;
+  const recent = mine.slice(0, 10);
+  return recent.length > 0 && recent.filter(iv=> iv.payment==='credit').length * 2 >= recent.length;
+}
+
+// Changing a saved cash/card bill to a credit bill (the money was never received): the amount that
+// was recorded as paid becomes owed instead. Revenue, cost and stock are unchanged, so the only
+// accounting move is Cash/Bank → Accounts Receivable for that amount (works the same for bills from
+// before accounting started, whose sale is covered by the opening balances).
+function buildBillToCreditLines(inv, glAccounts){
+  const paid = invoiceBalanceInfo(inv).paidAmt;
+  if(glToCents(paid) <= 0) throw new Error('Nothing was recorded as paid on this bill');
+  const ar = findGlAccountByCode(glAccounts, '1100');
+  const cash = findGlAccountByCode(glAccounts, inv.payment==='card' ? '1010' : '1000');
+  if(!ar || !cash) throw new Error('Chart of Accounts is missing 1100 / ' + (inv.payment==='card' ? '1010' : '1000'));
+  const desc = 'Bill ' + (inv.billNo||inv.id) + ' changed from ' + (inv.payment||'cash') + ' to credit';
+  return [
+    { accountId: ar.id, debit: paid, credit: 0, description: desc },
+    { accountId: cash.id, debit: 0, credit: paid, description: desc },
+  ];
 }
 
 // Null-safe customer search over name / tel / code (records missing a field are never dropped or crash the list).
@@ -6933,7 +6965,7 @@ function PurchaseOrders({items, batches, suppliers, purchaseOrders, notify, onCo
 /* ---------- New Bill (PharmaKo-style: entry strip + Add + running table) ---------- */
 function emptyBillEntry(){ return {itemId:'', itemCode:'', brandName:'', unit:'', qty:'', unitPrice:'', unitCost:0, batchCode:'', batchId:''}; }
 
-function NewBill({items, batches, customers, notify, staffUser, prefill, clearPrefill, initialDraft, onDraftChange, glAccounts, glJournals}){
+function NewBill({items, batches, customers, invoices, notify, staffUser, prefill, clearPrefill, initialDraft, onDraftChange, glAccounts, glJournals}){
   const d = initialDraft || {};
   const [customerId,setCustomerId] = useState(d.customerId||'');
   const [custQuery,setCustQuery] = useState(d.custQuery||'');
@@ -7067,6 +7099,13 @@ function NewBill({items, batches, customers, notify, staffUser, prefill, clearPr
     const dueToAdd = payment==='credit' ? totalToPay : balanceDue;
     if(dueToAdd>0 && !customerId && !tel){
       return notify('Balance due track කරන්න Customer tel number එකක් ඕන');
+    }
+    // A credit customer's bill entered as a fully-paid cash/card sale is a common slip — ask first.
+    const billCustomer = selectedCustomer || (walkIn && tel && tel!==DEFAULT_WALKIN_TEL ? customers.find(c=> c.tel===tel) : null);
+    if(payment!=='credit' && dueToAdd<=0.001 && customerUsuallyBuysOnCredit(billCustomer, invoices)){
+      if(!window.confirm('⚠ ' + billCustomer.name + ' සාමාන්‍යයෙන් ණයට (credit) ගන්න කෙනෙක්.\n\nමේක ' + (payment==='card'?'Card':'Cash') + ' bill එකක්ද?\n\nOK = ' + (payment==='card'?'Card':'Cash') + ' විදිහටම save කරන්න · Cancel = ආපහු ගිහින් Payment එක Credit කරන්න')){
+        return notify('Payment එක Credit කරලා ආයෙත් Save කරන්න');
+      }
     }
     setSaving(true);
     try{
@@ -7559,6 +7598,47 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
   // Admin-PIN-gated invoice deletion — for correcting mistaken/duplicate bills. Restocks every
   // item sold on the bill (as a fresh batch, same pattern as a Sales Return) and reverses any
   // outstanding due it left on the customer's ledger, then removes the invoice document itself.
+  // Change a saved cash/card bill to a credit bill (Admin PIN). The amount recorded as paid becomes
+  // the customer's due; stock, revenue and cost stay as they are. A walk-in (no customer) bill needs
+  // a customer picked first.
+  const [creditFix,setCreditFix] = useState(null); // {inv, query, customerId}
+  const changeToCredit = async (inv, pickedCustomerId)=>{
+    const customerIdForDue = inv.customerId || pickedCustomerId;
+    const cust = (customers||[]).find(c=> c.id===customerIdForDue);
+    if(!cust) return notify('Customer කෙනෙක් තෝරන්න');
+    const paid = invoiceBalanceInfo(inv).paidAmt;
+    if(glToCents(paid) <= 0) return notify('මේ bill එකේ ගෙවපු ගාණක් නැහැ');
+    if(!checkAdminPin(inv.billNo + ' credit bill එකක් කරන්න')) return;
+    if(!window.confirm(`${inv.billNo} — ${inv.payment} → CREDIT\n\n${cust.name} ගේ ණයට ${fmt(paid)} එකතු වෙනවා (සල්ලි ලැබිලා නැති නිසා). Stock වෙනස් වෙන්නේ නැහැ. කරන්නද?`)) return;
+    try{
+      const batch = db.batch();
+      batch.update(db.collection('invoices').doc(inv.id), {
+        payment:'credit', paidAmount:0, paid:false,
+        customerId: cust.id, customerName: cust.name, customerTel: cust.tel||inv.customerTel||'',
+        changedFromPayment: inv.payment, changedToCreditAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+      const custRef = db.collection('customers').doc(cust.id);
+      const snap = await custRef.get();
+      const currentDue = snap.exists ? (Number(snap.data().dueAmount)||0) : 0;
+      batch.update(custRef, {dueAmount: currentDue + paid});
+      await batch.commit();
+      setCreditFix(null);
+      notify('✓ ' + inv.billNo + ' දැන් credit bill එකක් — ' + cust.name + ' ගේ ණයට ' + fmt(paid) + ' එකතු වුණා');
+    }catch(e){ console.error('changeToCredit failed', e); return notify('❌ වෙනස් කරන්න බැරි වුණා: ' + (e.message||e)); }
+    // Books: Cash/Bank → Accounts Receivable. Runs after the bill is changed; a failure is reported
+    // and the health check will show the AR difference.
+    if(glAccounts && glAccounts.length){
+      try{
+        const sourceType = 'BILL_TO_CREDIT', sourceId = inv.id;
+        if(!(glJournals||[]).some(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j))){
+          const lines = buildBillToCreditLines(inv, glAccounts);
+          const id = await createJournal({ date: todayISO(), description: lines[0].description, sourceType, sourceId, lines }, glAccounts);
+          await postJournal(id, glAccounts, glJournals);
+        }
+      }catch(err){ console.error('Bill-to-credit accounting failed', err); notify('⚠ Bill එක වෙනස් වුණා, ඒත් accounts entry එක fail වුණා: ' + err.message); }
+    }
+  };
+
   const deleteInvoice = async (inv)=>{
     if(!checkAdminPin('Invoice ' + inv.billNo + ' delete කරන්න')) return;
     if(!window.confirm(`${inv.billNo} සම්පූර්ණයෙන්ම delete කරන්නද?\nStock ආපහු එකතු වෙනවා, customer due එකක් තිබ්බොත් අඩු වෙනවා.\nමේක undo කරන්න බෑ.`)) return;
@@ -7885,7 +7965,20 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
                     {inv.customerTel && (
                       <button className="btn btn-ghost btn-sm" title="Send colored receipt photo via WhatsApp" onClick={()=>shareReceiptImage(inv, notify)}>📸</button>
                     )}
+                    {inv.payment!=='credit' && glToCents(invoiceBalanceInfo(inv).paidAmt)>0 && (
+                      <button className="btn btn-ghost btn-sm" title="Change to credit bill (Admin PIN required)"
+                        onClick={()=> inv.customerId ? changeToCredit(inv) : setCreditFix({inv, query:''})}>💳 Credit</button>
+                    )}
                     <button className="btn btn-danger btn-sm" title="Delete invoice (Admin PIN required)" onClick={()=>deleteInvoice(inv)}>🗑️</button>
+                    {creditFix && creditFix.inv.id===inv.id && (
+                      <div data-testid="credit-fix" style={{marginTop:6, minWidth:220}}>
+                        <input autoFocus value={creditFix.query} onChange={e=>setCreditFix({...creditFix, query:e.target.value})} placeholder="Customer name / tel..." />
+                        {(customers||[]).filter(c=> creditFix.query.trim() && customerMatchesQuery(c, creditFix.query)).slice(0,6).map(c=>(
+                          <div key={c.id} style={{cursor:'pointer', padding:'4px 2px', fontSize:12.5}} onClick={()=>changeToCredit(inv, c.id)}>👤 {c.name} <span style={{color:'var(--ink-soft)'}}>{c.tel}</span></div>
+                        ))}
+                        <button className="btn btn-ghost btn-sm" onClick={()=>setCreditFix(null)}>Cancel</button>
+                      </div>
+                    )}
                   </td>
                   </tr>
                 );

@@ -6,7 +6,7 @@ const H = loadHelpers(['glToCents','glCentsToAmount','glIsLiveJournal','findGlAc
   'glActivePostedJournals','glLineDelta','computeTrialBalance','validateTrialBalance','computeProfitAndLoss',
   'computeBalanceSheet','validateBalanceSheet','glAgeInDays','glAgingBucket','glSubledgerLines','glARPaidByInvoice',
   'glAPPaidByGrn','computeAR','computeAP','invoiceBalanceInfo','computeCustomerOutstanding',
-  'buildSalesReturnLines','buildOpeningBalanceLines','computeAccountsHealth']);
+  'buildSalesReturnLines','buildOpeningBalanceLines','computeAccountsHealth','customerUsuallyBuysOnCredit','buildBillToCreditLines']);
 
 const CHART = [
   ['1000','Cash','ASSET'], ['1010','Bank','ASSET'], ['1100','Accounts Receivable','ASSET'], ['1210','Pharmacy Inventory','ASSET'],
@@ -142,4 +142,23 @@ test('zero-value documents are not listed as unposted; opening balances are dete
   assert.equal(h.openingPosted, false);
   const ob = J('OPENING_BALANCE','1100-x', H.buildOpeningBalanceLines('1100', 10, CHART, 'ob'));
   assert.equal(H.computeAccountsHealth({ ...base, invoices:[], payments:[], glJournals:[ob] }, '2026-12-31').openingPosted, true);
+});
+
+test('customerUsuallyBuysOnCredit: owes now, or at least half of the last 10 bills on credit', ()=>{
+  const c = { id:'c1' };
+  const bill = (i, payment, extra={})=> ({ id:'b'+i, customerId:'c1', payment, totalToPay:100, paidAmount: payment==='credit'?100:100, paid:true, createdAtMs:i, ...extra });
+  assert.equal(H.customerUsuallyBuysOnCredit(null, []), false);
+  assert.equal(H.customerUsuallyBuysOnCredit(c, []), false);
+  assert.equal(H.customerUsuallyBuysOnCredit(c, [bill(1,'credit',{ paidAmount:0, paid:false })]), true);     // still owes
+  assert.equal(H.customerUsuallyBuysOnCredit(c, [bill(1,'cash'), bill(2,'cash'), bill(3,'credit')]), false); // 1 of 3
+  assert.equal(H.customerUsuallyBuysOnCredit(c, [bill(1,'cash'), bill(2,'credit'), bill(3,'credit')]), true);// 2 of 3, all settled
+  assert.equal(H.customerUsuallyBuysOnCredit(c, [bill(1,'credit',{ totalToPay:0 })]), false);                 // zero bills ignored
+});
+
+test('bill-to-credit lines move the paid amount from Cash/Bank to AR', ()=>{
+  const cash = H.buildBillToCreditLines({ id:'i', billNo:'B', payment:'cash', totalToPay:500, paidAmount:500 }, CHART);
+  assert.deepEqual(cash.map(l=>[l.accountId, l.debit, l.credit]), [[A('1100'),500,0],[A('1000'),0,500]]);
+  const card = H.buildBillToCreditLines({ id:'i', billNo:'B', payment:'card', totalToPay:500, paidAmount:200 }, CHART);
+  assert.deepEqual(card.map(l=>[l.accountId, l.debit, l.credit]), [[A('1100'),200,0],[A('1010'),0,200]]);
+  assert.throws(()=> H.buildBillToCreditLines({ id:'i', payment:'cash', totalToPay:100, paidAmount:0 }, CHART));
 });

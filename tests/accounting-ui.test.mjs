@@ -163,3 +163,63 @@ test('Retry all with many bills: runs side by side, each bill posted once, uniqu
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('New Bill: a credit customer\'s bill saved as cash asks first; Cancel saves nothing', { skip }, async()=>{
+  const { browser, page, errors } = await signIn();
+  try{
+    const dialogs = [];
+    page.removeAllListeners('dialog');
+    let answer = false;
+    page.on('dialog', d=>{ dialogs.push(d.message()); answer ? d.accept() : d.dismiss(); });
+    await page.getByText('New Bill', { exact:true }).first().click();
+    await page.getByText('Use registered customer').first().click();
+    await page.getByPlaceholder('Search customer name or tel...').fill('Alpha');
+    await page.locator('.ac-item', { hasText:'Alpha Test' }).first().dispatchEvent('mousedown');
+    await page.getByPlaceholder('type code or brand name...').fill('Testamol');
+    await page.locator('.ac-item', { hasText:'Testamol' }).first().dispatchEvent('mousedown');
+    await page.locator('input[type=number]').first().fill('1');
+    await page.getByRole('button', { name:'+ Add' }).click();
+    await page.getByRole('button', { name:'💾 Save Bill' }).click();
+    await page.waitForTimeout(300);
+    assert.equal(dialogs.length, 1);
+    assert.match(dialogs[0], /Alpha Test සාමාන්‍යයෙන් ණයට/);
+    assert.equal(await page.evaluate(()=> window.firebase.__store.invoices.length), 1);   // nothing saved
+    answer = true;                                                                       // now confirm it really is cash
+    await page.getByRole('button', { name:'💾 Save Bill' }).click();
+    await page.waitForFunction(()=> window.firebase.__store.invoices.length===2);
+    assert.equal(await page.evaluate(()=> window.firebase.__store.invoices.find(i=> i.id!=='inv1').payment), 'cash');
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('Sales Report: change a walk-in cash bill to credit for a customer — due, books and health check follow', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.invoices.push({ id:'inv2', billNo:'B2', customerId:null, customerName:'NC', payment:'cash', totalToPay:300, paidAmount:300, paid:true,
+    createdAtMs:2, accountingStatus:'POSTED', items:[{ itemId:'it1', brandName:'Testamol', qty:3, lineTotal:300, costTotal:180 }] });
+  fx.collections.glJournals.push({ id:'js2', journalNo:'JE-3', date:'2026-10-03', status:'POSTED', sourceType:'SALE', sourceId:'inv2', description:'Bill B2',
+    lines:[L('1000',300,0), L('4000',0,300), L('5000',180,0), L('1210',0,180)] });
+  fx.collections.batches[0].remainingUnits = 17;                                         // 3 sold on B2
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await page.getByText('Reports', { exact:true }).first().click();
+    await page.getByRole('button', { name:'🧾 Sales Report' }).click();
+    await page.locator('input[type=date]').first().fill('1970-01-01');
+    const row = page.locator('tr', { hasText:'B2' });
+    await row.getByTitle('Change to credit bill (Admin PIN required)').click();
+    await page.getByTestId('credit-fix').locator('input').fill('Alpha');
+    await page.getByTestId('credit-fix').getByText('Alpha Test').click();
+    await page.waitForFunction(()=> (window.firebase.__store.glJournals||[]).some(j=> j.sourceType==='BILL_TO_CREDIT' && j.status==='POSTED'));
+    const inv = await page.evaluate(()=> window.firebase.__store.invoices.find(i=> i.id==='inv2'));
+    assert.deepEqual([inv.payment, inv.paidAmount, inv.paid, inv.customerId, inv.changedFromPayment], ['credit', 0, false, 'c1', 'cash']);
+    assert.equal(await page.evaluate(()=> window.firebase.__store.customers.find(c=> c.id==='c1').dueAmount), 1300);
+    const j = await page.evaluate(()=> window.firebase.__store.glJournals.find(j=> j.sourceType==='BILL_TO_CREDIT'));
+    assert.deepEqual(j.lines.map(l=>[l.accountId, l.debit, l.credit]), [['a1100',300,0],['a1000',0,300]]);
+    await page.getByText('Finance (Setup)', { exact:true }).first().click();
+    const t = await page.getByTestId('health-control').innerText();
+    assert.match(t, /1100[^\n]*Rs\. 1300\.00\s+Rs\. 1300\.00/);
+    assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
