@@ -6,7 +6,7 @@ const H = loadHelpers(['glToCents','glCentsToAmount','glIsLiveJournal','findGlAc
   'glActivePostedJournals','glLineDelta','computeTrialBalance','validateTrialBalance','computeProfitAndLoss',
   'computeBalanceSheet','validateBalanceSheet','glAgeInDays','glAgingBucket','glSubledgerLines','glARPaidByInvoice',
   'glAPPaidByGrn','computeAR','computeAP','invoiceBalanceInfo','computeCustomerOutstanding',
-  'buildSalesReturnLines','buildOpeningBalanceLines','computeAccountsHealth','customerUsuallyBuysOnCredit','buildBillToCreditLines']);
+  'buildSalesReturnLines','buildOpeningBalanceLines','computeAccountsHealth','customerUsuallyBuysOnCredit','buildBillToCreditLines','buildGrnReturnLines','itemSellPrice','restockBatchFields']);
 
 const CHART = [
   ['1000','Cash','ASSET'], ['1010','Bank','ASSET'], ['1100','Accounts Receivable','ASSET'], ['1210','Pharmacy Inventory','ASSET'],
@@ -161,4 +161,31 @@ test('bill-to-credit lines move the paid amount from Cash/Bank to AR', ()=>{
   const card = H.buildBillToCreditLines({ id:'i', billNo:'B', payment:'card', totalToPay:500, paidAmount:200 }, CHART);
   assert.deepEqual(card.map(l=>[l.accountId, l.debit, l.credit]), [[A('1100'),200,0],[A('1010'),0,200]]);
   assert.throws(()=> H.buildBillToCreditLines({ id:'i', payment:'cash', totalToPay:100, paidAmount:0 }, CHART));
+});
+
+test('GRN return lines: inventory out at cost, supplier credit at its value, difference as gain/loss', ()=>{
+  const chart = [...CHART, { id:'a4100', accountCode:'4100', accountName:'Other Income', accountType:'REVENUE', isActive:true }];
+  const at = (ret)=> H.buildGrnReturnLines(ret, chart, 'r').map(l=>[l.accountId, l.debit, l.credit]);
+  assert.deepEqual(at({ amount:300 }), [[A('2100'),300,0],[A('1210'),0,300]]);                       // old returns: credit = cost
+  assert.deepEqual(at({ amount:500, cost:300 }), [[A('2100'),500,0],[A('1210'),0,300],['a4100',0,200]]);
+  assert.deepEqual(at({ amount:250, cost:300 }), [[A('2100'),250,0],[A('1210'),0,300],[A('6600'),50,0]]);
+  for(const ret of [{ amount:500, cost:300 }, { amount:250, cost:300 }])
+    assert.deepEqual(H.checkJournalInvariants(H.buildGrnReturnLines(ret, chart, 'r'), chart), []);
+});
+
+test('itemSellPrice: FEFO batch price, else the latest priced batch (restocked units never bill at 0)', ()=>{
+  const batches = [
+    { id:'ret', itemId:'i', remainingUnits:2, unitSell:0, expiryDate:'' },                          // returned stock, no price
+    { id:'b1', itemId:'i', remainingUnits:5, unitSell:12.5, expiryDate:'2027-01-01', createdAt:{ seconds:1 } },
+    { id:'b2', itemId:'i', remainingUnits:0, unitSell:14, expiryDate:'2027-06-01', createdAt:{ seconds:2 } },
+  ];
+  assert.equal(H.itemSellPrice('i', batches), 14);
+  assert.equal(H.itemSellPrice('i', [batches[1]]), 12.5);
+  assert.equal(H.itemSellPrice('x', batches), 0);
+});
+
+test('restockBatchFields: keeps the sold price and the source batch expiry', ()=>{
+  const batches = [{ id:'b1', itemId:'i', batchCode:'A-1', unitSell:20, unitCost:12, expiryDate:'2027-03-01' }];
+  assert.deepEqual(H.restockBatchFields({ itemId:'i', batchCode:'A-1', unitPrice:19, unitCost:12 }, batches), { unitSell:19, unitCost:12, expiryDate:'2027-03-01' });
+  assert.deepEqual(H.restockBatchFields({ itemId:'i', batchCode:'?' }, batches, 11), { unitSell:20, unitCost:11, expiryDate:'' });
 });
