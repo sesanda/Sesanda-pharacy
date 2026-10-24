@@ -282,3 +282,39 @@ test('Sales Report search finds a bill from any date by its number', { skip }, a
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('Sub GRN: items received by unit qty with unit cost/sales → stock, supplier due and books', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.suppliers = [{ id:'s1', name:'Supp' }];
+  fx.collections.items = [{ id:'it1', itemNumber:'T001', brandName:'Testamol', genericName:'Paracetamol', unit:'tab', packSize:10 }];
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await page.getByText('Sub GRN Entry', { exact:true }).first().click();
+    await page.getByText('🧩 Sub GRN Entry (units)').waitFor();
+    for(const l of ['Pack Size','Pkt Qty (full packs)','Free Qty (packs)','Pkt Cost (Rs.)','Pkt Sales (Rs.)'])
+      assert.equal(await page.getByText(l, { exact:true }).count(), 0, l);
+    await page.locator('select').first().selectOption('s1');
+    await page.getByPlaceholder('type code or brand name...').fill('Testa');
+    await page.locator('.ac-item', { hasText:'Testamol' }).first().dispatchEvent('mousedown');
+    await page.getByTestId('sub-grn-qty').fill('25');
+    await page.getByTestId('sub-grn-unit-cost').fill('4');
+    await page.getByTestId('sub-grn-unit-sales').fill('6');
+    await page.locator('input[type=date]').nth(1).fill('2027-08-01');
+    await page.getByRole('button', { name:'+ Add' }).click();
+    await page.locator('select').nth(2).selectOption('credit');
+    await page.getByRole('button', { name:'💾 Save GRN & Update Stock' }).click();
+    await page.waitForFunction(()=> (window.firebase.__store.glJournals||[]).filter(j=> j.sourceType==='GRN' && j.status==='POSTED').length===2);
+    const g = await page.evaluate(()=> window.firebase.__store.grns.find(g=> g.grnType==='sub'));
+    assert.deepEqual([g.payment, g.paid, g.totalAmount], ['credit', false, 100]);
+    const b = await page.evaluate((id)=> window.firebase.__store.batches.find(b=> b.grnId===id), g.id);
+    assert.deepEqual([b.remainingUnits, b.unitCost, b.unitSell, b.qtyPacks, b.looseQty, b.expiryDate], [25, 4, 6, 2, 5, '2027-08-01']);
+    const j = await page.evaluate((id)=> window.firebase.__store.glJournals.find(j=> j.sourceId===id), g.id);
+    assert.deepEqual(j.lines.map(l=>[l.accountId, l.debit, l.credit]), [['a1210',100,0],['a2100',0,100]]);
+    await page.getByText('Finance (Setup)', { exact:true }).first().click();
+    const t = await page.getByTestId('health-control').innerText();
+    assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
