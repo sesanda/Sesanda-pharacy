@@ -497,3 +497,43 @@ test('Bank Accounts: add a bank, send card money there, deposit cash into it', {
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('Stock Audit: pick items, lots split by price/expiry, physical counts, print sheet', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.items = [{ id:'it1', itemNumber:'T001', brandName:'Testamol', genericName:'Paracetamol', unit:'tab', packSize:10 },
+    { id:'it2', itemNumber:'P002', brandName:'Panadol', genericName:'Paracetamol', unit:'tab', packSize:10 }];
+  fx.collections.batches.push(
+    { id:'b2', itemId:'it1', brandName:'Testamol', remainingUnits:5, unitCost:70, unitSell:110, expiryDate:'2027-09-01', batchCode:'B-2' },
+    { id:'b3', itemId:'it1', brandName:'Testamol', remainingUnits:4, unitCost:60, unitSell:100, expiryDate:'2027-05-01', batchCode:'B-3' },
+    { id:'b4', itemId:'it2', brandName:'Panadol', remainingUnits:9, unitCost:8, unitSell:10, expiryDate:'2027-02-01', batchCode:'P-1' });
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await goTo(page, 'Stock Audit');
+    await page.getByTestId('audit-search').fill('testa');
+    await page.getByTestId('audit-search').press('Enter');
+    const box = page.getByTestId('stock-audit');
+    await box.locator('tbody tr').nth(1).waitFor();
+    assert.equal(await box.locator('tbody tr').count(), 2);                      // 24 @60/100 and 5 @70/110 — Panadol not picked
+    assert.match(await box.locator('tbody tr').nth(0).innerText(), /2027-05-01\s+60\.00\s+100\.00\s+24 tab/);
+    assert.match(await box.locator('tbody tr').nth(1).innerText(), /2027-09-01\s+70\.00\s+110\.00\s+5 tab/);
+    await box.locator('tbody tr').nth(0).locator('input').fill('22');
+    await box.locator('tbody tr').nth(1).locator('input').fill('5');
+    const sum = await page.getByTestId('audit-summary').innerText();
+    assert.match(sum, /Rs\. 120\.00[\s\S]*2 units/);                             // 2 short × Rs 60
+    assert.match(sum, /Rs\. -200\.00/);                                          // at sell price
+
+    if(process.env.SHOT){ await page.setViewportSize({ width:1200, height:1000 }); await box.screenshot({ path: process.env.SHOT }); }
+    await box.getByRole('button', { name:'📋 ඔක්කොම items' }).click();
+    assert.equal(await box.locator('tbody tr').count(), 3);
+    const [popup] = await Promise.all([ page.waitForEvent('popup'), box.getByRole('button', { name:'🖨 Print' }).click() ]);
+    await popup.waitForLoadState();
+    const sheet = await popup.locator('.sheet').innerText();
+    assert.match(sheet, /Stock Audit/);
+    assert.match(sheet, /Panadol/);
+    assert.match(sheet, /Counted by/);
+    if(process.env.SHOT) await popup.screenshot({ path: process.env.SHOT.replace('.png','-print.png') });
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});

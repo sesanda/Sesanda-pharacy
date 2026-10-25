@@ -295,3 +295,27 @@ test('bank accounts: list, next code, transfer lines, card bank per document', (
   assert.equal(glCardBankCode({ cardBankCode:'1012' }), '1012');
   assert.equal(glCardBankCode({}), '1010');
 });
+
+test('stock audit: one line per item + expiry + cost + sell, counts compared at cost and sell', ()=>{
+  const C = loadHelpers(['buildStockAuditRows','stockAuditSummary','stockAuditSheetHtml']);
+  const items = [{ id:'a', brandName:'Alpha', itemNumber:'A1', unit:'tab' }, { id:'b', brandName:'Beta <x>', itemNumber:'B1' }, { id:'c', brandName:'Cee' }];
+  const batches = [
+    { itemId:'a', remainingUnits:10, unitCost:5, unitSell:8, expiryDate:'2027-01-01', batchCode:'aa' },
+    { itemId:'a', remainingUnits:4, unitCost:5, unitSell:8, expiryDate:'2027-01-01', batchCode:'ab' },
+    { itemId:'a', remainingUnits:6, unitCost:6, unitSell:9, expiryDate:'2027-01-01', batchCode:'ac' },
+    { itemId:'a', remainingUnits:3, unitCost:5, unitSell:8, expiryDate:'2026-12-01', batchCode:'ad' },
+    { itemId:'a', remainingUnits:0, unitCost:5, unitSell:8, expiryDate:'2026-01-01' },
+    { itemId:'b', remainingUnits:2, unitCost:10, unitSell:12, expiryDate:'2027-03-01' },
+  ];
+  const all = C.buildStockAuditRows(items, batches, null, false);
+  assert.deepEqual(all.map(r=>[r.name, r.expiry, r.unitCost, r.systemQty]),
+    [['Alpha','2026-12-01',5,3], ['Alpha','2027-01-01',5,14], ['Alpha','2027-01-01',6,6], ['Beta <x>','2027-03-01',10,2]]);
+  assert.equal(C.buildStockAuditRows(items, batches, null, true).length, 5);          // + Cee with 0
+  assert.deepEqual(C.buildStockAuditRows(items, batches, ['c','b'], false).map(r=>[r.name, r.systemQty]), [['Beta <x>',2], ['Cee',0]]);
+  const s = C.stockAuditSummary(all, { [all[1].key]:'12', [all[2].key]:'7', [all[3].key]:'2' });
+  assert.deepEqual([s.counted, s.shortQty, s.overQty, s.shortCost, s.overCost, s.netCost, s.netSell], [3, 2, 1, 10, 6, -4, -7]);
+  assert.equal(s.lines[0].diff, null);
+  const html = C.stockAuditSheetHtml(s, { date:'2026-10-25', scope:'All items' });
+  assert.match(html, /Beta &lt;x&gt;/);
+  assert.match(html, /Net: Rs -4\.00 \(cost\)/);
+});

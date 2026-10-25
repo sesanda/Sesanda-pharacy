@@ -4466,6 +4466,7 @@ function StaffApp({onExit}){
     {id:'returns', label:'Returns', ic:'↩️'},
     {id:'opening', label:'Opening Stock', ic:'📥'},
     {id:'stock', label:'Stock', ic:'📋'},
+    {id:'stockaudit', label:'Stock Audit', ic:'🧮'},
     {id:'suppliers', label:'Suppliers', ic:'🚚'},
     {id:'customers', label:'Customers', ic:'👥'},
     {id:'orders', label:'Orders', ic:'🔔', badge:newOrders.length},
@@ -4488,7 +4489,7 @@ function StaffApp({onExit}){
   // Sidebar groups — Dashboard / New Bill stay on top; the rest fold under a heading. A group opens
   // when clicked (remembered on this device) and always when it holds the open page.
   const NAV_GROUPS = [
-    {id:'stockGrp', label:'Stock & Purchasing', ic:'📦', items:['items','purchaseOrders','grn','subgrn','returns','opening','stock','suppliers']},
+    {id:'stockGrp', label:'Stock & Purchasing', ic:'📦', items:['items','purchaseOrders','grn','subgrn','returns','opening','stock','stockaudit','suppliers']},
     {id:'custGrp', label:'Customers & Orders', ic:'👥', items:['customers','orders','special']},
     {id:'reportGrp', label:'Reports & Cash', ic:'📈', items:['reports','cashcontrol','ai']},
     {id:'acctGrp', label:'Accounting', ic:'💰', items:['finance','banks','ledger','trialbalance','pnl','balancesheet','ar','ap','cashflow','expenses','capitalloans']},
@@ -4572,6 +4573,7 @@ function StaffApp({onExit}){
           {tab==='returns' && <Returns invoices={invoices} customers={customers} batches={batches} items={items} grns={grns} suppliers={suppliers} salesReturns={salesReturns} grnReturns={grnReturns} glAccounts={glAccounts} glJournals={glJournals} notify={notify}/>}
           {tab==='opening' && <OpeningStock items={items} batches={batches} notify={notify}/>}
           {tab==='stock' && <StockView items={items} batches={batches}/>}
+          {tab==='stockaudit' && <StockAudit items={items} batches={batches} notify={notify}/>}
           {tab==='suppliers' && <Suppliers suppliers={suppliers} grns={grns} glAccounts={glAccounts} glJournals={glJournals} notify={notify}/>}
           {tab==='customers' && <Customers customers={customers} invoices={invoices} payments={payments} items={items} medReminders={medReminders} notify={notify} glAccounts={glAccounts} glJournals={glJournals} customersLoading={customersLoading} customersError={customersError} invoicesError={invoicesError}/>}
           {tab==='orders' && <OrdersBoard orders={orders} items={items} batches={batches} notify={notify}/>}
@@ -7954,6 +7956,196 @@ function BillEntryStrip({entry, patchEntry, pickItem, items, stockFor, entryTota
 }
 
 /* ---------- Stock View ---------- */
+/* ---------- 🧮 Stock Audit (stock count sheet) ----------
+   One row per item + expiry + cost + sell price: batches that differ in any of these are counted
+   separately, so the physical count shows exactly which price/expiry lot is short or over. */
+function buildStockAuditRows(items, batches, selectedIds, includeZero){
+  const pick = selectedIds ? new Set(selectedIds) : null;
+  const r2 = (n)=> Math.round((Number(n)||0)*100)/100;
+  const byKey = {};
+  (batches||[]).forEach(b=>{
+    if(!(Number(b.remainingUnits)>0) || (pick && !pick.has(b.itemId))) return;
+    const key = b.itemId + '|' + (b.expiryDate||'') + '|' + r2(b.unitCost) + '|' + r2(b.unitSell);
+    const row = byKey[key] || (byKey[key] = { key, itemId:b.itemId, expiry:b.expiryDate||'', unitCost:r2(b.unitCost), unitSell:r2(b.unitSell), systemQty:0, batchCodes:[] });
+    row.systemQty += Number(b.remainingUnits)||0;
+    if(b.batchCode) row.batchCodes.push(b.batchCode);
+  });
+  const itemById = Object.fromEntries((items||[]).map(it=> [it.id, it]));
+  const rows = Object.values(byKey).filter(r=> itemById[r.itemId]);
+  const withStock = new Set(rows.map(r=> r.itemId));
+  (items||[]).forEach(it=>{
+    if(withStock.has(it.id)) return;
+    if(pick ? pick.has(it.id) : includeZero) rows.push({ key: it.id + '|none', itemId: it.id, expiry:'', unitCost:0, unitSell:0, systemQty:0, batchCodes:[] });
+  });
+  return rows.map(r=>{ const it = itemById[r.itemId];
+    return { ...r, code: it.itemNumber||'', name: it.brandName||'', generic: it.genericName||'', unit: it.unit||'' }; })
+    .sort((a,b)=> a.name.localeCompare(b.name) || (a.expiry||'9').localeCompare(b.expiry||'9') || a.unitCost - b.unitCost);
+}
+
+// counts: {rowKey: physical qty as typed}. Only rows with a count are compared.
+function stockAuditSummary(rows, counts){
+  let counted = 0, shortQty = 0, overQty = 0, shortCost = 0, overCost = 0, diffSell = 0;
+  const lines = rows.map(r=>{
+    const raw = counts && counts[r.key];
+    if(raw==null || raw==='') return { ...r, physical:null, diff:null };
+    const physical = Number(raw)||0, diff = physical - r.systemQty;
+    counted++;
+    if(diff<0){ shortQty += -diff; shortCost += -diff*r.unitCost; }
+    if(diff>0){ overQty += diff; overCost += diff*r.unitCost; }
+    diffSell += diff*r.unitSell;
+    return { ...r, physical, diff };
+  });
+  const r2 = (n)=> Math.round(n*100)/100;
+  return { lines, counted, total: rows.length, shortQty, overQty, shortCost: r2(shortCost), overCost: r2(overCost),
+    netCost: r2(overCost - shortCost), netSell: r2(diffSell) };
+}
+
+function stockAuditSheetHtml(summary, meta){
+  const esc = (s)=> String(s==null?'':s).replace(/[&<>"]/g, c=> ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const rows = summary.lines.map((l,i)=> `<tr><td>${i+1}</td><td>${esc(l.name)}<br><small>${esc(l.code)}${l.generic ? ' · ' + esc(l.generic) : ''}</small></td>
+    <td>${esc(l.expiry||'-')}</td><td class="n">${l.unitCost.toFixed(2)}</td><td class="n">${l.unitSell.toFixed(2)}</td>
+    <td class="n">${l.systemQty} ${esc(l.unit)}</td><td class="n phys">${l.physical==null ? '' : l.physical}</td>
+    <td class="n">${l.diff==null ? '' : (l.diff>0 ? '+' : '') + l.diff}</td></tr>`).join('');
+  return `<div class="sheet"><h2>Sesanda Pharmacy — Stock Audit</h2>
+    <p>${esc(meta.date)} · ${esc(meta.scope)} · lines ${summary.total}${summary.counted ? ' · counted ' + summary.counted : ''}</p>
+    <table><thead><tr><th>#</th><th>Item</th><th>Expiry</th><th>Cost</th><th>Sell</th><th>System Qty</th><th>Physical Qty</th><th>Diff</th></tr></thead><tbody>${rows}</tbody></table>
+    ${summary.counted ? `<p class="sum">අඩු: ${summary.shortQty} units · Rs ${summary.shortCost.toFixed(2)} (cost) &nbsp; | &nbsp; වැඩි: ${summary.overQty} units · Rs ${summary.overCost.toFixed(2)} &nbsp; | &nbsp; Net: Rs ${summary.netCost.toFixed(2)} (cost) / Rs ${summary.netSell.toFixed(2)} (sell)</p>` : ''}
+    <p class="sig">Counted by: ____________________ &nbsp;&nbsp; Checked by: ____________________ &nbsp;&nbsp; Date: __________</p></div>`;
+}
+const STOCK_AUDIT_CSS = `.sheet{font-family:Arial,sans-serif; color:#000; background:#fff; padding:14px;}
+  .sheet h2{margin:0 0 4px; font-size:18px;} .sheet p{margin:4px 0; font-size:12px;}
+  .sheet table{width:100%; border-collapse:collapse; font-size:11.5px; margin-top:8px;}
+  .sheet th,.sheet td{border:1px solid #999; padding:4px 5px; text-align:left; vertical-align:top;}
+  .sheet th{background:#eee;} .sheet td.n{text-align:right; white-space:nowrap;} .sheet td.phys{min-width:70px;}
+  .sheet small{color:#555;} .sheet .sum{font-weight:bold; margin-top:8px;} .sheet .sig{margin-top:22px;}`;
+
+function stockAuditCsv(summary){
+  const q = (v)=> '"' + String(v==null?'':v).replace(/"/g,'""') + '"';
+  return [['Item','Code','Generic','Expiry','Unit cost','Unit sell','System qty','Physical qty','Diff','Diff value (cost)','Batches']]
+    .concat(summary.lines.map(l=> [l.name, l.code, l.generic, l.expiry, l.unitCost, l.unitSell, l.systemQty, l.physical, l.diff,
+      l.diff==null ? '' : Math.round(l.diff*l.unitCost*100)/100, l.batchCodes.join(' ')]))
+    .map(r=> r.map(q).join(',')).join('\n');
+}
+
+function StockAudit({items, batches, notify}){
+  const saved = (()=>{ try{ return JSON.parse(localStorage.getItem('stockAuditDraft')||'{}')||{}; }catch(e){ return {}; } })();
+  const [mode,setMode] = useState(saved.mode||'select');
+  const [selected,setSelected] = useState(saved.selected||[]);
+  const [includeZero,setIncludeZero] = useState(!!saved.includeZero);
+  const [counts,setCounts] = useState(saved.counts||{});
+  const [q,setQ] = useState(''), [open,setOpen] = useState(false), [hi,setHi] = useState(0);
+  const [onlyDiff,setOnlyDiff] = useState(false);
+  useEffect(()=>{ try{ localStorage.setItem('stockAuditDraft', JSON.stringify({mode, selected, includeZero, counts})); }catch(e){} },[mode, selected, includeZero, counts]);
+
+  const ql = q.trim().toLowerCase();
+  const matches = ql ? items.filter(it=> !selected.includes(it.id) && (String(it.brandName||'').toLowerCase().includes(ql) || String(it.genericName||'').toLowerCase().includes(ql) || String(it.itemNumber||'').toLowerCase().includes(ql))).slice(0,8) : [];
+  const addItem = (it)=>{ setSelected(s=> s.includes(it.id) ? s : [...s, it.id]); setQ(''); setHi(0); };
+  const onKey = (e)=>{
+    if(!matches.length) return;
+    if(e.key==='ArrowDown'){ e.preventDefault(); setHi(h=> Math.min(h+1, matches.length-1)); }
+    else if(e.key==='ArrowUp'){ e.preventDefault(); setHi(h=> Math.max(h-1, 0)); }
+    else if(e.key==='Enter'){ e.preventDefault(); addItem(matches[hi]); }
+  };
+  const rows = buildStockAuditRows(items, batches, mode==='all' ? null : selected, includeZero);
+  const summary = stockAuditSummary(rows, counts);
+  const shown = onlyDiff ? summary.lines.filter(l=> l.diff) : summary.lines;
+  const meta = { date: todayISO(), scope: mode==='all' ? 'All items' : selected.length + ' selected items' };
+  const sheetSummary = onlyDiff ? {...summary, lines: shown, total: shown.length} : summary;
+
+  const print = ()=>{
+    if(!rows.length) return notify('Items තෝරන්න');
+    const w = window.open('', '_blank');
+    if(!w) return notify('Popup block වෙලා — browser එකේ popups allow කරන්න');
+    w.document.write(`<html><head><title>Stock Audit ${meta.date}</title><style>${STOCK_AUDIT_CSS} body{margin:0}</style></head><body>${stockAuditSheetHtml(sheetSummary, meta)}<script>window.print();<\/script></body></html>`);
+    w.document.close();
+  };
+  const share = async ()=>{
+    if(!rows.length) return notify('Items තෝරන්න');
+    if(typeof html2canvas==='undefined') return notify('❌ Image tool එක load වෙලා නැහැ — Print → Save as PDF කරලා යවන්න');
+    const el = document.createElement('div');
+    el.style.cssText = 'position:fixed; left:-10000px; top:0; width:820px; background:#fff;';
+    el.innerHTML = `<style>${STOCK_AUDIT_CSS}</style>` + stockAuditSheetHtml(sheetSummary, meta);
+    document.body.appendChild(el);
+    try{
+      const canvas = await html2canvas(el, {scale:2, backgroundColor:'#ffffff'});
+      const blob = await new Promise(res=> canvas.toBlob(res, 'image/png'));
+      const file = new File([blob], 'stock-audit-' + meta.date + '.png', {type:'image/png'});
+      if(navigator.canShare && navigator.canShare({files:[file]})){
+        try{ await navigator.share({files:[file], title:'Stock Audit ' + meta.date}); return; }
+        catch(err){ if(err && err.name==='AbortError') return; }
+      }
+      const url = URL.createObjectURL(blob), a = document.createElement('a');
+      a.href = url; a.download = file.name; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=> URL.revokeObjectURL(url), 5000);
+      window.open('https://wa.me/?text=' + encodeURIComponent('Stock Audit ' + meta.date + ' — image එක attach කරලා තියෙනවා'), '_blank');
+      notify('📥 Image එක download වුණා — WhatsApp එකේ attach කරන්න');
+    }catch(e){ console.error('stock audit image failed', e); notify('❌ Image හදන්න බැරි වුණා: ' + (e.message||e)); }
+    finally{ el.remove(); }
+  };
+  const csv = ()=>{
+    const url = URL.createObjectURL(new Blob([stockAuditCsv(sheetSummary)], {type:'text/csv'})), a = document.createElement('a');
+    a.href = url; a.download = 'stock-audit-' + meta.date + '.csv'; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=> URL.revokeObjectURL(url), 5000);
+  };
+  const itemName = (id)=> (items.find(it=> it.id===id)||{}).brandName || id;
+
+  return (
+    <div data-testid="stock-audit">
+      <div className="card">
+        <h3>🧮 Stock Audit — count කරන්න items</h3>
+        <div style={{display:'flex', gap:8, marginBottom:12, flexWrap:'wrap'}}>
+          <button className={"btn btn-sm " + (mode==='select' ? 'btn-primary' : 'btn-ghost')} onClick={()=>setMode('select')}>🔍 තෝරපු items</button>
+          <button className={"btn btn-sm " + (mode==='all' ? 'btn-primary' : 'btn-ghost')} onClick={()=>setMode('all')}>📋 ඔක්කොම items</button>
+        </div>
+        {mode==='select' ? <>
+          <div className="autocomplete">
+            <input data-testid="audit-search" value={q} placeholder="Item නම / generic / code type කරලා Enter (හෝ click)" autoComplete="off"
+              onChange={e=>{ setQ(e.target.value); setOpen(true); setHi(0); }} onKeyDown={onKey} onFocus={()=>setOpen(true)} onBlur={()=>setTimeout(()=>setOpen(false),150)} />
+            {open && matches.length>0 && <div className="ac-list">{matches.map((m,i)=>
+              <div key={m.id} className={"ac-item" + (i===hi ? " hi" : "")} onMouseDown={()=>addItem(m)}>
+                <b>{m.itemNumber}</b> — {m.brandName} <span style={{color:'var(--ink-soft)'}}>({m.genericName})</span></div>)}</div>}
+          </div>
+          <div style={{display:'flex', gap:6, flexWrap:'wrap', marginTop:10}}>
+            {selected.map(id=> <span key={id} className="tag" style={{display:'inline-flex', alignItems:'center', gap:6}}>{itemName(id)}
+              <button className="btn btn-ghost btn-sm" style={{padding:'0 6px'}} onClick={()=>setSelected(s=> s.filter(x=> x!==id))}>✕</button></span>)}
+            {selected.length>0 && <button className="btn btn-ghost btn-sm" onClick={()=>setSelected([])}>🧹 ඔක්කොම අයින් කරන්න</button>}
+          </div>
+        </> : <label style={{display:'flex', gap:8, alignItems:'center', fontSize:13}}>
+          <input type="checkbox" style={{width:'auto'}} checked={includeZero} onChange={e=>setIncludeZero(e.target.checked)} /> Stock 0 items-ත් ගන්න
+        </label>}
+      </div>
+
+      <div className="card">
+        <div style={{display:'flex', gap:8, flexWrap:'wrap', alignItems:'center', marginBottom:12}}>
+          <b style={{flex:1}}>Lines {rows.length} · counted {summary.counted}</b>
+          <label style={{display:'flex', gap:6, alignItems:'center', fontSize:13}}><input type="checkbox" style={{width:'auto'}} checked={onlyDiff} onChange={e=>setOnlyDiff(e.target.checked)} /> වෙනස තියෙන ඒවා විතරක්</label>
+          <button className="btn btn-primary btn-sm" onClick={print}>🖨 Print</button>
+          <button className="btn btn-primary btn-sm" onClick={share}>📲 WhatsApp</button>
+          <button className="btn btn-ghost btn-sm" onClick={csv}>⬇ CSV</button>
+          <button className="btn btn-ghost btn-sm" onClick={()=>{ if(window.confirm('ගහපු physical counts ඔක්කොම මකන්නද?')) setCounts({}); }}>🧹 Counts clear</button>
+        </div>
+        {summary.counted>0 && <div className="grid c4" style={{marginBottom:12}} data-testid="audit-summary">
+          <div className="card" style={{margin:0}}><div style={{fontSize:12.5, color:'var(--ink-soft)'}}>අඩු (shortage)</div><div style={{fontSize:18, fontWeight:700, color:'var(--red)'}}>{fmt(summary.shortCost)}</div><div style={{fontSize:12, color:'var(--ink-soft)'}}>{summary.shortQty} units · cost</div></div>
+          <div className="card" style={{margin:0}}><div style={{fontSize:12.5, color:'var(--ink-soft)'}}>වැඩි (excess)</div><div style={{fontSize:18, fontWeight:700}}>{fmt(summary.overCost)}</div><div style={{fontSize:12, color:'var(--ink-soft)'}}>{summary.overQty} units · cost</div></div>
+          <div className="card" style={{margin:0}}><div style={{fontSize:12.5, color:'var(--ink-soft)'}}>Net වෙනස (cost)</div><div style={{fontSize:18, fontWeight:700}}>{fmt(summary.netCost)}</div><div style={{fontSize:12, color:'var(--ink-soft)'}}>ලාභයට බලපාන ගාණ</div></div>
+          <div className="card" style={{margin:0}}><div style={{fontSize:12.5, color:'var(--ink-soft)'}}>Net වෙනස (sell price)</div><div style={{fontSize:18, fontWeight:700}}>{fmt(summary.netSell)}</div><div style={{fontSize:12, color:'var(--ink-soft)'}}>විකුණුවා නම් ලැබෙන ගාණ</div></div>
+        </div>}
+        {rows.length===0 ? <div className="empty">{mode==='select' ? 'උඩින් items search කරලා add කරන්න' : 'Stock තියෙන items නැහැ'}</div> :
+        <div style={{overflowX:'auto'}}><table>
+          <thead><tr><th>#</th><th>Item</th><th>Expiry</th><th>Cost</th><th>Sell</th><th>System Qty</th><th>Physical Qty</th><th>Diff</th><th>Diff (cost)</th></tr></thead>
+          <tbody>{shown.map((l,i)=> <tr key={l.key}>
+            <td>{i+1}</td><td>{l.name}<div style={{fontSize:11.5, color:'var(--ink-soft)'}}>{l.code}{l.generic ? ' · ' + l.generic : ''}</div></td>
+            <td>{l.expiry||'—'}</td><td>{l.unitCost.toFixed(2)}</td><td>{l.unitSell.toFixed(2)}</td><td>{l.systemQty} {l.unit}</td>
+            <td><input type="number" min="0" data-testid={'count-' + l.key} value={counts[l.key]==null ? '' : counts[l.key]} style={{width:90}}
+              onChange={e=>{ const v = e.target.value; setCounts(c=>{ const n = {...c}; if(v==='') delete n[l.key]; else n[l.key] = v; return n; }); }} /></td>
+            <td style={{color: l.diff<0 ? 'var(--red)' : l.diff>0 ? 'var(--green)' : undefined, fontWeight: l.diff ? 700 : 400}}>{l.diff==null ? '' : (l.diff>0 ? '+' : '') + l.diff}</td>
+            <td>{l.diff ? fmt(l.diff*l.unitCost) : ''}</td></tr>)}</tbody>
+        </table></div>}
+      </div>
+    </div>
+  );
+}
+
 function StockView({items, batches}){
   const [q,setQ] = useState('');
   const ql = q.trim().toLowerCase();
