@@ -319,3 +319,22 @@ test('stock audit: one line per item + expiry + cost + sell, counts compared at 
   assert.match(html, /Beta &lt;x&gt;/);
   assert.match(html, /Net: Rs -4\.00 \(cost\)/);
 });
+
+test('stock audit apply: batches set to the count, journal at cost, no-batch excess skipped', ()=>{
+  const C = loadHelpers(['glToCents','findGlAccountByCode','planStockAuditAdjustment','buildStockAuditLines']);
+  const batches = [{ id:'b1', remainingUnits:3 }, { id:'b2', remainingUnits:10 }, { id:'b3', remainingUnits:4 }];
+  const lines = [
+    { key:'k1', itemId:'a', name:'A', batchIds:['b1','b2'], systemQty:13, unitCost:5, unitSell:8, diff:-5 },   // 3 off b1, 2 off b2
+    { key:'k2', itemId:'b', name:'B', batchIds:['b3'], systemQty:4, unitCost:10, unitSell:12, diff:2 },
+    { key:'k3', itemId:'c', name:'C', batchIds:[], systemQty:0, unitCost:0, unitSell:0, diff:4 },
+    { key:'k4', itemId:'d', name:'D', batchIds:['b9'], diff:null },
+  ];
+  const p = C.planStockAuditAdjustment(lines, batches);
+  assert.deepEqual(p.updates, [{ id:'b1', remainingUnits:0 }, { id:'b2', remainingUnits:8 }, { id:'b3', remainingUnits:6 }]);
+  assert.deepEqual(p.adjustments.map(a=>[a.itemId, a.qty, a.valueAtCost]), [['a',-5,-25], ['b',2,20]]);
+  assert.deepEqual([p.skipped.map(l=>l.key), p.shortCost, p.overCost, p.net], [['k3'], 25, 20, -5]);
+  const chart = [{ id:'a6700', accountCode:'6700' }, { id:'a1210', accountCode:'1210' }];
+  assert.deepEqual(C.buildStockAuditLines(-5, chart, 'x').map(l=>[l.accountId, l.debit, l.credit]), [['a6700',5,0],['a1210',0,5]]);
+  assert.deepEqual(C.buildStockAuditLines(7, chart, 'x').map(l=>[l.accountId, l.debit, l.credit]), [['a1210',7,0],['a6700',0,7]]);
+  assert.deepEqual(C.buildStockAuditLines(0, chart, 'x'), []);
+});

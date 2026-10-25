@@ -537,3 +537,31 @@ test('Stock Audit: pick items, lots split by price/expiry, physical counts, prin
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('Stock Audit apply: stock follows the count, shortage goes to 6700 and the health check still matches', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.items = [{ id:'it1', itemNumber:'T001', brandName:'Testamol', genericName:'Paracetamol', unit:'tab', packSize:10 }];
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await goTo(page, 'Stock Audit');
+    const box = page.getByTestId('stock-audit');
+    await box.getByRole('button', { name:'📋 ඔක්කොම items' }).click();
+    await box.locator('tbody tr input').first().fill('17');
+    await box.getByRole('button', { name:'✅ Apply adjustments (1)' }).click();
+    await page.waitForFunction(()=> (window.firebase.__store.glJournals||[]).some(j=> j.sourceType==='STOCK_AUDIT' && j.status==='POSTED'));
+    assert.equal(await page.evaluate(()=> window.firebase.__store.batches.find(b=> b.id==='b1').remainingUnits), 17);
+    const adj = await page.evaluate(()=> window.firebase.__store.adjustments.find(a=> a.source==='stockAudit'));
+    assert.deepEqual([adj.itemId, adj.qty, adj.valueAtCost], ['it1', -3, -180]);
+    const wo = await page.evaluate(()=> window.firebase.__store.glAccounts.find(a=> a.accountCode==='6700'));
+    const j = await page.evaluate(()=> window.firebase.__store.glJournals.find(j=> j.sourceType==='STOCK_AUDIT'));
+    assert.deepEqual(j.lines.map(l=>[l.accountId, l.debit, l.credit]), [[wo.id,180,0],['a1210',0,180]]);
+    await box.locator('tbody tr').filter({ hasText:'17 tab' }).waitFor();
+    assert.equal(await box.locator('tbody tr input').first().inputValue(), '');          // applied count cleared
+    await goTo(page, 'Finance (Setup)');
+    const t = await page.getByTestId('health-control').innerText();
+    assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
