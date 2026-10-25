@@ -439,3 +439,55 @@ test('Card charge: a card bill posts its % to 6500 Bank Charges from Bank; older
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('Bank Accounts: add a bank, send card money there, deposit cash into it', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.glAccounts.push({ id:'a6500', accountCode:'6500', accountName:'Bank Charges', accountType:'EXPENSE', isActive:true });
+  fx.collections.glJournals.push({ id:'jc', journalNo:'JE-9', date:'2026-10-01', status:'POSTED', sourceType:'OWNER_CAPITAL', sourceId:'c', description:'cap', lines:[L('1000',2000,0), L('3000',0,2000)] });
+  fx.collections.meta = [{ id:'settings', cardChargePercent:2 }];
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await page.getByText('Bank Accounts', { exact:true }).first().click();
+    await page.getByTestId('new-bank-name').fill('BOC Current');
+    await page.getByRole('button', { name:'➕ Add bank account' }).click();
+    await page.locator('tr', { hasText:'BOC Current' }).waitFor();
+    const boc = await page.evaluate(()=> window.firebase.__store.glAccounts.find(a=> a.accountName==='BOC Current'));
+    assert.deepEqual([boc.accountCode, boc.accountType, boc.isBank], ['1011','ASSET',true]);
+    await page.locator('tr', { hasText:'BOC Current' }).getByRole('button', { name:'මෙතනට යවන්න' }).click();
+    await page.locator('tr', { hasText:'BOC Current' }).getByText('💳 මෙතනට').waitFor();
+    assert.equal(await page.evaluate(()=> window.firebase.__store.meta.find(m=> m.id==='settings').cardBankAccountCode), '1011');
+
+    await page.getByTestId('dep-to').selectOption('1011');
+    await page.getByTestId('dep-amount').fill('1500');
+    await page.getByRole('button', { name:'💾 Save deposit' }).click();
+    await page.waitForFunction(()=> window.firebase.__store.glJournals.some(j=> j.sourceType==='BANK_TRANSFER' && j.status==='POSTED'));
+    const dj = await page.evaluate(()=> window.firebase.__store.glJournals.find(j=> j.sourceType==='BANK_TRANSFER'));
+    assert.deepEqual(dj.lines.map(l=>[l.accountId, l.debit, l.credit]), [[boc.id,1500,0],['a1000',0,1500]]);
+    await page.locator('tr', { hasText:'BOC Current' }).filter({ hasText:'Rs. 1,500.00' }).first().waitFor();
+    if(process.env.SHOT) await page.getByTestId('bank-accounts').screenshot({ path: process.env.SHOT });
+
+    // a card bill now lands in BOC, and its 2% charge comes out of BOC
+    await page.getByText('New Bill', { exact:true }).first().click();
+    await page.getByPlaceholder('type code or brand name...').fill('Testamol');
+    await page.locator('.ac-item', { hasText:'Testamol' }).first().dispatchEvent('mousedown');
+    await page.locator('input[type=number]').first().fill('1');
+    await page.getByRole('button', { name:'+ Add' }).click();
+    await page.locator('select:has(option[value="card"])').first().selectOption('card');
+    await page.getByRole('button', { name:'💾 Save Bill' }).click();
+    await page.waitForFunction(()=> window.firebase.__store.glJournals.some(j=> j.sourceType==='CARD_CHARGE' && j.status==='POSTED'));
+    const inv = await page.evaluate(()=> window.firebase.__store.invoices.find(i=> i.payment==='card'));
+    assert.equal(inv.cardBankCode, '1011');
+    const sj = await page.evaluate((id)=> window.firebase.__store.glJournals.find(j=> j.sourceType==='SALE' && j.sourceId===id), inv.id);
+    assert.equal(sj.lines[0].accountId, boc.id);
+    const cj = await page.evaluate((id)=> window.firebase.__store.glJournals.find(j=> j.sourceType==='CARD_CHARGE' && j.sourceId===id), inv.id);
+    assert.deepEqual(cj.lines.map(l=>l.accountId), ['a6500', boc.id]);
+
+    await page.getByText('Finance (Setup)', { exact:true }).first().click();
+    const t = await page.getByTestId('health-control').innerText();
+    assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
+    assert.match(await page.getByTestId('health-check').innerText(), /Bank in books: Rs\. [\d,]+\.\d\d/);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});

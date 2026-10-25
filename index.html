@@ -1298,7 +1298,7 @@ async function postSaleAccounting(invoice, glAccounts, existingJournals){
 
   const lines = [];
   if(paidPortion > 0.001){
-    const cashCode = invoice.payment==='card' ? '1010' : '1000'; // card settlements land in Bank, not till Cash
+    const cashCode = invoice.payment==='card' ? glCardBankCode(invoice) : '1000'; // card settlements land in the card bank account, not till Cash
     const cashAcc = findGlAccountByCode(glAccounts, cashCode);
     if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
     lines.push({ accountId: cashAcc.id, debit: paidPortion, credit: 0, description: desc });
@@ -1334,7 +1334,35 @@ async function postSaleAccounting(invoice, glAccounts, existingJournals){
    createJournal()/postJournal() path as GRN/Sale. Uses the exact payment amount already recorded
    operationally — never recalculated here. Card settles to Bank (1010), matching Step 3's mapping;
    cash uses 1000 — no other payment method exists in either flow, so none is invented. */
-function glCashAccountCodeForMethod(method){ return method==='card' ? '1010' : '1000'; }
+function glCashAccountCodeForMethod(method, doc){ return method==='card' ? glCardBankCode(doc) : '1000'; }
+
+/* ---------- Bank accounts ----------
+   1010 Bank plus any bank account added from 🏦 Bank Accounts (ASSET, isBank, codes 1011–1099).
+   Card money goes to the one chosen there (meta/settings cardBankAccountCode, loaded at sign-in
+   into GL_CARD_BANK_CODE); each card bill/payment stores the code it went to (cardBankCode) so
+   its charge, refund or change-to-credit later hits the same bank. */
+let GL_CARD_BANK_CODE = '1010';
+function glCardBankCode(doc){ return (doc && doc.cardBankCode) || (typeof GL_CARD_BANK_CODE!=='undefined' ? GL_CARD_BANK_CODE : '1010'); }
+function glBankAccounts(glAccounts){
+  return (glAccounts||[]).filter(a=> a.accountType==='ASSET' && a.isActive!==false && (a.accountCode==='1010' || a.isBank))
+    .sort((a,b)=> a.accountCode<b.accountCode ? -1 : 1);
+}
+function nextBankAccountCode(glAccounts){
+  const used = new Set((glAccounts||[]).map(a=> String(a.accountCode)));
+  for(let c=1011; c<1100; c++) if(!used.has(String(c))) return String(c);
+  return null;
+}
+// A cash deposit / bank-to-bank move: DR the account the money went into, CR where it came from.
+function buildBankTransferLines(fromCode, toCode, amount, glAccounts, desc){
+  if(fromCode===toCode) throw new Error('From සහ To එකම account එක වෙන්න බැහැ');
+  if(glToCents(amount) <= 0) throw new Error('Amount එක 0ට වඩා වැඩි වෙන්න ඕන');
+  const from = findGlAccountByCode(glAccounts, fromCode), to = findGlAccountByCode(glAccounts, toCode);
+  if(!from || !to) throw new Error('Account ' + (!from ? fromCode : toCode) + ' Chart of Accounts එකේ නැහැ');
+  return [
+    { accountId: to.id, debit: Number(amount), credit: 0, description: desc },
+    { accountId: from.id, debit: 0, credit: Number(amount), description: desc },
+  ];
+}
 
 async function postCustomerPaymentAccounting(payment, glAccounts, existingJournals){
   const sourceType = 'CUSTOMER_PAYMENT', sourceId = payment.id;
@@ -1346,7 +1374,7 @@ async function postCustomerPaymentAccounting(payment, glAccounts, existingJourna
 
   const arAcc = findGlAccountByCode(glAccounts, '1100');
   if(!arAcc) throw new Error('Chart of Accounts has no active 1100 Accounts Receivable account — load/check it in Finance');
-  const cashCode = glCashAccountCodeForMethod(payment.method);
+  const cashCode = glCashAccountCodeForMethod(payment.method, payment);
   const cashAcc = findGlAccountByCode(glAccounts, cashCode);
   if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
 
@@ -1370,7 +1398,7 @@ async function postSupplierPaymentAccounting(payment, glAccounts, existingJourna
 
   const apAcc = findGlAccountByCode(glAccounts, '2100');
   if(!apAcc) throw new Error('Chart of Accounts has no active 2100 Supplier Payables account — load/check it in Finance');
-  const cashCode = glCashAccountCodeForMethod(payment.method);
+  const cashCode = glCashAccountCodeForMethod(payment.method, payment);
   const cashAcc = findGlAccountByCode(glAccounts, cashCode);
   if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
 
@@ -1427,7 +1455,7 @@ async function postExpenseAccounting(expense, glAccounts, existingJournals){
   if(!check.valid) throw new Error(check.errors.join('; '));
 
   const categoryAcc = (glAccounts||[]).find(a=>a.id===expense.categoryAccountId);
-  const cashCode = glCashAccountCodeForMethod(expense.paymentMethod);
+  const cashCode = glCashAccountCodeForMethod(expense.paymentMethod, expense);
   const cashAcc = findGlAccountByCode(glAccounts, cashCode);
   if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
 
@@ -1449,7 +1477,7 @@ async function postExpenseAccounting(expense, glAccounts, existingJournals){
    matching this module's own vocabulary — glCashOrBankAccountCode() is a distinct small mapping
    from glCashAccountCodeForMethod() (Step 8) because that one treats anything non-'card' as cash,
    which would wrongly resolve 'bank' to 1000 here. */
-function glCashOrBankAccountCode(method){ return method==='bank' ? '1010' : '1000'; }
+function glCashOrBankAccountCode(method, bankCode){ return method==='bank' ? (bankCode || '1010') : '1000'; }
 
 async function nextCapitalLoanNo(){
   const ref = db.collection('meta').doc('counters');
@@ -1512,7 +1540,7 @@ async function _postCapitalLoanEntry(txn, glAccounts, existingJournals, sourceTy
 }
 
 async function postOwnerCapitalAccounting(txn, glAccounts, existingJournals){
-  const cashCode = glCashOrBankAccountCode(txn.paymentMethod);
+  const cashCode = glCashOrBankAccountCode(txn.paymentMethod, txn.bankCode);
   const cashAcc = findGlAccountByCode(glAccounts, cashCode);
   if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
   const capitalAcc = findGlAccountByCode(glAccounts, '3000');
@@ -1521,7 +1549,7 @@ async function postOwnerCapitalAccounting(txn, glAccounts, existingJournals){
 }
 
 async function postOwnerDrawingAccounting(txn, glAccounts, existingJournals){
-  const cashCode = glCashOrBankAccountCode(txn.paymentMethod);
+  const cashCode = glCashOrBankAccountCode(txn.paymentMethod, txn.bankCode);
   const cashAcc = findGlAccountByCode(glAccounts, cashCode);
   if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
   const drawingsAcc = findGlAccountByCode(glAccounts, '3200');
@@ -1530,7 +1558,7 @@ async function postOwnerDrawingAccounting(txn, glAccounts, existingJournals){
 }
 
 async function postLoanReceivedAccounting(txn, glAccounts, existingJournals){
-  const cashCode = glCashOrBankAccountCode(txn.paymentMethod);
+  const cashCode = glCashOrBankAccountCode(txn.paymentMethod, txn.bankCode);
   const cashAcc = findGlAccountByCode(glAccounts, cashCode);
   if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
   const loanAcc = (glAccounts||[]).find(a=>a.id===txn.accountId && a.accountType==='LIABILITY' && a.isActive!==false);
@@ -1539,7 +1567,7 @@ async function postLoanReceivedAccounting(txn, glAccounts, existingJournals){
 }
 
 async function postLoanRepaymentAccounting(txn, glAccounts, existingJournals){
-  const cashCode = glCashOrBankAccountCode(txn.paymentMethod);
+  const cashCode = glCashOrBankAccountCode(txn.paymentMethod, txn.bankCode);
   const cashAcc = findGlAccountByCode(glAccounts, cashCode);
   if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
   const loanAcc = (glAccounts||[]).find(a=>a.id===txn.accountId && a.accountType==='LIABILITY' && a.isActive!==false);
@@ -1548,7 +1576,7 @@ async function postLoanRepaymentAccounting(txn, glAccounts, existingJournals){
 }
 
 async function postLoanInterestAccounting(txn, glAccounts, existingJournals){
-  const cashCode = glCashOrBankAccountCode(txn.paymentMethod);
+  const cashCode = glCashOrBankAccountCode(txn.paymentMethod, txn.bankCode);
   const cashAcc = findGlAccountByCode(glAccounts, cashCode);
   if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
   const interestAcc = (glAccounts||[]).find(a=>a.id===txn.accountId && a.accountType==='EXPENSE' && a.isActive!==false);
@@ -1611,7 +1639,7 @@ async function postInventoryWriteOffAccounting(writeOff, glAccounts, existingJou
 // Pure: journal lines for a sales return. dueReduction/cashRefund come straight from
 // applySalesReturnToInvoice() (they sum to the return value); restockCost is the cost of the
 // resellable units put back on the shelf (damaged units stay expensed in COGS, as before).
-function buildSalesReturnLines({dueReduction, cashRefund, restockCost, payment, desc}, glAccounts){
+function buildSalesReturnLines({dueReduction, cashRefund, restockCost, payment, desc, bankCode}, glAccounts){
   const need = (code)=>{ const a = findGlAccountByCode(glAccounts, code); if(!a) throw new Error('Chart of Accounts has no active ' + code + ' account — load/check it in Finance'); return a; };
   const due = Math.max(0, Number(dueReduction)||0), cash = Math.max(0, Number(cashRefund)||0), cost = Math.max(0, Number(restockCost)||0);
   const value = due + cash;
@@ -1620,7 +1648,7 @@ function buildSalesReturnLines({dueReduction, cashRefund, restockCost, payment, 
   if(value > 0.001){
     lines.push({ accountId: need('4000').id, debit: value, credit: 0, description: desc });
     if(due > 0.001) lines.push({ accountId: need('1100').id, debit: 0, credit: due, description: desc });
-    if(cash > 0.001) lines.push({ accountId: need(payment==='card' ? '1010' : '1000').id, debit: 0, credit: cash, description: desc });
+    if(cash > 0.001) lines.push({ accountId: need(payment==='card' ? (bankCode || glCardBankCode()) : '1000').id, debit: 0, credit: cash, description: desc });
   }
   if(cost > 0.001){
     lines.push({ accountId: need('1210').id, debit: cost, credit: 0, description: desc });
@@ -1637,7 +1665,7 @@ async function postSalesReturnAccounting(ret, glAccounts, existingJournals){
   const sale = (existingJournals||[]).find(j=> j.sourceType==='SALE' && j.sourceId===ret.invoiceId && glIsLiveJournal(j));
   if(!sale && !glOpeningBalancesPosted(existingJournals)) return { status:'SKIPPED', journalId:null, journalNo:null, reason:'Bill ' + (ret.billNo||ret.invoiceId) + ' has no sale entry in the books (before accounting started)' };
   const desc = 'Sales return — Bill ' + (ret.billNo||ret.invoiceId) + (ret.customerName? (' — '+ret.customerName) : '');
-  const lines = buildSalesReturnLines({ dueReduction:ret.dueReduction, cashRefund:ret.cashRefund, restockCost:ret.restockCost, payment:ret.payment, desc }, glAccounts);
+  const lines = buildSalesReturnLines({ dueReduction:ret.dueReduction, cashRefund:ret.cashRefund, restockCost:ret.restockCost, payment:ret.payment, desc, bankCode:ret.cardBankCode }, glAccounts);
   const journalId = await createJournal({ date: ret.date || todayISO(), description: desc, sourceType, sourceId, lines }, glAccounts);
   await postJournal(journalId, glAccounts, existingJournals);
   return { status:'POSTED', journalId, journalNo: null };
@@ -1701,9 +1729,10 @@ async function reverseSaleForDeletedInvoice(invoiceId, billNo, glAccounts, exist
    (cardChargePct); older ones use the current setting. */
 function cardChargeAmount(amount, pct){ return Math.round((Number(amount)||0) * (Number(pct)||0)) / 100; }
 
-function buildCardChargeLines(fee, glAccounts, desc){
-  const charges = findGlAccountByCode(glAccounts, '6500'), bank = findGlAccountByCode(glAccounts, '1010');
-  if(!charges || !bank) throw new Error('Chart of Accounts has no active ' + (!charges ? '6500 Bank Charges' : '1010 Bank') + ' account — add it in Finance');
+function buildCardChargeLines(fee, glAccounts, desc, bankCode){
+  const code = bankCode || glCardBankCode();
+  const charges = findGlAccountByCode(glAccounts, '6500'), bank = findGlAccountByCode(glAccounts, code);
+  if(!charges || !bank) throw new Error('Chart of Accounts has no active ' + (!charges ? '6500 Bank Charges' : code + ' Bank') + ' account — add it in Finance');
   return [
     { accountId: charges.id, debit: fee, credit: 0, description: desc },
     { accountId: bank.id, debit: 0, credit: fee, description: desc },
@@ -1723,7 +1752,7 @@ async function postCardChargeAccounting(charge, glAccounts, existingJournals){
   const fee = cardChargeAmount(charge.amount, charge.pct);
   if(glToCents(fee) <= 0) return { status:'NO_CHARGE' };
   const desc = 'Card charge ' + charge.pct + '% — ' + charge.desc;
-  const lines = buildCardChargeLines(fee, glAccounts, desc);
+  const lines = buildCardChargeLines(fee, glAccounts, desc, charge.bankCode);
   const journalId = await createJournal({ date: charge.date || todayISO(), description: desc, sourceType, sourceId, lines }, glAccounts);
   await postJournal(journalId, glAccounts, existingJournals);
   return { status:'POSTED', journalId };
@@ -1742,12 +1771,12 @@ function pendingCardCharges(invoices, payments, journals, currentPct){
   (invoices||[]).forEach(inv=>{
     if(inv.payment!=='card' || !live.has('SALE|' + inv.id) || live.has('CARD_CHARGE|' + inv.id) || live.has('BILL_TO_CREDIT|' + inv.id)) return;
     const amount = invoiceBalanceInfo(inv).paidAmt, pct = pctOf(inv);
-    if(glToCents(cardChargeAmount(amount, pct)) > 0) out.push({ id:inv.id, amount, pct, date: glDocDate(inv), desc: 'Bill ' + (inv.billNo||inv.id) });
+    if(glToCents(cardChargeAmount(amount, pct)) > 0) out.push({ id:inv.id, amount, pct, date: glDocDate(inv), desc: 'Bill ' + (inv.billNo||inv.id), bankCode: inv.cardBankCode });
   });
   (payments||[]).forEach(p=>{
     if(p.method!=='card' || !live.has('CUSTOMER_PAYMENT|' + p.id) || live.has('CARD_CHARGE|' + p.id)) return;
     const pct = pctOf(p);
-    if(glToCents(cardChargeAmount(p.amount, pct)) > 0) out.push({ id:p.id, amount:Number(p.amount)||0, pct, date: glDocDate(p), desc: 'Card payment — ' + (p.customerName||'') });
+    if(glToCents(cardChargeAmount(p.amount, pct)) > 0) out.push({ id:p.id, amount:Number(p.amount)||0, pct, date: glDocDate(p), desc: 'Card payment — ' + (p.customerName||''), bankCode: p.cardBankCode });
   });
   return out;
 }
@@ -2266,7 +2295,8 @@ function validateAPReconciliation(ap){
 // glAccounts (not hard-coded by name), and never invented beyond what already exists.
 const GL_CASH_ACCOUNT_CODES = ['1000','1010'];
 function glCashBankAccounts(glAccounts){
-  return GL_CASH_ACCOUNT_CODES.map(code=> findGlAccountByCode(glAccounts, code)).filter(Boolean);
+  const base = GL_CASH_ACCOUNT_CODES.map(code=> findGlAccountByCode(glAccounts, code)).filter(Boolean);
+  return base.concat(glBankAccounts(glAccounts).filter(a=> !base.includes(a)));
 }
 
 // Classifies a POSTED journal's cash/bank line by its journal's sourceType alone (not by the
@@ -2288,6 +2318,8 @@ function glClassifyCashLine(sourceType){
   if(sourceType==='SALES_RETURN') return { section:'operating', label:'Customer Refunds (Sales Returns)' };
   if(sourceType==='BILL_TO_CREDIT') return { section:'operating', label:'Customer Sales Receipts' };
   if(sourceType==='OPENING_BALANCE') return { section:'financing', label:'Opening Balance Entries' };
+  if(sourceType==='CARD_CHARGE') return { section:'operating', label:'Card / Bank Charges' };
+  if(sourceType==='BANK_TRANSFER') return { section:'transfer', label:'Cash deposits / bank transfers' };
   return null;
 }
 
@@ -2317,6 +2349,7 @@ function computeCashFlow(glAccounts, glJournals, dateFrom, dateTo){
       const row = { date:j.date, journalNo:j.journalNo, description:l.description||j.description,
         sourceType:j.sourceType||'', sourceId:j.sourceId||'', debit, credit, net };
       const classified = glClassifyCashLine(j.sourceType);
+      if(classified && classified.section==='transfer') return; // cash ↔ bank moves net to zero inside Cash & Bank
       if(classified && classified.section==='operating') operatingLines.push({...row, label:classified.label});
       else if(classified && classified.section==='financing') financingLines.push({...row, label:classified.label});
       else unclassifiedLines.push(row);
@@ -2431,7 +2464,7 @@ function computeAccountsHealth(d, asOfDate){
   const bsCheck = validateBalanceSheet(computeBalanceSheet(glAccounts, glJournals, asOfDate));
   const openingPosted = glJournals.some(j=> glIsLiveJournal(j) && j.sourceType==='OPENING_BALANCE');
   return { asOfDate, hasChart: glAccounts.length>0, journalCount: glJournals.length, openingPosted,
-    trialBalance: tbCheck, balanceSheet: bsCheck, cash: bal('1000'), bank: bal('1010'),
+    trialBalance: tbCheck, balanceSheet: bsCheck, cash: bal('1000'), bank: r2(glBankAccounts(glAccounts).reduce((s,a)=> s + bal(a.accountCode), 0)),
     control, unposted, orphans };
 }
 
@@ -3320,6 +3353,7 @@ function CapitalLoans({glAccounts, glJournals, capitalLoanTxns, notify}){
   const [transactionDate,setTransactionDate] = useState(todayISO());
   const [amount,setAmount] = useState('');
   const [paymentMethod,setPaymentMethod] = useState('cash');
+  const [bankCode,setBankCode] = useState('1010');
   const [loanAccountId,setLoanAccountId] = useState('');
   const [interestAccountId,setInterestAccountId] = useState('');
   const [description,setDescription] = useState('');
@@ -3375,6 +3409,7 @@ function CapitalLoans({glAccounts, glJournals, capitalLoanTxns, notify}){
       const acc = glAccounts.find(a=>a.id===accountId);
       const txnRef = await db.collection('capitalLoanTransactions').add({
         transactionNo, transactionDate, transactionType, amount:Number(amount)||0, paymentMethod,
+        ...(paymentMethod==='bank' ? {bankCode} : {}),
         accountId, accountCode:acc.accountCode, accountName:acc.accountName,
         description:description||'', referenceNo:referenceNo||'', notes:notes||'',
         accountingStatus:'PENDING', accountingError:null, journalId:null, createdBy:null,
@@ -3388,7 +3423,7 @@ function CapitalLoans({glAccounts, glJournals, capitalLoanTxns, notify}){
       // transaction stays recorded regardless, and the failure is surfaced + made retryable
       // (Finance tab) rather than silently swallowed — same pattern as every prior step.
       try{
-        const acct = await postCapitalLoanAccounting({id:txnRef.id, transactionNo, transactionDate, transactionType, amount:Number(amount)||0, paymentMethod, accountId, description}, glAccounts, glJournals);
+        const acct = await postCapitalLoanAccounting({id:txnRef.id, transactionNo, transactionDate, transactionType, amount:Number(amount)||0, paymentMethod, ...(paymentMethod==='bank' ? {bankCode} : {}), accountId, description}, glAccounts, glJournals);
         await db.collection('capitalLoanTransactions').doc(txnRef.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null });
         if(acct.status==='POSTED') notify('✓ Accounting posted for ' + transactionNo);
       } catch(err){
@@ -3427,8 +3462,9 @@ function CapitalLoans({glAccounts, glJournals, capitalLoanTxns, notify}){
           <div><label>Date</label><input type="date" value={transactionDate} onChange={e=>setTransactionDate(e.target.value)} /></div>
           <div><label>Amount (Rs.)</label><input type="number" value={amount} onChange={e=>setAmount(e.target.value)} /></div>
           <div><label>Payment Account</label>
-            <select value={paymentMethod} onChange={e=>setPaymentMethod(e.target.value)}>
-              <option value="cash">Cash (1000)</option><option value="bank">Bank (1010)</option>
+            <select value={paymentMethod==='bank' ? 'bank:' + bankCode : 'cash'} onChange={e=>{ const v = e.target.value; if(v==='cash') setPaymentMethod('cash'); else { setPaymentMethod('bank'); setBankCode(v.slice(5)); } }}>
+              <option value="cash">Cash (1000)</option>
+              {glBankAccounts(glAccounts).map(a=> <option key={a.id} value={'bank:' + a.accountCode}>{a.accountName} ({a.accountCode})</option>)}
             </select></div>
 
           {(transactionType==='OWNER_CAPITAL') && (
@@ -3500,6 +3536,119 @@ function CapitalLoans({glAccounts, glJournals, capitalLoanTxns, notify}){
             </tbody>
           </table>
         )}
+      </div>
+    </div>
+  );
+}
+
+
+/* ---------- 🏦 Bank Accounts: add accounts, pick the card account, record deposits / transfers ---------- */
+function BankAccounts({glAccounts, glJournals, notify}){
+  const banks = glBankAccounts(glAccounts);
+  const cashAcc = findGlAccountByCode(glAccounts, '1000');
+  const tb = computeTrialBalance(glAccounts, glJournals, todayISO());
+  const balOf = (a)=>{ const r = tb.rows.find(x=> x.accountId===a.id || x.accountCode===a.accountCode); return r ? Math.round((r.debit - r.credit)*100)/100 : 0; };
+  const [cardCode,setCardCode] = useState(GL_CARD_BANK_CODE);
+  const [newName,setNewName] = useState(''), [newNo,setNewNo] = useState('');
+  const [busy,setBusy] = useState(false);
+  const [dep,setDep] = useState({date: todayISO(), from:'1000', to: GL_CARD_BANK_CODE, amount:'', ref:''});
+  useEffect(()=>{ db.collection('meta').doc('settings').get().then(snap=>{
+    const c = snap.exists && snap.data().cardBankAccountCode; if(c){ setCardCode(String(c)); GL_CARD_BANK_CODE = String(c); }
+  }).catch(()=>{}); },[]);
+
+  const saveCardCode = async (code)=>{
+    setCardCode(code); GL_CARD_BANK_CODE = code;
+    try{ await db.collection('meta').doc('settings').set({cardBankAccountCode: code}, {merge:true});
+      const a = findGlAccountByCode(glAccounts, code); notify('✓ Card payments දැන් යන්නේ ' + code + ' ' + (a ? a.accountName : '') + ' එකට'); }
+    catch(e){ console.error(e); notify('❌ Save වුනේ නැහැ'); }
+  };
+  const addBank = async ()=>{
+    const name = newName.trim();
+    if(!name) return notify('Bank account එකේ නම දෙන්න (e.g. BOC Current)');
+    const code = nextBankAccountCode(glAccounts);
+    if(!code) return notify('තවත් bank accounts දාන්න codes ඉතුරු නැහැ');
+    setBusy(true);
+    try{
+      await db.collection('glAccounts').add({ accountCode: code, accountName: name + (newNo.trim() ? ' — ' + newNo.trim() : ''), accountType:'ASSET',
+        isBank:true, bankAccountNo: newNo.trim(), parentAccountId:null, isActive:true,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(), updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+      setNewName(''); setNewNo(''); notify('✓ ' + code + ' ' + name + ' bank account එක හැදුවා');
+    }catch(e){ console.error(e); notify('❌ Account එක හදන්න බැරි වුණා: ' + (e.message||e)); }
+    setBusy(false);
+  };
+  const renameBank = async (a)=>{
+    const name = window.prompt(a.accountCode + ' account එකේ අලුත් නම (e.g. Commercial Bank — 1234):', a.accountName);
+    if(!name || !name.trim() || name.trim()===a.accountName) return;
+    try{ await db.collection('glAccounts').doc(a.id).update({ accountName: name.trim(), updatedAt: firebase.firestore.FieldValue.serverTimestamp() }); notify('✓ නම වෙනස් කළා'); }
+    catch(e){ console.error(e); notify('❌ නම වෙනස් කරන්න බැරි වුණා'); }
+  };
+  const saveTransfer = async ()=>{
+    const from = findGlAccountByCode(glAccounts, dep.from), to = findGlAccountByCode(glAccounts, dep.to);
+    const desc = (dep.from==='1000' ? 'Cash deposit' : 'Bank transfer') + ' → ' + (to ? to.accountName : dep.to) + (dep.ref.trim() ? ' (slip ' + dep.ref.trim() + ')' : '');
+    let lines;
+    try{ lines = buildBankTransferLines(dep.from, dep.to, Number(dep.amount), glAccounts, desc); }catch(e){ return notify('❌ ' + e.message); }
+    if(dep.from==='1000' && Number(dep.amount) > balOf(cashAcc) + 0.001 &&
+      !window.confirm('Books වල Cash තියෙන්නේ ' + fmt(balOf(cashAcc)) + ' යි — ' + fmt(Number(dep.amount)) + ' deposit කරනවද?')) return;
+    setBusy(true);
+    try{
+      const id = await createJournal({ date: dep.date || todayISO(), description: desc, sourceType:'BANK_TRANSFER', sourceId: 'BT-' + Date.now(), lines }, glAccounts);
+      await postJournal(id, glAccounts, glJournals);
+      notify('✓ ' + fmt(Number(dep.amount)) + ' — ' + (from ? from.accountName : '') + ' → ' + (to ? to.accountName : ''));
+      setDep(d=> ({...d, amount:'', ref:''}));
+    }catch(e){ console.error(e); notify('❌ Save වුනේ නැහැ: ' + (e.message||e)); }
+    setBusy(false);
+  };
+  const recent = (glJournals||[]).filter(j=> j.sourceType==='BANK_TRANSFER' && glIsLiveJournal(j))
+    .sort((a,b)=> (b.date||'').localeCompare(a.date||'') || String(b.journalNo||'').localeCompare(String(a.journalNo||''))).slice(0,20);
+  const nameOf = (id)=>{ const a = (glAccounts||[]).find(x=> x.id===id); return a ? a.accountCode + ' ' + a.accountName : id; };
+  const options = [cashAcc, ...banks].filter(Boolean);
+
+  if(!glAccounts.length) return <div className="card"><div className="empty">මුලින්ම Finance (Setup) එකෙන් Chart of Accounts load කරන්න</div></div>;
+  return (
+    <div data-testid="bank-accounts">
+      <div className="card">
+        <h3>🏦 Bank Accounts — balances (books)</h3>
+        <table><thead><tr><th>Code</th><th>Account</th><th>Balance</th><th>Card payments</th></tr></thead>
+          <tbody>
+            {cashAcc && <tr><td>{cashAcc.accountCode}</td><td>{cashAcc.accountName} (drawer)</td><td>{fmt(balOf(cashAcc))}</td><td></td></tr>}
+            {banks.map(a=> <tr key={a.id}><td>{a.accountCode}</td><td>{a.accountName} <button className="btn btn-ghost btn-sm" title="නම වෙනස් කරන්න" onClick={()=>renameBank(a)}>✏</button></td><td>{fmt(balOf(a))}</td>
+              <td>{a.accountCode===cardCode ? <b>💳 මෙතනට</b> : <button className="btn btn-ghost btn-sm" onClick={()=>saveCardCode(a.accountCode)}>මෙතනට යවන්න</button>}</td></tr>)}
+          </tbody></table>
+        <p style={{fontSize:12.5, color:'var(--ink-soft)', marginBottom:0}}>💳 කියලා තියෙන account එකට card bills, card වලින් ගෙවන ණය, card charges ඔක්කොම යනවා. වෙනස් කළොත් ඊළඟ card bills වල ඉඳන් අලුත් account එකට යනවා.</p>
+      </div>
+
+      <div className="card" style={{background:'var(--teal-100)', border:'1.5px solid var(--teal-500)'}}>
+        <h3>💵 Cash deposit / Bank transfer</h3>
+        <div className="grid c3">
+          <div><label>Date</label><input type="date" value={dep.date} onChange={e=>setDep({...dep, date:e.target.value})} /></div>
+          <div><label>From (සල්ලි ගත්ත තැන)</label>
+            <select data-testid="dep-from" value={dep.from} onChange={e=>setDep({...dep, from:e.target.value})}>
+              {options.map(a=> <option key={a.id} value={a.accountCode}>{a.accountCode} {a.accountName} — {fmt(balOf(a))}</option>)}</select></div>
+          <div><label>To (deposit කරපු bank account එක)</label>
+            <select data-testid="dep-to" value={dep.to} onChange={e=>setDep({...dep, to:e.target.value})}>
+              {options.map(a=> <option key={a.id} value={a.accountCode}>{a.accountCode} {a.accountName}</option>)}</select></div>
+          <div><label>Amount (Rs.)</label><input data-testid="dep-amount" type="number" value={dep.amount} onChange={e=>setDep({...dep, amount:e.target.value})} /></div>
+          <div><label>Slip / Ref No (optional)</label><input value={dep.ref} onChange={e=>setDep({...dep, ref:e.target.value})} /></div>
+          <div style={{display:'flex', alignItems:'flex-end'}}><button className="btn btn-primary" disabled={busy} onClick={saveTransfer}>💾 Save deposit</button></div>
+        </div>
+      </div>
+
+      <div className="card">
+        <h3>➕ අලුත් bank account එකක්</h3>
+        <div className="grid c3">
+          <div><label>Bank / account නම</label><input data-testid="new-bank-name" value={newName} onChange={e=>setNewName(e.target.value)} placeholder="e.g. BOC Current" /></div>
+          <div><label>Account No (optional)</label><input value={newNo} onChange={e=>setNewNo(e.target.value)} placeholder="e.g. 0012345678" /></div>
+          <div style={{display:'flex', alignItems:'flex-end'}}><button className="btn btn-primary" disabled={busy} onClick={addBank}>➕ Add bank account</button></div>
+        </div>
+        <p style={{fontSize:12.5, color:'var(--ink-soft)', marginBottom:0}}>Chart of Accounts එකට ASSET account එකක් විදියට ({nextBankAccountCode(glAccounts)||'—'}) එකතු වෙනවා. පරණ 1010 Bank එක ඒ විදියටම තියෙනවා — ✏ ඔබලා ඒකේ නම (ඔයාගේ bank එකේ නම) දාන්න පුළුවන්.</p>
+      </div>
+
+      <div className="card">
+        <h3>🧾 අන්තිම deposits / transfers</h3>
+        {recent.length===0 ? <div className="empty">තවම deposits නැහැ</div> :
+        <table><thead><tr><th>Date</th><th>JE</th><th>To</th><th>From</th><th>Amount</th><th>Note</th></tr></thead>
+          <tbody>{recent.map(j=>{ const dr = (j.lines||[]).find(l=> Number(l.debit)>0), cr = (j.lines||[]).find(l=> Number(l.credit)>0);
+            return <tr key={j.id}><td>{j.date}</td><td>{j.journalNo}</td><td>{dr && nameOf(dr.accountId)}</td><td>{cr && nameOf(cr.accountId)}</td><td>{fmt(dr ? dr.debit : 0)}</td><td>{j.description}</td></tr>; })}</tbody></table>}
       </div>
     </div>
   );
@@ -4205,6 +4354,13 @@ function StaffApp({onExit}){
     });
     return unsub;
   },[]);
+  // Which bank account card money goes to (🏦 Bank Accounts) — read once signed in.
+  useEffect(()=>{
+    if(!user) return;
+    db.collection('meta').doc('settings').get().then(snap=>{
+      if(snap.exists && snap.data().cardBankAccountCode) GL_CARD_BANK_CODE = String(snap.data().cardBankAccountCode);
+    }).catch(e=> console.error('settings read failed', e));
+  },[user]);
 
   const [items] = useCollection('items');
   const [batches] = useCollection('batches');
@@ -4309,6 +4465,7 @@ function StaffApp({onExit}){
     {id:'reports', label:'Reports', ic:'📈'},
     {id:'cashcontrol', label:'Cash Control', ic:'🧾'},
     {id:'finance', label:'Finance (Setup)', ic:'💰'},
+    {id:'banks', label:'Bank Accounts', ic:'🏦'},
     {id:'ledger', label:'General Ledger', ic:'📖'},
     {id:'trialbalance', label:'Trial Balance', ic:'⚖'},
     {id:'pnl', label:'Profit & Loss', ic:'📊'},
@@ -4392,6 +4549,7 @@ function StaffApp({onExit}){
             suppliers={suppliers} expenses={expenses} adjustments={adjustments} salesReturns={salesReturns} grnReturns={grnReturns}
             glAccounts={glAccounts} glJournals={glJournals} customers={customers} payments={payments} notify={notify}/>}
           {tab==='cashcontrol' && <CashControl invoices={invoices} payments={payments} cashChecks={cashChecks} notify={notify} />}
+          {tab==='banks' && <BankAccounts glAccounts={glAccounts} glJournals={glJournals} notify={notify} />}
           {tab==='finance' && <Finance glAccounts={glAccounts} glJournals={glJournals} grns={grns} invoices={invoices} payments={payments} supplierPayments={supplierPayments} expenses={opExpenses} capitalLoanTxns={capitalLoanTxns} batches={batches} customers={customers} salesReturns={salesReturns} grnReturns={grnReturns} notify={notify} />}
           {tab==='ledger' && <GeneralLedger glAccounts={glAccounts} glJournals={glJournals} />}
           {tab==='trialbalance' && <TrialBalance glAccounts={glAccounts} glJournals={glJournals} />}
@@ -5389,8 +5547,9 @@ function buildBillToCreditLines(inv, glAccounts){
   const paid = invoiceBalanceInfo(inv).paidAmt;
   if(glToCents(paid) <= 0) throw new Error('Nothing was recorded as paid on this bill');
   const ar = findGlAccountByCode(glAccounts, '1100');
-  const cash = findGlAccountByCode(glAccounts, inv.payment==='card' ? '1010' : '1000');
-  if(!ar || !cash) throw new Error('Chart of Accounts is missing 1100 / ' + (inv.payment==='card' ? '1010' : '1000'));
+  const cashCode = inv.payment==='card' ? glCardBankCode(inv) : '1000';
+  const cash = findGlAccountByCode(glAccounts, cashCode);
+  if(!ar || !cash) throw new Error('Chart of Accounts is missing 1100 / ' + cashCode);
   const desc = 'Bill ' + (inv.billNo||inv.id) + ' changed from ' + (inv.payment||'cash') + ' to credit';
   return [
     { accountId: ar.id, debit: paid, credit: 0, description: desc },
@@ -5530,7 +5689,7 @@ function Customers({customers, invoices, payments, items, medReminders, notify, 
       const payCardPct = method==='card' ? await getCardChargePct() : null;
       const payRef = await db.collection('payments').add({
         customerId:c.id, customerName:c.name, amount:actuallyApplied, method,
-        previousDue:c.dueAmount||0, newDue, appliedTo, ...(method==='card' ? { cardChargePct: payCardPct } : {}),
+        previousDue:c.dueAmount||0, newDue, appliedTo, ...(method==='card' ? { cardChargePct: payCardPct, cardBankCode: GL_CARD_BANK_CODE } : {}),
         createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       });
       setPayAmounts(p=>({...p,[c.id]:''}));
@@ -5543,10 +5702,10 @@ function Customers({customers, invoices, payments, items, medReminders, notify, 
       // made retryable (Finance tab → Pending Customer Payment Accounting) rather than silently
       // swallowed or rolled back — same pattern as GRN/Bill accounting in Steps 2/3.
       try{
-        const acct = await postCustomerPaymentAccounting({id:payRef.id, customerId:c.id, customerName:c.name, amount:actuallyApplied, method, date:today}, glAccounts, glJournals);
+        const acct = await postCustomerPaymentAccounting({id:payRef.id, customerId:c.id, customerName:c.name, amount:actuallyApplied, method, date:today, ...(method==='card' ? {cardBankCode: GL_CARD_BANK_CODE} : {})}, glAccounts, glJournals);
         await db.collection('payments').doc(payRef.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null });
         if(method==='card' && payCardPct>0){
-          try{ await postCardChargeAccounting({ id:payRef.id, amount:actuallyApplied, pct:payCardPct, date:today, desc:'Card payment — ' + c.name }, glAccounts, glJournals); }
+          try{ await postCardChargeAccounting({ id:payRef.id, amount:actuallyApplied, pct:payCardPct, date:today, desc:'Card payment — ' + c.name, bankCode: GL_CARD_BANK_CODE }, glAccounts, glJournals); }
           catch(err){ console.error('Card charge accounting failed', err); notify('⚠ Card charge එක books වලට ගියේ නැහැ (' + err.message + ') — Finance tab එකෙන් post කරන්න'); }
         }
       } catch(err){
@@ -5898,7 +6057,8 @@ function Returns({invoices, customers, batches, items, grns, suppliers, salesRet
       });
       const {update, dueReduction, cashRefundDue} = applySalesReturnToInvoice(foundInvoice, totalRefund);
       const acctRet = { invoiceId: foundInvoice.id, billNo: foundInvoice.billNo, customerName: foundInvoice.customerName,
-        payment: foundInvoice.payment, dueReduction, cashRefund: cashRefundDue, restockCost: +restockCost.toFixed(2), date: todayISO() };
+        payment: foundInvoice.payment, ...(foundInvoice.cardBankCode ? {cardBankCode: foundInvoice.cardBankCode} : {}),
+        dueReduction, cashRefund: cashRefundDue, restockCost: +restockCost.toFixed(2), date: todayISO() };
       for(const r of rows){
         const qty = Number(r.qty);
         const unitPrice = r.item.qty>0 ? r.item.lineTotal/r.item.qty : 0;
@@ -7491,7 +7651,7 @@ function NewBill({items, batches, customers, invoices, notify, staffUser, prefil
         otherCharges:Number(otherCharges)||0, totalToPay, payment, staffName: staffUser?.name||'',
         // per-bill paid tracking (needed for Sales Report PAID/DUE badge + Customer Credit Ledger + partial cash/card payments)
         paidAmount: payment==='credit' ? 0 : paidAmountEffective, paid: dueToAdd<=0.001,
-        ...(payment==='card' ? { cardChargePct: await getCardChargePct() } : {}),
+        ...(payment==='card' ? { cardChargePct: await getCardChargePct(), cardBankCode: GL_CARD_BANK_CODE } : {}),
         createdAt: firebase.firestore.FieldValue.serverTimestamp(), createdAtMs: Date.now(),
       };
       const invRef = await db.collection('invoices').add(invoiceData);
@@ -7509,7 +7669,7 @@ function NewBill({items, batches, customers, invoices, notify, staffUser, prefil
         if(acct.status==='POSTED') notify('✓ Accounting posted for ' + billNo);
         if(payment==='card' && invoiceData.cardChargePct>0){
           try{
-            await postCardChargeAccounting({ id:invRef.id, amount:invoiceData.paidAmount, pct:invoiceData.cardChargePct, date:glDocDate(invoiceData), desc:'Bill ' + billNo }, glAccounts, glJournals);
+            await postCardChargeAccounting({ id:invRef.id, amount:invoiceData.paidAmount, pct:invoiceData.cardChargePct, date:glDocDate(invoiceData), desc:'Bill ' + billNo, bankCode:invoiceData.cardBankCode }, glAccounts, glJournals);
           }catch(err){ console.error('Card charge accounting failed', err); notify('⚠ ' + billNo + ' card charge එක books වලට ගියේ නැහැ (' + err.message + ') — Finance tab එකෙන් post කරන්න'); }
         }
       } catch(err){

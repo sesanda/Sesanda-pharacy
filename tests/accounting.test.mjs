@@ -6,7 +6,7 @@ const H = loadHelpers(['glToCents','glCentsToAmount','glIsLiveJournal','findGlAc
   'glActivePostedJournals','glLineDelta','computeTrialBalance','validateTrialBalance','computeProfitAndLoss',
   'computeBalanceSheet','validateBalanceSheet','glAgeInDays','glAgingBucket','glSubledgerLines','glARPaidByInvoice',
   'glAPPaidByGrn','computeAR','computeAP','invoiceBalanceInfo','computeCustomerOutstanding',
-  'buildSalesReturnLines','buildOpeningBalanceLines','computeAccountsHealth','customerUsuallyBuysOnCredit','buildBillToCreditLines','buildGrnReturnLines','itemSellPrice','restockBatchFields']);
+  'buildSalesReturnLines','buildOpeningBalanceLines','computeAccountsHealth','customerUsuallyBuysOnCredit','buildBillToCreditLines','buildGrnReturnLines','itemSellPrice','restockBatchFields','glCardBankCode','glBankAccounts']);
 
 const CHART = [
   ['1000','Cash','ASSET'], ['1010','Bank','ASSET'], ['1100','Accounts Receivable','ASSET'], ['1210','Pharmacy Inventory','ASSET'],
@@ -257,7 +257,7 @@ test('item analysis: price history, monthly units, generic comparison', ()=>{
 });
 
 test('card charges: fee, lines, and which card bills / payments still need one', ()=>{
-  const C = loadHelpers(['glToCents','glIsLiveJournal','findGlAccountByCode','localDateStr','glDocDate','invoiceBalanceInfo','cardChargeAmount','buildCardChargeLines','pendingCardCharges']);
+  const C = loadHelpers(['glToCents','glIsLiveJournal','findGlAccountByCode','localDateStr','glDocDate','invoiceBalanceInfo','cardChargeAmount','buildCardChargeLines','pendingCardCharges','glCardBankCode','glBankAccounts']);
   assert.equal(C.cardChargeAmount(1000, 3), 30);
   assert.equal(C.cardChargeAmount(333.33, 2.5), 8.33);
   const chart = [{ id:'a6500', accountCode:'6500', accountType:'EXPENSE', isActive:true }, { id:'a1010', accountCode:'1010', accountType:'ASSET', isActive:true }];
@@ -279,4 +279,19 @@ test('card charges: fee, lines, and which card bills / payments still need one',
   assert.deepEqual(C.pendingCardCharges(invs, pays, js, 3).map(c=>[c.id, c.amount, c.pct, c.date]),
     [['i1',1000,3,'2026-10-01'], ['i2',500,2,'2026-10-02'], ['p1',200,3,'2026-10-03']]);
   assert.equal(C.pendingCardCharges(invs, pays, js, 0).length, 1);   // only INV-2's own 2%
+});
+
+test('bank accounts: list, next code, transfer lines, card bank per document', ()=>{
+  const C = loadHelpers(['glToCents','findGlAccountByCode','glBankAccounts','nextBankAccountCode','buildBankTransferLines']);
+  const chart = [{ id:'a1000', accountCode:'1000', accountType:'ASSET' }, { id:'a1010', accountCode:'1010', accountType:'ASSET' },
+    { id:'a1012', accountCode:'1012', accountType:'ASSET', isBank:true }, { id:'a1100', accountCode:'1100', accountType:'ASSET' },
+    { id:'a1013', accountCode:'1013', accountType:'ASSET', isBank:true, isActive:false }];
+  assert.deepEqual(C.glBankAccounts(chart).map(a=>a.accountCode), ['1010','1012']);
+  assert.equal(C.nextBankAccountCode(chart), '1011');
+  assert.deepEqual(C.buildBankTransferLines('1000','1012', 500, chart, 'd').map(l=>[l.accountId, l.debit, l.credit]), [['a1012',500,0],['a1000',0,500]]);
+  assert.throws(()=> C.buildBankTransferLines('1010','1010', 5, chart, 'd'), /එකම account/);
+  assert.throws(()=> C.buildBankTransferLines('1000','1010', 0, chart, 'd'), /0ට වඩා/);
+  const { glCardBankCode } = loadHelpers(['glCardBankCode']);
+  assert.equal(glCardBankCode({ cardBankCode:'1012' }), '1012');
+  assert.equal(glCardBankCode({}), '1010');
 });
