@@ -234,3 +234,24 @@ test('charts: buckets, sales trend, top items, payment mix, expiry value', ()=>{
     { remainingUnits:0, unitCost:4, expiryDate:'2026-11-20' }, { remainingUnits:5, unitCost:4, expiryDate:'2028-01-01' }], '2026-10-25', 3);
   assert.deepEqual(ex.map(r=>[r.key, r.value]), [['expired',20],['2026-10',0],['2026-11',20],['2026-12',0]]);
 });
+
+test('item analysis: price history, monthly units, generic comparison', ()=>{
+  const C = loadHelpers(['localDateStr','buildItemPriceHistory','buildItemMonthlyUnits','buildGenericComparison']);
+  const hist = C.buildItemPriceHistory('a', [
+    { itemId:'a', unitCost:10, unitSell:12, grnId:'g2', grnNo:'GRN-2' },
+    { itemId:'a', unitCost:8, unitSell:11, isOpeningStock:true, openingDate:'2026-01-05' },
+    { itemId:'a', unitCost:9, unitSell:12, isReturn:true, openingDate:'2026-02-01' },
+    { itemId:'b', unitCost:1, unitSell:2, openingDate:'2026-01-01' },
+  ], [{ id:'g2', date:'2026-06-10' }]);
+  assert.deepEqual(hist.map(p=>[p.date, p.unitCost, p.unitSell, p.source]), [['2026-01-05',8,11,'Opening stock'], ['2026-06-10',10,12,'GRN-2']]);
+  const invs = [
+    { day:'2026-10-02', items:[{ itemId:'a', qty:3, lineTotal:36, costTotal:30 }, { itemId:'b', qty:5, lineTotal:10, costTotal:5 }] },
+    { day:'2026-08-15', items:[{ itemId:'a', qty:2, lineTotal:24, costTotal:20 }] },
+    { day:'2025-01-01', items:[{ itemId:'a', qty:99, lineTotal:1, costTotal:1 }] },
+  ];
+  const mu = C.buildItemMonthlyUnits('a', invs, i=>i.day, '2026-10-25', 3);
+  assert.deepEqual(mu.map(r=>[r.key, r.units, r.sales]), [['2026-08',2,24], ['2026-09',0,0], ['2026-10',3,36]]);
+  const items = [{ id:'a', brandName:'A', genericName:'Paracetamol' }, { id:'b', brandName:'B', genericName:'paracetamol ' }, { id:'c', brandName:'C', genericName:'Other' }];
+  const cmp = C.buildGenericComparison('PARACETAMOL', items, invs.slice(0,2), l=>l.costTotal);
+  assert.deepEqual(cmp.map(r=>[r.name, r.units, r.sales, r.profit]), [['A',5,60,10], ['B',5,10,5]]);
+});

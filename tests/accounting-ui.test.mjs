@@ -372,3 +372,34 @@ test('Reports → Charts: tiles, trend chart with hover, top items, payment mix'
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('Charts → item analysis: price history, busiest months, best brand of a generic', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.items = [{ id:'it1', itemNumber:'T001', brandName:'Testamol', genericName:'Paracetamol', unit:'tab', packSize:10 },
+    { id:'it2', itemNumber:'P002', brandName:'Panadol', genericName:'Paracetamol', unit:'tab', packSize:10 }];
+  fx.collections.batches.push({ id:'b2', itemId:'it1', brandName:'Testamol', remainingUnits:5, unitCost:70, unitSell:110, expiryDate:'2027-09-01', openingDate:'2026-10-10', isOpeningStock:true });
+  fx.collections.invoices[0].createdAtMs = Date.now();
+  fx.collections.invoices.push({ id:'inv2', billNo:'B2', customerName:'Walk-in', payment:'cash', totalToPay:300, paidAmount:300, paid:true, createdAtMs:Date.now(),
+    items:[{ itemId:'it2', brandName:'Panadol', qty:3, unitPrice:100, lineTotal:300, costTotal:270, unitCost:90 }] });
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await page.setViewportSize({ width:1200, height:1400 });
+    await page.getByText('Reports', { exact:true }).first().click();
+    await page.getByRole('button', { name:'📊 Charts' }).click();
+    await page.getByRole('button', { name:'දින 30' }).click();
+    const box = page.getByTestId('item-analysis');
+    await page.getByTestId('analysis-item').fill('testa');
+    await box.locator('.ac-item', { hasText:'Testamol' }).dispatchEvent('mousedown');
+    const t = await box.innerText();
+    assert.match(t, /cost 16\.7%, sell 10\.0% වෙනස් වෙලා/);       // 60→70, 100→110
+    assert.match(t, /වැඩිම: \S+ \d\d \(10\)/);
+    await page.getByTestId('analysis-generic').fill('Paracetamol');
+    const t2 = await box.innerText();
+    assert.match(t2, /වැඩියෙන්ම profit: Testamol — Rs\. 400\.00/);
+    assert.match(t2, /Panadol/);
+    if(process.env.SHOT) await box.screenshot({ path: process.env.SHOT });
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});

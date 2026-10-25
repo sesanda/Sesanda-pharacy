@@ -8025,6 +8025,195 @@ function HBarList({rows, color, valueFmt, empty}){
   );
 }
 
+/* ---------- Charts → 🔎 Item analysis ---------- */
+// Every priced stock intake of an item, oldest first: [{date, unitCost, unitSell, source}].
+// Date = the GRN's bill date, else the opening-stock date, else when the batch was saved.
+// Returned stock is skipped (it carries the sold bill's price, not a new purchase price).
+function buildItemPriceHistory(itemId, batches, grns){
+  const grnDate = Object.fromEntries((grns||[]).map(g=> [g.id, g.date]));
+  return (batches||[]).filter(b=> b.itemId===itemId && !b.isReturn && (Number(b.unitCost)>0 || Number(b.unitSell)>0)).map(b=>({
+    date: (b.grnId && grnDate[b.grnId]) || b.openingDate || (b.createdAt?.seconds ? localDateStr(new Date(b.createdAt.seconds*1000)) : ''),
+    unitCost: Number(b.unitCost)||0, unitSell: Number(b.unitSell)||0,
+    source: b.grnNo || (b.isOpeningStock ? 'Opening stock' : b.batchCode || ''),
+  })).filter(p=> p.date).sort((a,b)=> a.date<b.date ? -1 : a.date>b.date ? 1 : 0);
+}
+
+// Units of an item sold per month, for the `months` months up to `today`.
+function buildItemMonthlyUnits(itemId, invoices, dayOf, today, months){
+  const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  let y = +today.slice(0,4), m = +today.slice(5,7);
+  const rows = [];
+  for(let i=0;i<months;i++){
+    rows.unshift({ key: y + '-' + String(m).padStart(2,'0'), label: MON[m-1] + ' ' + String(y).slice(2), units:0, sales:0 });
+    m--; if(m<1){ m=12; y--; }
+  }
+  const byKey = Object.fromEntries(rows.map(r=> [r.key, r]));
+  (invoices||[]).forEach(inv=>{
+    const r = byKey[(dayOf(inv)||'').slice(0,7)]; if(!r) return;
+    (inv.items||[]).forEach(l=>{ if(l.itemId!==itemId) return;
+      r.units += Number(l.qty)||0; r.sales += Number(l.lineTotal) || (Number(l.unitPrice)||0)*(Number(l.qty)||0); });
+  });
+  return rows;
+}
+
+// Brands of one generic, compared on the bills given: [{itemId, name, units, sales, cost, profit}] by profit.
+function buildGenericComparison(generic, items, invoices, lineCost){
+  const g = String(generic||'').trim().toLowerCase();
+  if(!g) return [];
+  const mine = (items||[]).filter(it=> String(it.genericName||'').trim().toLowerCase()===g);
+  const map = Object.fromEntries(mine.map(it=> [it.id, { itemId:it.id, name:it.brandName, units:0, sales:0, cost:0 }]));
+  (invoices||[]).forEach(inv=> (inv.items||[]).forEach(l=>{
+    const r = map[l.itemId]; if(!r) return;
+    r.units += Number(l.qty)||0;
+    r.sales += Number(l.lineTotal) || (Number(l.unitPrice)||0)*(Number(l.qty)||0);
+    r.cost += Number(lineCost(l))||0;
+  }));
+  return Object.values(map).map(r=> ({ ...r, profit: r.sales - r.cost })).sort((a,b)=> b.profit - a.profit || b.sales - a.sales);
+}
+
+// Cost and sell price at each stock intake — two lines on one Rs axis, markers on every point.
+function PriceHistoryChart({points}){
+  const [hi,setHi] = useState(null);
+  const W = 720, H = 220, L = 48, R = 12, T = 12, B = 26;
+  const max = chartNiceMax(Math.max(...points.map(p=> Math.max(p.unitCost, p.unitSell)), 0));
+  const step = points.length>1 ? (W-L-R)/(points.length-1) : 0;
+  const x = (i)=> points.length>1 ? L + step*i : (L + W - R)/2;
+  const y = (v)=> T + (H-T-B) * (1 - v/max);
+  const path = (k)=> points.map((p,i)=> (i?'L':'M') + x(i) + ',' + y(p[k])).join(' ');
+  const every = Math.ceil(points.length / 8);
+  const h = hi!=null ? points[hi] : null;
+  return (
+    <div style={{position:'relative'}}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{width:'100%', height:'auto', display:'block'}} role="img" aria-label="Unit cost and unit sell price at each stock intake">
+        {[0,0.25,0.5,0.75,1].map((f,i)=> <g key={i}>
+          <line x1={L} x2={W-R} y1={y(f*max)} y2={y(f*max)} stroke="var(--line)" strokeWidth="1" />
+          <text x={L-6} y={y(f*max)+4} textAnchor="end" fontSize="11" fill="var(--ink-soft)">{chartShort(f*max)}</text>
+        </g>)}
+        {hi!=null && <line x1={x(hi)} x2={x(hi)} y1={T} y2={H-B} stroke="var(--ink-soft)" strokeWidth="1" strokeDasharray="3 3" />}
+        <path d={path('unitCost')} fill="none" stroke={CHART_COST} strokeWidth="2" />
+        <path d={path('unitSell')} fill="none" stroke={CHART_PROFIT} strokeWidth="2" />
+        {points.map((p,i)=> <g key={i}>
+          <circle cx={x(i)} cy={y(p.unitCost)} r={hi===i?5:4} fill={CHART_COST} stroke="var(--card)" strokeWidth="2" />
+          <circle cx={x(i)} cy={y(p.unitSell)} r={hi===i?5:4} fill={CHART_PROFIT} stroke="var(--card)" strokeWidth="2" />
+          {(i % every===0 || i===points.length-1) && (points.length<2 || i===points.length-1 || i+every<points.length) && <text x={x(i)} y={H-8} fontSize="11" fill="var(--ink-soft)"
+            textAnchor={points.length<2 ? 'middle' : i===0 ? 'start' : i===points.length-1 ? 'end' : 'middle'}>{p.date}</text>}
+          <rect x={x(i) - Math.max(step,24)/2} y={T} width={Math.max(step,24)} height={H-T-B} fill="transparent"
+            onMouseEnter={()=>setHi(i)} onMouseLeave={()=>setHi(null)} onClick={()=>setHi(i)} />
+        </g>)}
+      </svg>
+      {h && (
+        <div style={{position:'absolute', top:4, left:`${Math.min(70, Math.max(0, x(hi)/W*100 - 10))}%`, background:'var(--bg)', border:'1px solid var(--line)',
+          borderRadius:8, padding:'8px 10px', fontSize:12.5, pointerEvents:'none', minWidth:160, boxShadow:'0 4px 14px rgba(0,0,0,.35)'}}>
+          <div style={{fontWeight:700, marginBottom:4}}>{h.date} · {h.source}</div>
+          <div><span style={{display:'inline-block', width:9, height:9, borderRadius:2, background:CHART_COST, marginRight:6}} />Unit cost: Rs {h.unitCost.toFixed(2)}</div>
+          <div><span style={{display:'inline-block', width:9, height:9, borderRadius:2, background:CHART_PROFIT, marginRight:6}} />Unit sell: Rs {h.unitSell.toFixed(2)}</div>
+          <div style={{color:'var(--ink-soft)'}}>{h.unitSell>0 ? ((h.unitSell-h.unitCost)/h.unitSell*100).toFixed(1) + '% margin' : ''}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Single-series vertical bars with a hover tooltip — rows: [{key, label, value, tip}].
+function SimpleBarChart({rows, color, valueLabel}){
+  const [hi,setHi] = useState(null);
+  const W = 720, H = 200, L = 40, R = 8, T = 20, B = 26;
+  const max = chartNiceMax(Math.max(...rows.map(r=> r.value), 0));
+  const pw = (W-L-R)/Math.max(1, rows.length), bw = Math.max(3, Math.min(30, pw*0.62));
+  const y = (v)=> T + (H-T-B) * (1 - v/max);
+  const top = Math.max(...rows.map(r=> r.value));
+  const h = hi!=null ? rows[hi] : null;
+  return (
+    <div style={{position:'relative'}}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{width:'100%', height:'auto', display:'block'}} role="img" aria-label={valueLabel}>
+        {[0,0.5,1].map((f,i)=> <g key={i}>
+          <line x1={L} x2={W-R} y1={y(f*max)} y2={y(f*max)} stroke="var(--line)" strokeWidth="1" />
+          <text x={L-6} y={y(f*max)+4} textAnchor="end" fontSize="11" fill="var(--ink-soft)">{chartShort(f*max)}</text>
+        </g>)}
+        {rows.map((r,i)=>{
+          const bx = L + pw*i + (pw-bw)/2, by = y(r.value), bh = y(0)-by, rr = Math.min(4, bh, bw/2);
+          return <g key={r.key} opacity={hi!=null && hi!==i ? 0.45 : 1}>
+            {r.value>0 && <path d={`M${bx},${by+bh} V${by+rr} Q${bx},${by} ${bx+rr},${by} H${bx+bw-rr} Q${bx+bw},${by} ${bx+bw},${by+rr} V${by+bh} Z`} fill={color||CHART_COST} />}
+            {r.value>0 && r.value===top && <text x={bx+bw/2} y={by-4} textAnchor="middle" fontSize="11" fill="var(--ink)">{chartShort(r.value)}</text>}
+            <text x={L + pw*i + pw/2} y={H-8} textAnchor="middle" fontSize="11" fill="var(--ink-soft)">{r.label}</text>
+            <rect x={L + pw*i} y={T} width={pw} height={H-T-B} fill="transparent" onMouseEnter={()=>setHi(i)} onMouseLeave={()=>setHi(null)} onClick={()=>setHi(i)} />
+          </g>;
+        })}
+        <line x1={L} x2={W-R} y1={y(0)} y2={y(0)} stroke="var(--ink-soft)" strokeWidth="1" />
+      </svg>
+      {h && (
+        <div style={{position:'absolute', top:4, left:`${Math.min(72, Math.max(0, (L + pw*hi)/W*100 - 8))}%`, background:'var(--bg)', border:'1px solid var(--line)',
+          borderRadius:8, padding:'8px 10px', fontSize:12.5, pointerEvents:'none', boxShadow:'0 4px 14px rgba(0,0,0,.35)'}}>
+          <div style={{fontWeight:700}}>{h.label}</div><div>{h.tip}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ItemAnalysis({items, batches, invoices, grns, periodInvoices, lineCost, rangeLabel}){
+  const [q,setQ] = useState(''), [itemId,setItemId] = useState(''), [open,setOpen] = useState(false);
+  const [generic,setGeneric] = useState('');
+  const item = items.find(it=> it.id===itemId);
+  const ql = q.trim().toLowerCase();
+  const matches = ql && !item ? items.filter(it=> String(it.brandName||'').toLowerCase().includes(ql) || String(it.genericName||'').toLowerCase().includes(ql) || String(it.itemNumber||'').includes(ql)).slice(0,8) : [];
+  const generics = [...new Set(items.map(it=> String(it.genericName||'').trim()).filter(Boolean))].sort();
+  const history = item ? buildItemPriceHistory(item.id, batches, grns) : [];
+  const monthly = item ? buildItemMonthlyUnits(item.id, invoices, inv=> inv.createdAtMs ? localDateStr(new Date(inv.createdAtMs)) : '', todayISO(), 12) : [];
+  const busiest = monthly.slice().sort((a,b)=> b.units - a.units).filter(r=> r.units>0).slice(0,3);
+  const cmp = buildGenericComparison(generic, items, periodInvoices, lineCost);
+  const pct = (a,b)=> b>0 ? (a/b*100).toFixed(1)+'%' : '—';
+  return (
+    <div data-testid="item-analysis">
+      <div className="card">
+        <h3>🔎 Item එකක් analyze කරන්න</h3>
+        <div className="autocomplete">
+          <input data-testid="analysis-item" value={item ? item.itemNumber + ' — ' + item.brandName : q} placeholder="Item නම / code type කරන්න"
+            onChange={e=>{ setQ(e.target.value); setItemId(''); setOpen(true); }} onFocus={()=>{ if(item){ setQ(item.brandName); setItemId(''); } setOpen(true); }}
+            onBlur={()=>setTimeout(()=>setOpen(false),150)} autoComplete="off" />
+          {open && matches.length>0 && <div className="ac-list">{matches.map(m=>
+            <div key={m.id} className="ac-item" onMouseDown={()=>{ setItemId(m.id); setOpen(false); }}>
+              <b>{m.itemNumber}</b> — {m.brandName} <span style={{color:'var(--ink-soft)'}}>({m.genericName})</span></div>)}</div>}
+        </div>
+        {item && <>
+          <h3 style={{marginTop:18}}>💲 Cost / Sell price වෙනස් වුණු විදිය</h3>
+          {history.length===0 ? <div className="empty">මේ item එකට prices තියෙන stock entries නැහැ</div> : <>
+            <div style={{display:'flex', gap:16, fontSize:13, marginBottom:8, flexWrap:'wrap'}}>
+              <span><span style={{display:'inline-block', width:10, height:10, borderRadius:2, background:CHART_COST, marginRight:6}} />Unit cost</span>
+              <span><span style={{display:'inline-block', width:10, height:10, borderRadius:2, background:CHART_PROFIT, marginRight:6}} />Unit sell</span>
+              <span style={{color:'var(--ink-soft)'}}>
+                {history.length>1 ? 'පළමු GRN එකට වඩා cost ' + pct(history[history.length-1].unitCost - history[0].unitCost, history[0].unitCost) + ', sell ' + pct(history[history.length-1].unitSell - history[0].unitSell, history[0].unitSell) + ' වෙනස් වෙලා' : 'Stock entry එකයි තියෙන්නේ'}
+              </span>
+            </div>
+            <PriceHistoryChart points={history} />
+            <details style={{marginTop:10}}><summary style={{cursor:'pointer', fontSize:13}}>📋 Table එක බලන්න</summary>
+              <div style={{overflowX:'auto'}}><table><thead><tr><th>Date</th><th>GRN</th><th>Unit Cost</th><th>Unit Sell</th><th>Margin</th></tr></thead>
+                <tbody>{history.map((p,i)=> <tr key={i}><td>{p.date}</td><td>{p.source}</td><td>{p.unitCost.toFixed(2)}</td><td>{p.unitSell.toFixed(2)}</td><td>{pct(p.unitSell-p.unitCost, p.unitSell)}</td></tr>)}</tbody></table></div>
+            </details>
+          </>}
+          <h3 style={{marginTop:18}}>📅 වැඩියෙන්ම විකිණෙන කාල (ගිය මාස 12, units)</h3>
+          {busiest.length===0 ? <div className="empty">ගිය මාස 12 ඇතුළත මේ item එක විකුණලා නැහැ</div> : <>
+            <div style={{fontSize:13, marginBottom:8}}>වැඩිම: {busiest.map(r=> <b key={r.key} style={{marginRight:10}}>{r.label} ({r.units})</b>)}</div>
+            <SimpleBarChart rows={monthly.map(r=> ({key:r.key, label:r.label.slice(0,3), value:r.units, tip: r.units + ' ' + (item.unit||'units') + ' · ' + fmt(r.sales)}))} valueLabel="Units sold per month" />
+          </>}
+        </>}
+      </div>
+      <div className="card">
+        <h3>🧪 Generic එක අනුව — වැඩියෙන්ම profit දෙන item එක ({rangeLabel})</h3>
+        <input data-testid="analysis-generic" list="generic-names" value={generic} onChange={e=>setGeneric(e.target.value)} placeholder="Generic නම type කරන්න (e.g. Paracetamol)" />
+        <datalist id="generic-names">{generics.map(g=> <option key={g} value={g} />)}</datalist>
+        {generic.trim() && (cmp.length===0 ? <div className="empty">ඒ generic නමින් items නැහැ — list එකෙන් තෝරන්න</div> : <div style={{marginTop:12}}>
+          {cmp[0].profit>0 && <div style={{marginBottom:10, fontSize:14}}>🏆 වැඩියෙන්ම profit: <b>{cmp[0].name}</b> — {fmt(cmp[0].profit)} ({pct(cmp[0].profit, cmp[0].sales)} margin)</div>}
+          <HBarList rows={cmp.filter(r=> r.profit>0).map(r=> ({key:r.itemId, name:r.name, value:r.profit, note: r.units + ' units · sales ' + fmt(r.sales) + ' · ' + pct(r.profit, r.sales)}))} color={CHART_PROFIT}
+            empty="මේ කාලය ඇතුළත මේ generic එකේ items වලින් profit එකක් නැහැ — උඩින් දින පරාසය වැඩි කරන්න" />
+          <div style={{overflowX:'auto', marginTop:12}}><table><thead><tr><th>Item</th><th>Units</th><th>Sales</th><th>Cost</th><th>Profit</th><th>Margin</th></tr></thead>
+            <tbody>{cmp.map(r=> <tr key={r.itemId}><td>{r.name}</td><td>{r.units}</td><td>{fmt(r.sales)}</td><td>{fmt(r.cost)}</td><td>{fmt(r.profit)}</td><td>{pct(r.profit, r.sales)}</td></tr>)}</tbody></table></div>
+        </div>)}
+      </div>
+    </div>
+  );
+}
+
 function Reports({invoices, journal, batches, items, grns, suppliers, expenses, adjustments, salesReturns, grnReturns, glAccounts, glJournals, customers, payments, notify}){
   const [reportTab,setReportTab] = useState('overview');
   const [fromDate,setFromDate] = useState(todayISO());
@@ -8362,6 +8551,7 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
             </div>
             <div className="card"><h3>⏳ Expire වෙන stock (cost value, ඉදිරි මාස 6)</h3>
               <HBarList rows={expiry.map(r=> ({key:r.key, name:r.name, value:r.value, note: r.units + ' units'}))} color={CHART_COST} empty="ඉදිරි මාස 6 ඇතුළත expire වෙන stock නැහැ" /></div>
+            <ItemAnalysis items={items} batches={batches} invoices={invoices} grns={grns||[]} periodInvoices={periodInvoices} lineCost={estimateLineCost} rangeLabel={fromDate + ' → ' + toDate} />
           </div>
         );
       })()}
