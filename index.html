@@ -117,6 +117,13 @@
   .nav-btn{display:flex; align-items:center; gap:10px; width:100%; text-align:left; background:transparent; border:none; color:rgba(255,255,255,.78); padding:11px 12px; border-radius:10px; font-size:13.5px; margin-bottom:3px;}
   .nav-btn.active{background:rgba(255,255,255,.14); color:#fff; font-weight:600;}
   .nav-btn:hover{background:rgba(255,255,255,.08);}
+  .nav-group{display:flex; align-items:center; gap:10px; width:100%; text-align:left; background:transparent; border:none; color:#fff; padding:10px 12px; border-radius:10px; font-size:13.5px; font-weight:600; margin:4px 0 3px;}
+  .nav-group:hover{background:rgba(255,255,255,.08);}
+  .nav-group .chev{opacity:.6; font-size:11px; transition:transform .15s;}
+  .nav-group.open .chev{transform:rotate(90deg);}
+  .nav-sub{margin-left:12px; padding-left:8px; border-left:1px solid rgba(255,255,255,.12); margin-bottom:6px;}
+  .nav-sub .nav-btn{padding:9px 10px; font-size:13px;}
+  .side{overflow-y:auto;}
   .side-foot{margin-top:auto; padding-top:14px; border-top:1px solid rgba(255,255,255,.12); font-size:12px; opacity:.7;}
   .side-foot button{background:none;border:none;color:#fff;opacity:.85;font-size:12.5px;padding:8px 0;}
 
@@ -4268,6 +4275,7 @@ function StaffApp({onExit}){
   const [billPrefill,setBillPrefill] = useState(null);
   const [billDrafts,setBillDrafts] = useState([{id:1}]);
   const [activeBillDraftId,setActiveBillDraftId] = useState(1);
+  const [openGroups,setOpenGroups] = useState(()=>{ try{ return JSON.parse(localStorage.getItem('navGroups')||'{}')||{}; }catch(e){ return {}; } });
   const [grnDrafts,setGrnDrafts] = useState([{id:1}]);
   const [activeGrnDraftId,setActiveGrnDraftId] = useState(1);
   const [subGrnDrafts,setSubGrnDrafts] = useState([{id:1}]);
@@ -4477,18 +4485,42 @@ function StaffApp({onExit}){
     {id:'capitalloans', label:'Capital & Loans', ic:'💰'},
     {id:'ai', label:'AI Insights', ic:'🤖'},
   ];
+  // Sidebar groups — Dashboard / New Bill stay on top; the rest fold under a heading. A group opens
+  // when clicked (remembered on this device) and always when it holds the open page.
+  const NAV_GROUPS = [
+    {id:'stockGrp', label:'Stock & Purchasing', ic:'📦', items:['items','purchaseOrders','grn','subgrn','returns','opening','stock','suppliers']},
+    {id:'custGrp', label:'Customers & Orders', ic:'👥', items:['customers','orders','special']},
+    {id:'reportGrp', label:'Reports & Cash', ic:'📈', items:['reports','cashcontrol','ai']},
+    {id:'acctGrp', label:'Accounting', ic:'💰', items:['finance','banks','ledger','trialbalance','pnl','balancesheet','ar','ap','cashflow','expenses','capitalloans']},
+  ];
+  const grouped = new Set(NAV_GROUPS.flatMap(g=> g.items));
+  const navBtn = (n)=> (
+    <button key={n.id} className={"nav-btn"+(tab===n.id?" active":"")} onClick={()=>{setTab(n.id); setSideOpen(false);}}>
+      <span>{n.ic}</span><span style={{flex:1}}>{n.label}</span>
+      {!!n.badge && <span className="tag pending">{n.badge}</span>}
+    </button>
+  );
+  const toggleGroup = (id, isOpen)=> setOpenGroups(o=>{ const next = {...o, [id]: !isOpen}; try{ localStorage.setItem('navGroups', JSON.stringify(next)); }catch(e){} return next; });
 
   return (
     <div className="app">
       {sideOpen && <div className="side-backdrop" onClick={()=>setSideOpen(false)}></div>}
       <div className={"side"+(sideOpen?" open":"")}>
         <div className="brand">Sesanda Pharmacy<small>Staff Portal — {user.name}</small></div>
-        {NAV.map(n=>(
-          <button key={n.id} className={"nav-btn"+(tab===n.id?" active":"")} onClick={()=>{setTab(n.id); setSideOpen(false);}}>
-            <span>{n.ic}</span><span style={{flex:1}}>{n.label}</span>
-            {!!n.badge && <span className="tag pending">{n.badge}</span>}
-          </button>
-        ))}
+        {NAV.filter(n=> !grouped.has(n.id)).map(navBtn)}
+        {NAV_GROUPS.map(g=>{
+          const items = g.items.map(id=> NAV.find(n=> n.id===id)).filter(Boolean);
+          const open = openGroups[g.id]!=null ? openGroups[g.id] : g.items.includes(tab);
+          const badge = items.reduce((s,n)=> s + (n.badge||0), 0);
+          return <div key={g.id}>
+            <button className={"nav-group"+(open?" open":"")} data-labels={'|' + items.map(n=>n.label).join('|') + '|'} onClick={()=>toggleGroup(g.id, open)}>
+              <span>{g.ic}</span><span style={{flex:1}}>{g.label}</span>
+              {!open && badge>0 && <span className="tag pending">{badge}</span>}
+              <span className="chev">▶</span>
+            </button>
+            {open && <div className="nav-sub">{items.map(navBtn)}</div>}
+          </div>;
+        })}
         <div className="side-foot">
           <button onClick={()=>firebase.auth().signOut()}>↩ Sign out</button><br/>
           <button onClick={onExit}>🏠 Home</button>

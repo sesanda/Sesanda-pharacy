@@ -7,6 +7,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+// Sidebar pages sit inside folding groups: open the page's group first if it's closed.
+async function goTo(page, label){
+  const btn = page.locator('.side .nav-btn').filter({ has: page.getByText(label, { exact:true }) }).first();
+  if(!(await btn.isVisible().catch(()=>false))) await page.locator('.side .nav-group[data-labels*="|' + label + '|"]').first().click();
+  await btn.click();
+}
 const here = path.dirname(fileURLToPath(import.meta.url));
 const DEPS = process.env.TEST_DEPS;
 const HTML_FILE = process.env.TEST_HTML || path.join(here, '..', 'index.html');
@@ -55,7 +61,7 @@ async function openCustomers({ failCollections=[], htmlFile=HTML_FILE }={}){
   const inputs = page.locator('input');
   await inputs.nth(0).fill('tester@example.test'); await inputs.nth(1).fill('x');
   await page.getByRole('button', { name:'Login' }).click();
-  await page.getByText('Customers', { exact:true }).first().click();
+  await goTo(page, 'Customers');
   await page.waitForTimeout(600);
   return { browser, page, errors };
   } catch(e){ await browser.close(); throw e; }
@@ -118,7 +124,7 @@ test('"Download balance check" button downloads the reconciliation CSV without w
 test('Reports → "To Collect" shows money owed by customers, read-only', { skip }, async()=>{
   const { browser, page } = await openCustomers();
   try{
-    await page.getByText('Reports', { exact:true }).first().click();
+    await goTo(page, 'Reports');
     await page.getByRole('button', { name:'💰 To Collect' }).click();
     const report = page.getByTestId('collect-report');
     await report.waitFor();
