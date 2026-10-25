@@ -7847,6 +7847,184 @@ function StaffSpecialOrders({specialOrders, notify, onConvertToInvoice}){
 }
 
 /* ---------- Reports: Sales / Purchasing / Item Ledger / P&L / Expired Write-Off ---------- */
+/* ---------- Reports → 📊 Charts ----------
+   Pure builders (unit tested) + two small SVG/HTML chart components. Sales = what bills charged
+   (totalToPay) less sales returns; cost = each line's locked-in batch cost; gross profit = the rest. */
+const CHART_COST = '#3987e5', CHART_PROFIT = '#199e70';
+
+// Daily buckets for ranges up to 62 days, monthly beyond. Dates are 'YYYY-MM-DD' strings.
+function chartBuckets(fromDate, toDate){
+  if(!fromDate || !toDate || fromDate > toDate) return { unit:'day', buckets:[] };
+  const toUTC = (s)=> Date.UTC(+s.slice(0,4), +s.slice(5,7)-1, +s.slice(8,10));
+  const iso = (ms)=> new Date(ms).toISOString().slice(0,10);
+  const days = Math.round((toUTC(toDate) - toUTC(fromDate)) / 86400000) + 1;
+  const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const buckets = [];
+  if(days <= 62){
+    for(let ms = toUTC(fromDate); ms <= toUTC(toDate); ms += 86400000){
+      const d = iso(ms);
+      buckets.push({ key:d, label: +d.slice(8,10) + ' ' + MON[+d.slice(5,7)-1] });
+    }
+    return { unit:'day', buckets };
+  }
+  let y = +fromDate.slice(0,4), m = +fromDate.slice(5,7);
+  const endKey = toDate.slice(0,7);
+  for(;;){
+    const key = y + '-' + String(m).padStart(2,'0');
+    buckets.push({ key, label: MON[m-1] + ' ' + String(y).slice(2) });
+    if(key >= endKey) break;
+    m++; if(m>12){ m=1; y++; }
+  }
+  return { unit:'month', buckets };
+}
+
+// invoices / salesReturns → one row per bucket {key,label,sales,cost,profit,bills}.
+// dayOf(inv) gives the bill's local 'YYYY-MM-DD'; lineCost(line) its cost.
+function buildSalesTrend(invoices, salesReturns, fromDate, toDate, dayOf, lineCost){
+  const { unit, buckets } = chartBuckets(fromDate, toDate);
+  const rows = buckets.map(b=> ({ ...b, sales:0, cost:0, profit:0, bills:0 }));
+  const byKey = Object.fromEntries(rows.map(r=> [r.key, r]));
+  const keyOf = (d)=> d && d>=fromDate && d<=toDate ? (unit==='day' ? d : d.slice(0,7)) : null;
+  (invoices||[]).forEach(inv=>{
+    const r = byKey[keyOf(dayOf(inv))]; if(!r) return;
+    r.sales += Number(inv.totalToPay)||0;
+    r.cost += (inv.items||[]).reduce((s,l)=> s + (Number(lineCost(l))||0), 0);
+    r.bills += 1;
+  });
+  (salesReturns||[]).forEach(ret=>{
+    const r = byKey[keyOf(ret.date)]; if(!r) return;
+    r.sales -= Number(ret.refundAmount)||0;
+    r.cost -= Number(ret.costImpact)||0;
+  });
+  rows.forEach(r=>{ r.sales = Math.round(r.sales*100)/100; r.cost = Math.round(Math.max(0, r.cost)*100)/100; r.profit = Math.round((r.sales - r.cost)*100)/100; });
+  return { unit, rows };
+}
+
+// Top items in the bills given: [{name, sales, cost, profit, qty}] sorted by `by` ('sales'|'profit').
+function buildTopItems(invoices, lineCost, by, n){
+  const map = {};
+  (invoices||[]).forEach(inv=> (inv.items||[]).forEach(l=>{
+    const k = l.itemId || l.brandName; if(!k) return;
+    const r = map[k] || (map[k] = { name: l.brandName || k, sales:0, cost:0, qty:0 });
+    r.sales += Number(l.lineTotal) || (Number(l.unitPrice)||0)*(Number(l.qty)||0);
+    r.cost += Number(lineCost(l))||0;
+    r.qty += Number(l.qty)||0;
+  }));
+  return Object.values(map).map(r=> ({ ...r, profit: r.sales - r.cost }))
+    .sort((a,b)=> (b[by]||0) - (a[by]||0)).slice(0, n||10);
+}
+
+// Bill totals by how they were paid.
+function buildPaymentMix(invoices){
+  const names = { cash:'Cash', card:'Card', credit:'Credit (ණය)' };
+  const map = {};
+  (invoices||[]).forEach(inv=>{
+    const k = names[inv.payment] ? inv.payment : 'cash';
+    const r = map[k] || (map[k] = { key:k, name:names[k], value:0, bills:0 });
+    r.value += Number(inv.totalToPay)||0; r.bills += 1;
+  });
+  return ['cash','card','credit'].filter(k=> map[k]).map(k=> map[k]);
+}
+
+// Stock still on the shelf by expiry month (value at cost), from today for `months` months;
+// already-expired stock is one row in front.
+function buildExpiryValue(batches, today, months){
+  const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  let y = +today.slice(0,4), m = +today.slice(5,7);
+  const rows = [{ key:'expired', name:'Expired', value:0, units:0 }];
+  for(let i=0;i<months;i++){
+    rows.push({ key: y + '-' + String(m).padStart(2,'0'), name: MON[m-1] + ' ' + y, value:0, units:0 });
+    m++; if(m>12){ m=1; y++; }
+  }
+  const byKey = Object.fromEntries(rows.map(r=> [r.key, r]));
+  (batches||[]).forEach(b=>{
+    const units = Number(b.remainingUnits)||0;
+    if(units<=0 || !b.expiryDate) return;
+    const r = b.expiryDate < today ? byKey.expired : byKey[b.expiryDate.slice(0,7)];
+    if(!r) return;
+    r.value += units * (Number(b.unitCost)||0); r.units += units;
+  });
+  return rows;
+}
+
+function chartNiceMax(v){
+  if(!(v>0)) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v))), f = v / p;
+  return (f<=1 ? 1 : f<=2 ? 2 : f<=2.5 ? 2.5 : f<=5 ? 5 : 10) * p;
+}
+const chartShort = (n)=> { const a = Math.abs(n); return a>=1e6 ? (n/1e6).toFixed(a>=1e7?0:1)+'M' : a>=1e3 ? (n/1e3).toFixed(a>=1e4?0:1)+'k' : String(Math.round(n)); };
+
+// Stacked vertical bars: cost (bottom) + gross profit (top) = sales. A loss day shows cost only,
+// with the loss in the tooltip. Hover any column for its figures.
+function SalesTrendChart({rows}){
+  const [hi,setHi] = useState(null);
+  const W = 720, H = 240, L = 44, R = 8, T = 10, B = 26;
+  const max = chartNiceMax(Math.max(...rows.map(r=> Math.max(r.sales, r.cost)), 0));
+  const pw = (W-L-R) / Math.max(1, rows.length), bw = Math.max(3, Math.min(28, pw*0.62));
+  const y = (v)=> T + (H-T-B) * (1 - v/max);
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map(f=> f*max);
+  const every = Math.ceil(rows.length / 10);
+  const topRounded = (x, y0, w, h, r)=>{ r = Math.min(r, h, w/2); return `M${x},${y0+h} V${y0+r} Q${x},${y0} ${x+r},${y0} H${x+w-r} Q${x+w},${y0} ${x+w},${y0+r} V${y0+h} Z`; };
+  const h = hi!=null ? rows[hi] : null;
+  return (
+    <div style={{position:'relative'}}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{width:'100%', height:'auto', display:'block'}} role="img" aria-label="Sales, cost and gross profit over time">
+        {ticks.map((t,i)=> <g key={i}>
+          <line x1={L} x2={W-R} y1={y(t)} y2={y(t)} stroke="var(--line)" strokeWidth="1" />
+          <text x={L-6} y={y(t)+4} textAnchor="end" fontSize="11" fill="var(--ink-soft)">{chartShort(t)}</text>
+        </g>)}
+        {rows.map((r,i)=>{
+          const x = L + pw*i + (pw-bw)/2;
+          const cost = Math.max(0, r.cost), profit = Math.max(0, r.sales - r.cost);
+          const yc = y(cost), yp = y(cost + profit);
+          const fade = hi!=null && hi!==i ? 0.45 : 1;
+          return <g key={r.key} opacity={fade}>
+            {cost>0 && (profit>0
+              ? <rect x={x} y={yc} width={bw} height={y(0)-yc} fill={CHART_COST} />
+              : <path d={topRounded(x, yc, bw, y(0)-yc, 4)} fill={CHART_COST} />)}
+            {profit>0 && <path d={topRounded(x, yp, bw, Math.max(0, yc-yp-(cost>0?2:0)), 4)} fill={CHART_PROFIT} />}
+            {i % every===0 && <text x={L + pw*i + pw/2} y={H-8} textAnchor="middle" fontSize="11" fill="var(--ink-soft)">{r.label}</text>}
+            <rect x={L + pw*i} y={T} width={pw} height={H-T-B} fill="transparent"
+              onMouseEnter={()=>setHi(i)} onMouseLeave={()=>setHi(null)} onClick={()=>setHi(i)} />
+          </g>;
+        })}
+        <line x1={L} x2={W-R} y1={y(0)} y2={y(0)} stroke="var(--ink-soft)" strokeWidth="1" />
+      </svg>
+      {h && (
+        <div style={{position:'absolute', top:4, left: `${Math.min(70, Math.max(0, (L + pw*hi)/W*100 - 10))}%`, background:'var(--bg)', border:'1px solid var(--line)',
+          borderRadius:8, padding:'8px 10px', fontSize:12.5, pointerEvents:'none', minWidth:170, boxShadow:'0 4px 14px rgba(0,0,0,.35)'}}>
+          <div style={{fontWeight:700, marginBottom:4}}>{h.label}</div>
+          <div>Sales: <b>{fmt(h.sales)}</b></div>
+          <div><span style={{display:'inline-block', width:9, height:9, borderRadius:2, background:CHART_COST, marginRight:6}} />Cost: {fmt(h.cost)}</div>
+          <div><span style={{display:'inline-block', width:9, height:9, borderRadius:2, background:CHART_PROFIT, marginRight:6}} />{h.profit<0 ? 'Loss' : 'Gross profit'}: {fmt(h.profit)}</div>
+          <div style={{color:'var(--ink-soft)'}}>{h.sales>0 ? (h.profit/h.sales*100).toFixed(1)+'% margin · ' : ''}{h.bills} bills</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Horizontal bars, each directly labelled — rows: [{name, value, note}].
+function HBarList({rows, color, valueFmt, empty}){
+  const max = Math.max(0, ...rows.map(r=> r.value));
+  if(!rows.length || !(max>0)) return <div className="empty">{empty || 'Data නැහැ'}</div>;
+  return (
+    <div style={{display:'grid', gap:8}}>
+      {rows.map((r,i)=>(
+        <div key={r.key || r.name + i} title={r.name + ' — ' + (valueFmt||fmt)(r.value) + (r.note ? ' · ' + r.note : '')}>
+          <div style={{display:'flex', justifyContent:'space-between', gap:8, fontSize:13, marginBottom:3}}>
+            <span style={{overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap'}}>{r.name}</span>
+            <span style={{whiteSpace:'nowrap'}}><b>{(valueFmt||fmt)(r.value)}</b>{r.note && <span style={{color:'var(--ink-soft)'}}> · {r.note}</span>}</span>
+          </div>
+          <div style={{height:10, background:'var(--line)', borderRadius:4}}>
+            <div style={{height:10, width: Math.max(1, r.value/max*100)+'%', background: color || CHART_COST, borderRadius:4}} />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function Reports({invoices, journal, batches, items, grns, suppliers, expenses, adjustments, salesReturns, grnReturns, glAccounts, glJournals, customers, payments, notify}){
   const [reportTab,setReportTab] = useState('overview');
   const [fromDate,setFromDate] = useState(todayISO());
@@ -8103,6 +8281,7 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
     {id:'ledger', label:'📒 Item Ledger'},
     {id:'writeoff', label:'🗑 Expired Write-Off'},
     {id:'collect', label:'💰 To Collect'},
+    {id:'charts', label:'📊 Charts'},
   ];
   const collections = reportTab==='collect' ? buildCollectionsReport(customers, invoices, payments, Date.now()) : null;
   const downloadBalanceCheck = ()=>{
@@ -8131,6 +8310,61 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
           </div>
         </div>
       )}
+
+      {reportTab==='charts' && (()=>{
+        const trend = buildSalesTrend(periodInvoices, periodSalesReturns, fromDate, toDate, inv=> dateOf(inv.createdAtMs), estimateLineCost);
+        const tSales = trend.rows.reduce((s,r)=>s+r.sales,0), tCost = trend.rows.reduce((s,r)=>s+r.cost,0), tBills = periodInvoices.length;
+        const topSales = buildTopItems(periodInvoices, estimateLineCost, 'sales', 10);
+        const topProfit = buildTopItems(periodInvoices, estimateLineCost, 'profit', 10);
+        const mix = buildPaymentMix(periodInvoices), mixTotal = mix.reduce((s,r)=>s+r.value,0);
+        const owing = buildCollectionsReport(customers, invoices, payments, Date.now()).rows.slice(0,10);
+        const expiry = buildExpiryValue(batches, todayISO(), 6);
+        const setRange = (days)=>{ const d = new Date(); d.setDate(d.getDate()-days+1); setFromDate(localDateStr(d)); setToDate(todayISO()); };
+        const pct = (a,b)=> b>0 ? (a/b*100).toFixed(1)+'%' : '—';
+        const tile = (label, value, sub)=> (
+          <div className="card" style={{margin:0}}><div style={{fontSize:12.5, color:'var(--ink-soft)'}}>{label}</div>
+            <div style={{fontSize:20, fontWeight:700}}>{value}</div>{sub && <div style={{fontSize:12, color:'var(--ink-soft)'}}>{sub}</div>}</div>);
+        return (
+          <div data-testid="charts">
+            <div className="card" style={{display:'flex', gap:8, flexWrap:'wrap', alignItems:'center'}}>
+              <span style={{color:'var(--ink-soft)', fontSize:13}}>ඉක්මනට:</span>
+              {[[7,'දින 7'],[30,'දින 30'],[90,'මාස 3'],[365,'මාස 12']].map(([d,l])=>
+                <button key={d} className="btn btn-sm btn-ghost" onClick={()=>setRange(d)}>{l}</button>)}
+            </div>
+            <div className="grid c4" style={{marginBottom:16}}>
+              {tile('Sales (returns අඩු කරලා)', fmt(tSales), tBills + ' bills')}
+              {tile('Cost of goods sold', fmt(tCost))}
+              {tile('Gross profit', fmt(tSales - tCost), pct(tSales - tCost, tSales) + ' margin')}
+              {tile('සාමාන්‍ය bill එක', fmt(tBills ? tSales/tBills : 0))}
+            </div>
+            <div className="card">
+              <h3>📈 Sales — Cost + Gross profit ({trend.unit==='day' ? 'දිනපතා' : 'මාසිකව'})</h3>
+              <div style={{display:'flex', gap:16, fontSize:13, marginBottom:8}}>
+                <span><span style={{display:'inline-block', width:10, height:10, borderRadius:2, background:CHART_COST, marginRight:6}} />Cost</span>
+                <span><span style={{display:'inline-block', width:10, height:10, borderRadius:2, background:CHART_PROFIT, marginRight:6}} />Gross profit</span>
+                <span style={{color:'var(--ink-soft)'}}>තීරුවේ උස = Sales · තීරුවක් උඩ mouse එක තියන්න / tap කරන්න</span>
+              </div>
+              {trend.rows.length ? <SalesTrendChart rows={trend.rows} /> : <div className="empty">From / To දින හරියට දෙන්න</div>}
+              <details style={{marginTop:10}}><summary style={{cursor:'pointer', fontSize:13}}>📋 Table එක බලන්න</summary>
+                <div style={{overflowX:'auto'}}><table><thead><tr><th>{trend.unit==='day'?'Day':'Month'}</th><th>Bills</th><th>Sales</th><th>Cost</th><th>Gross profit</th><th>Margin</th></tr></thead>
+                  <tbody>{trend.rows.map(r=> <tr key={r.key}><td>{r.label}</td><td>{r.bills}</td><td>{fmt(r.sales)}</td><td>{fmt(r.cost)}</td><td>{fmt(r.profit)}</td><td>{pct(r.profit, r.sales)}</td></tr>)}</tbody></table></div>
+              </details>
+            </div>
+            <div className="grid c2">
+              <div className="card"><h3>🏆 වැඩියෙන්ම විකුණුණු items (Sales)</h3>
+                <HBarList rows={topSales.map(r=> ({name:r.name, value:r.sales, note: r.qty + ' units · ' + pct(r.profit, r.sales)}))} color={CHART_COST} /></div>
+              <div className="card"><h3>💹 වැඩියෙන්ම ලාභ දුන්න items (Gross profit)</h3>
+                <HBarList rows={topProfit.filter(r=> r.profit>0).map(r=> ({name:r.name, value:r.profit, note: pct(r.profit, r.sales) + ' margin'}))} color={CHART_PROFIT} /></div>
+              <div className="card"><h3>💳 ගෙවපු විදිය (Cash / Card / Credit)</h3>
+                <HBarList rows={mix.map(r=> ({key:r.key, name:r.name, value:r.value, note: pct(r.value, mixTotal) + ' · ' + r.bills + ' bills'}))} color={CHART_COST} /></div>
+              <div className="card"><h3>👥 වැඩියෙන්ම ණය තියෙන customers (අද වෙනකොට)</h3>
+                <HBarList rows={owing.map(r=> ({key:r.id, name:r.name, value:r.outstanding, note: r.openBills + ' bills' + (r.oldestDays!=null ? ' · දින ' + r.oldestDays : '')}))} color={CHART_COST} empty="කාටවත් ණය නැහැ" /></div>
+            </div>
+            <div className="card"><h3>⏳ Expire වෙන stock (cost value, ඉදිරි මාස 6)</h3>
+              <HBarList rows={expiry.map(r=> ({key:r.key, name:r.name, value:r.value, note: r.units + ' units'}))} color={CHART_COST} empty="ඉදිරි මාස 6 ඇතුළත expire වෙන stock නැහැ" /></div>
+          </div>
+        );
+      })()}
 
       {reportTab==='overview' && (
         <div>

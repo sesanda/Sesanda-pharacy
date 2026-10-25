@@ -348,3 +348,27 @@ test('GRN: last prices show when an item is typed; selling price at or below cos
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('Reports → Charts: tiles, trend chart with hover, top items, payment mix', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.invoices[0].createdAtMs = Date.now();
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await page.setViewportSize({ width:1200, height:1400 });
+    await page.getByText('Reports', { exact:true }).first().click();
+    await page.getByRole('button', { name:'📊 Charts' }).click();
+    await page.getByRole('button', { name:'දින 30' }).click();
+    const charts = page.getByTestId('charts');
+    const text = await charts.innerText();
+    assert.match(text, /Rs\. 1,000\.00/);            // sales
+    assert.match(text, /40\.0% margin/);             // (1000-600)/1000
+    assert.match(text, /Testamol/);
+    assert.match(text, /Credit/);
+    await charts.locator('svg rect[fill="transparent"]').last().hover();
+    assert.match(await charts.innerText(), /Gross profit: Rs\. 400\.00/);
+    if(process.env.SHOT) await charts.screenshot({ path: process.env.SHOT });
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});

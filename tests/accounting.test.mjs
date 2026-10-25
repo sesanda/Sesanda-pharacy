@@ -211,3 +211,26 @@ test('itemLastPrices: newest GRN cost, New Bill sell price, returns skipped', ()
   assert.equal(itemLastPrices('i2', batches).grnNo, 'Opening stock');
   assert.deepEqual([itemLastPrices('none', batches).unitCost, itemLastPrices('none', batches).unitSell], [0, 0]);
 });
+
+test('charts: buckets, sales trend, top items, payment mix, expiry value', ()=>{
+  const C = loadHelpers(['chartBuckets','buildSalesTrend','buildTopItems','buildPaymentMix','buildExpiryValue']);
+  assert.equal(C.chartBuckets('2026-10-01','2026-10-30').buckets.length, 30);
+  assert.deepEqual(C.chartBuckets('2025-11-15','2026-10-25').buckets.map(b=>b.key).slice(0,3), ['2025-11','2025-12','2026-01']);
+  assert.equal(C.chartBuckets('2025-11-15','2026-10-25').unit, 'month');
+  const invs = [
+    { totalToPay:100, payment:'cash', day:'2026-10-02', items:[{ itemId:'a', brandName:'A', qty:2, lineTotal:100, costTotal:60 }] },
+    { totalToPay:50, payment:'credit', day:'2026-10-02', items:[{ itemId:'b', brandName:'B', qty:1, lineTotal:50, costTotal:20 }] },
+    { totalToPay:30, payment:'card', day:'2026-10-03', items:[{ itemId:'a', brandName:'A', qty:1, lineTotal:30, costTotal:30 }] },
+    { totalToPay:999, payment:'cash', day:'2026-09-01', items:[] },
+  ];
+  const t = C.buildSalesTrend(invs, [{ date:'2026-10-03', refundAmount:10, costImpact:6 }], '2026-10-01', '2026-10-03', i=>i.day, l=>l.costTotal);
+  assert.deepEqual(t.rows.map(r=>[r.key, r.sales, r.cost, r.profit, r.bills]),
+    [['2026-10-01',0,0,0,0], ['2026-10-02',150,80,70,2], ['2026-10-03',20,24,-4,1]]);
+  const top = C.buildTopItems(invs.slice(0,3), l=>l.costTotal, 'profit', 5);
+  assert.deepEqual(top.map(r=>[r.name, r.sales, r.profit, r.qty]), [['A',130,40,3], ['B',50,30,1]]);
+  assert.deepEqual(C.buildPaymentMix(invs.slice(0,3)).map(r=>[r.key, r.value]), [['cash',100],['card',30],['credit',50]]);
+  const ex = C.buildExpiryValue([
+    { remainingUnits:10, unitCost:2, expiryDate:'2026-09-30' }, { remainingUnits:5, unitCost:4, expiryDate:'2026-11-20' },
+    { remainingUnits:0, unitCost:4, expiryDate:'2026-11-20' }, { remainingUnits:5, unitCost:4, expiryDate:'2028-01-01' }], '2026-10-25', 3);
+  assert.deepEqual(ex.map(r=>[r.key, r.value]), [['expired',20],['2026-10',0],['2026-11',20],['2026-12',0]]);
+});
