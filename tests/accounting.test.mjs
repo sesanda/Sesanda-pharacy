@@ -198,3 +198,16 @@ test('costPriceWarning flags a selling price equal to or below cost', ()=>{
   assert.match(costPriceWarning(10, 10), /සමානයි/);
   assert.match(costPriceWarning('12', '10'), /අඩුයි/);
 });
+
+test('itemLastPrices: newest GRN cost, New Bill sell price, returns skipped', ()=>{
+  const { itemLastPrices } = loadHelpers(['itemSellPrice','itemLastPrices']);
+  const batches = [
+    { itemId:'i1', unitCost:8, unitSell:10, remainingUnits:0, grnNo:'GRN-1', createdAt:{seconds:1} },
+    { itemId:'i1', unitCost:9, unitSell:12, remainingUnits:5, grnNo:'GRN-2', expiryDate:'2027-01-01', createdAt:{seconds:2} },
+    { itemId:'i1', unitCost:7, unitSell:12, remainingUnits:1, isReturn:true, createdAt:{seconds:3} },
+    { itemId:'i2', unitCost:5, unitSell:6, remainingUnits:1, isOpeningStock:true, grnNo:'' },
+  ];
+  assert.deepEqual(itemLastPrices('i1', batches), { unitCost:9, unitSell:12, grnNo:'GRN-2', expiryDate:'2027-01-01' });
+  assert.equal(itemLastPrices('i2', batches).grnNo, 'Opening stock');
+  assert.deepEqual([itemLastPrices('none', batches).unitCost, itemLastPrices('none', batches).unitSell], [0, 0]);
+});

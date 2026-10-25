@@ -6147,6 +6147,34 @@ async function nextGrnNo(){
   });
 }
 
+// Latest known prices of an item: unit cost from its newest priced stock batch (GRN / opening stock;
+// returned stock is skipped — its cost is the sold bill's), unit sell = the price New Bill charges.
+function itemLastPrices(itemId, batches){
+  const mine = (batches||[]).filter(b=> b.itemId===itemId && Number(b.unitCost) > 0);
+  const newest = (list)=> list.slice().sort((a,b)=> (b.createdAt?.seconds||0) - (a.createdAt?.seconds||0))[0];
+  const last = newest(mine.filter(b=> !b.isReturn)) || newest(mine);
+  return { unitCost: last ? Number(last.unitCost) : 0, unitSell: itemSellPrice(itemId, batches),
+    grnNo: last ? (last.grnNo || (last.isOpeningStock ? 'Opening stock' : '')) : '', expiryDate: last ? (last.expiryDate||'') : '' };
+}
+function LastPriceTag({itemId, batches}){
+  const p = itemLastPrices(itemId, batches);
+  if(!p.unitCost && !p.unitSell) return null;
+  return <span style={{float:'right', fontSize:12, color:'var(--ink-soft)'}}>cost {p.unitCost.toFixed(2)} · sell {p.unitSell.toFixed(2)}</span>;
+}
+function LastPriceNote({itemId, batches, unit, packSize}){
+  const p = itemLastPrices(itemId, batches);
+  const pk = Number(packSize)||0;
+  return (
+    <div data-testid="last-price-note" style={{marginTop:10, padding:'8px 12px', borderRadius:8, background:'var(--card)', fontSize:13.5}}>
+      {(!p.unitCost && !p.unitSell) ? 'මේ item එකට කලින් prices නැහැ (අලුත් item එකක්)' : <>
+        💲 කලින් prices — <b>Unit Cost Rs {p.unitCost.toFixed(2)}</b> · <b>Unit Sell Rs {p.unitSell.toFixed(2)}</b>
+        {pk>1 && <span style={{color:'var(--ink-soft)'}}> (pack {pk}: cost {(p.unitCost*pk).toFixed(2)} · sell {(p.unitSell*pk).toFixed(2)})</span>}
+        {p.grnNo && <span style={{color:'var(--ink-soft)'}}> · {p.grnNo}</span>}
+      </>}
+    </div>
+  );
+}
+
 // Selling at or below cost is almost always a typing slip at GRN (sell price typed into the cost
 // box, or cost = MRP) — it makes COGS equal Sales in the books. Returns the warning text, or null.
 function costPriceWarning(unitCost, unitSell){
@@ -6340,7 +6368,7 @@ function GRNEntry({items, batches, suppliers, notify, initialDraft, onDraftChang
 
       <div className="card" style={{background:'var(--teal-100)', border:'1.5px solid var(--teal-500)'}}>
         <h3 style={{color:'var(--accent)'}}>➕ Add Item</h3>
-        <GrnEntryStrip entry={entry} patchEntry={patchEntry} pickItem={pickItem} items={items}
+        <GrnEntryStrip entry={entry} patchEntry={patchEntry} pickItem={pickItem} items={items} batches={batches}
           stockFor={stockFor} qtyUnits={qtyUnits} freeUnits={freeUnits} unitCost={unitCost} unitSales={unitSales}
           entryTotalCost={entryTotalCost} itemSearchRef={itemSearchRef} onAdd={addRow} notify={notify} subMode={subMode} />
         <div style={{display:'flex', gap:10, marginTop:14}}>
@@ -6478,7 +6506,7 @@ function OpeningStock({items, batches, notify}){
 
       <div className="card" style={{background:'var(--teal-100)', border:'1.5px solid var(--teal-500)'}}>
         <h3 style={{color:'var(--accent)'}}>➕ Add Item</h3>
-        <OpeningStockEntryStrip entry={entry} patchEntry={patchEntry} pickItem={pickItem} items={items}
+        <OpeningStockEntryStrip entry={entry} patchEntry={patchEntry} pickItem={pickItem} items={items} batches={batches}
           stockFor={stockFor} qtyUnits={qtyUnits} entryTotalCost={entryTotalCost}
           itemSearchRef={itemSearchRef} onAdd={addRow} notify={notify} />
         <div style={{display:'flex', gap:10, marginTop:14}}>
@@ -6524,7 +6552,7 @@ function emptyOpeningEntry(){
   return {itemId:'', itemCode:'', itemName:'', unit:'', packSize:0, pktQty:'', looseQty:'', unitCost:'', unitSell:'', expiry:''};
 }
 
-function OpeningStockEntryStrip({entry, patchEntry, pickItem, items, stockFor, qtyUnits, entryTotalCost, itemSearchRef, onAdd, notify}){
+function OpeningStockEntryStrip({entry, patchEntry, pickItem, items, batches, stockFor, qtyUnits, entryTotalCost, itemSearchRef, onAdd, notify}){
   const [query,setQuery] = useState('');
   const [open,setOpen] = useState(false);
   const [hi,setHi] = useState(0);
@@ -6560,6 +6588,7 @@ function OpeningStockEntryStrip({entry, patchEntry, pickItem, items, stockFor, q
               {matches.map((m,i)=>(
                 <div key={m.id} className={"ac-item"+(i===hi?" hi":"")} onMouseDown={()=>choose(m)}>
                   <b>{m.itemNumber}</b> — {m.brandName} <span style={{color:'var(--ink-soft)'}}>({m.genericName})</span>
+                  <LastPriceTag itemId={m.id} batches={batches} />
                 </div>
               ))}
             </div>
@@ -6568,6 +6597,7 @@ function OpeningStockEntryStrip({entry, patchEntry, pickItem, items, stockFor, q
         <div><label>Expire Date</label>
           <input ref={expRef} type="date" value={entry.expiry} onChange={e=>patchEntry({expiry:e.target.value})} /></div>
       </div>
+      {entry.itemId && <LastPriceNote itemId={entry.itemId} batches={batches} unit={entry.unit} packSize={entry.packSize} />}
 
       <div className="grid c4" style={{marginTop:12}}>
         <div><label>Pack Size (auto)</label><input readOnly style={{background:'var(--card)'}} value={entry.packSize||''} /></div>
@@ -6598,7 +6628,7 @@ function OpeningStockEntryStrip({entry, patchEntry, pickItem, items, stockFor, q
   );
 }
 
-function GrnEntryStrip({entry, patchEntry, pickItem, items, stockFor, qtyUnits, freeUnits, unitCost, unitSales, entryTotalCost, itemSearchRef, onAdd, notify, showLooseQty, subMode}){
+function GrnEntryStrip({entry, patchEntry, pickItem, items, batches, stockFor, qtyUnits, freeUnits, unitCost, unitSales, entryTotalCost, itemSearchRef, onAdd, notify, showLooseQty, subMode}){
   const [query,setQuery] = useState('');
   const [open,setOpen] = useState(false);
   const [hi,setHi] = useState(0);
@@ -6651,6 +6681,7 @@ function GrnEntryStrip({entry, patchEntry, pickItem, items, stockFor, qtyUnits, 
               {matches.map((m,i)=>(
                 <div key={m.id} className={"ac-item"+(i===hi?" hi":"")} onMouseDown={()=>choose(m)}>
                   <b>{m.itemNumber}</b> — {m.brandName} <span style={{color:'var(--ink-soft)'}}>({m.genericName})</span>
+                  <LastPriceTag itemId={m.id} batches={batches} />
                 </div>
               ))}
             </div>
@@ -6659,6 +6690,7 @@ function GrnEntryStrip({entry, patchEntry, pickItem, items, stockFor, qtyUnits, 
         <div><label>Expire Date</label>
           <input ref={expRef} type="date" value={entry.expiry} onChange={e=>patchEntry({expiry:e.target.value})} /></div>
       </div>
+      {entry.itemId && <LastPriceNote itemId={entry.itemId} batches={batches} unit={entry.unit} packSize={entry.packSize} />}
 
       <div className="grid c2" style={{marginTop:12}}>
         <div>
@@ -7646,26 +7678,31 @@ function BillEntryStrip({entry, patchEntry, pickItem, items, stockFor, entryTota
 
 /* ---------- Stock View ---------- */
 function StockView({items, batches}){
-  const rows = items.map(it=>{
+  const [q,setQ] = useState('');
+  const ql = q.trim().toLowerCase();
+  const rows = items.filter(it=> !ql || String(it.brandName||'').toLowerCase().includes(ql) || String(it.genericName||'').toLowerCase().includes(ql) || String(it.itemNumber||'').toLowerCase().includes(ql)).map(it=>{
     const bs = batches.filter(b=>b.itemId===it.id);
     const rem = bs.reduce((s,b)=>s+(b.remainingUnits||0),0);
     const nearestExpiry = bs.filter(b=>b.remainingUnits>0).map(b=>b.expiryDate).sort()[0];
-    return {...it, rem, batchCount:bs.length, nearestExpiry};
+    return {...it, rem, batchCount:bs.length, nearestExpiry, prices: itemLastPrices(it.id, batches)};
   }).sort((a,b)=>a.brandName<b.brandName?-1:1);
 
   return (
     <div className="card">
       <h3>📋 Current Stock</h3>
-      {rows.length===0? <div className="empty">Stock data නැහැ</div> :
+      <input data-testid="stock-search" value={q} onChange={e=>setQ(e.target.value)} placeholder="🔍 Item name / generic / code type කරන්න — prices බලන්න" style={{marginBottom:12}} />
+      {rows.length===0? <div className="empty">{ql ? 'ඒ නමින් item එකක් නැහැ' : 'Stock data නැහැ'}</div> :
       <table>
-        <thead><tr><th>Code</th><th>Brand</th><th>Generic</th><th>Batches</th><th>Units Left</th><th>Nearest Expiry</th><th>Status</th></tr></thead>
+        <thead><tr><th>Code</th><th>Brand</th><th>Generic</th><th>Batches</th><th>Units Left</th><th>Unit Cost</th><th>Unit Sell</th><th>Nearest Expiry</th><th>Status</th></tr></thead>
         <tbody>
           {rows.map(r=>{
             const status = r.rem===0? 'out' : r.rem<=20 ? 'low' : 'ok';
             return (
               <tr key={r.id}>
                 <td>{r.itemNumber}</td><td>{r.brandName}</td><td>{r.genericName}</td>
-                <td>{r.batchCount}</td><td>{r.rem} {r.unit}</td><td>{r.nearestExpiry||'—'}</td>
+                <td>{r.batchCount}</td><td>{r.rem} {r.unit}</td>
+                <td>{r.prices.unitCost ? r.prices.unitCost.toFixed(2) : '—'}</td><td>{r.prices.unitSell ? r.prices.unitSell.toFixed(2) : '—'}</td>
+                <td>{r.nearestExpiry||'—'}</td>
                 <td><span className={"tag "+status}>{status==='ok'?'In stock':status==='low'?'Low':'Out'}</span></td>
               </tr>
             );

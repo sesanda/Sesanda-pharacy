@@ -320,7 +320,7 @@ test('Sub GRN: items received by unit qty with unit cost/sales → stock, suppli
 });
 
 const field = (page, label)=> page.locator('xpath=//label[normalize-space(.)="' + label + '"]/following-sibling::input');
-test('GRN: selling price at or below cost shows a warning', { skip }, async()=>{
+test('GRN: last prices show when an item is typed; selling price at or below cost shows a warning', { skip }, async()=>{
   const fx = JSON.parse(JSON.stringify(fixture));
   fx.collections.suppliers = [{ id:'s1', name:'Supp' }];
   fx.collections.items = [{ id:'it1', itemNumber:'T001', brandName:'Testamol', genericName:'Paracetamol', unit:'tab', packSize:10 }];
@@ -330,7 +330,9 @@ test('GRN: selling price at or below cost shows a warning', { skip }, async()=>{
   try{
     await page.getByText('GRN Entry', { exact:true }).first().click();
     await page.getByPlaceholder('type code or brand name...').fill('Testa');
+    assert.match(await page.locator('.ac-item', { hasText:'Testamol' }).first().innerText(), /cost 60\.00 · sell 100\.00/);
     await page.locator('.ac-item', { hasText:'Testamol' }).first().dispatchEvent('mousedown');
+    assert.match(await page.getByTestId('last-price-note').innerText(), /Unit Cost Rs 60\.00 · Unit Sell Rs 100\.00/);
     await field(page,'Pkt Cost (Rs.)').fill('120');
     await field(page,'Pkt Sales (Rs.)').fill('150');
     assert.equal(await page.getByTestId('grn-price-warning').count(), 0);
@@ -338,6 +340,11 @@ test('GRN: selling price at or below cost shows a warning', { skip }, async()=>{
     assert.match(await page.getByTestId('grn-price-warning').innerText(), /සමානයි/);
     await field(page,'Pkt Sales (Rs.)').fill('100');
     assert.match(await page.getByTestId('grn-price-warning').innerText(), /අඩුයි/);
+
+    await page.getByText('Stock', { exact:true }).first().click();
+    await page.getByTestId('stock-search').fill('testa');
+    const row = await page.locator('tr', { hasText:'Testamol' }).innerText();
+    assert.match(row, /60\.00\s+100\.00/);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
