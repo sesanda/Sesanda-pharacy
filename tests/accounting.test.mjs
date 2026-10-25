@@ -255,3 +255,28 @@ test('item analysis: price history, monthly units, generic comparison', ()=>{
   const cmp = C.buildGenericComparison('PARACETAMOL', items, invs.slice(0,2), l=>l.costTotal);
   assert.deepEqual(cmp.map(r=>[r.name, r.units, r.sales, r.profit]), [['A',5,60,10], ['B',5,10,5]]);
 });
+
+test('card charges: fee, lines, and which card bills / payments still need one', ()=>{
+  const C = loadHelpers(['glToCents','glIsLiveJournal','findGlAccountByCode','localDateStr','glDocDate','invoiceBalanceInfo','cardChargeAmount','buildCardChargeLines','pendingCardCharges']);
+  assert.equal(C.cardChargeAmount(1000, 3), 30);
+  assert.equal(C.cardChargeAmount(333.33, 2.5), 8.33);
+  const chart = [{ id:'a6500', accountCode:'6500', accountType:'EXPENSE', isActive:true }, { id:'a1010', accountCode:'1010', accountType:'ASSET', isActive:true }];
+  assert.deepEqual(C.buildCardChargeLines(30, chart, 'x').map(l=>[l.accountId, l.debit, l.credit]), [['a6500',30,0],['a1010',0,30]]);
+  assert.throws(()=> C.buildCardChargeLines(30, chart.slice(0,1), 'x'), /1010 Bank/);
+  const J = (sourceType, sourceId)=> ({ status:'POSTED', sourceType, sourceId });
+  const invs = [
+    { id:'i1', billNo:'INV-1', payment:'card', totalToPay:1000, paidAmount:1000, date:'2026-10-01' },                   // pending, current %
+    { id:'i2', billNo:'INV-2', payment:'card', totalToPay:500, paidAmount:500, cardChargePct:2, date:'2026-10-02' },   // pending, own %
+    { id:'i3', payment:'card', totalToPay:500, paidAmount:500 },                                                        // charge already posted
+    { id:'i4', payment:'cash', totalToPay:500, paidAmount:500 },                                                        // cash
+    { id:'i5', payment:'card', totalToPay:500, paidAmount:500 },                                                        // sale not in books
+    { id:'i6', payment:'card', totalToPay:500, paidAmount:500, cardChargePct:0 },                                       // 0% when saved
+    { id:'i7', payment:'card', totalToPay:500, paidAmount:500 },                                                        // changed to credit
+  ];
+  const pays = [{ id:'p1', method:'card', amount:200, customerName:'Alpha', date:'2026-10-03' }, { id:'p2', method:'cash', amount:200 }];
+  const js = [J('SALE','i1'), J('SALE','i2'), J('SALE','i3'), J('CARD_CHARGE','i3'), J('SALE','i4'), J('SALE','i6'), J('SALE','i7'), J('BILL_TO_CREDIT','i7'),
+    J('CUSTOMER_PAYMENT','p1'), J('CUSTOMER_PAYMENT','p2')];
+  assert.deepEqual(C.pendingCardCharges(invs, pays, js, 3).map(c=>[c.id, c.amount, c.pct, c.date]),
+    [['i1',1000,3,'2026-10-01'], ['i2',500,2,'2026-10-02'], ['p1',200,3,'2026-10-03']]);
+  assert.equal(C.pendingCardCharges(invs, pays, js, 0).length, 1);   // only INV-2's own 2%
+});

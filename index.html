@@ -1689,7 +1689,67 @@ async function reverseSaleForDeletedInvoice(invoiceId, billNo, glAccounts, exist
   const sale = (existingJournals||[]).find(j=> j.sourceType==='SALE' && j.sourceId===invoiceId && glIsLiveJournal(j));
   if(!sale) return { status:'NOT_IN_BOOKS' };
   const reversalId = await reverseJournal(sale.id, glAccounts, 'Bill ' + (billNo||invoiceId) + ' deleted');
+  await reverseCardCharge(invoiceId, glAccounts, existingJournals, 'Bill ' + (billNo||invoiceId) + ' deleted');
   return { status:'REVERSED', journalId: reversalId };
+}
+
+/* ---------- Card charges → Accounting ----------
+   The bank keeps its card fee (Reports → P&L Overview "Card charge %", stored in meta/settings)
+   and pays in the rest, so each card receipt — a card bill's paid amount, or a customer's due
+   paid by card — posts its fee as its own journal: DR 6500 Bank Charges / CR 1010 Bank. The
+   customer's bill is untouched. The % in force when the bill/payment was saved is stored on it
+   (cardChargePct); older ones use the current setting. */
+function cardChargeAmount(amount, pct){ return Math.round((Number(amount)||0) * (Number(pct)||0)) / 100; }
+
+function buildCardChargeLines(fee, glAccounts, desc){
+  const charges = findGlAccountByCode(glAccounts, '6500'), bank = findGlAccountByCode(glAccounts, '1010');
+  if(!charges || !bank) throw new Error('Chart of Accounts has no active ' + (!charges ? '6500 Bank Charges' : '1010 Bank') + ' account — add it in Finance');
+  return [
+    { accountId: charges.id, debit: fee, credit: 0, description: desc },
+    { accountId: bank.id, debit: 0, credit: fee, description: desc },
+  ];
+}
+
+async function getCardChargePct(){
+  try{ const snap = await db.collection('meta').doc('settings').get(); return snap.exists ? (Number(snap.data().cardChargePercent)||0) : 0; }
+  catch(e){ console.error('card charge % read failed', e); return 0; }
+}
+
+// charge: {id (source doc id), amount (card money received), pct, date, desc}
+async function postCardChargeAccounting(charge, glAccounts, existingJournals){
+  const sourceType = 'CARD_CHARGE', sourceId = charge.id;
+  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j));
+  if(dup) return { status:'ALREADY_POSTED', journalId: dup.id };
+  const fee = cardChargeAmount(charge.amount, charge.pct);
+  if(glToCents(fee) <= 0) return { status:'NO_CHARGE' };
+  const desc = 'Card charge ' + charge.pct + '% — ' + charge.desc;
+  const lines = buildCardChargeLines(fee, glAccounts, desc);
+  const journalId = await createJournal({ date: charge.date || todayISO(), description: desc, sourceType, sourceId, lines }, glAccounts);
+  await postJournal(journalId, glAccounts, existingJournals);
+  return { status:'POSTED', journalId };
+}
+
+async function reverseCardCharge(sourceId, glAccounts, existingJournals, reason){
+  const j = (existingJournals||[]).find(j=> j.sourceType==='CARD_CHARGE' && j.sourceId===sourceId && glIsLiveJournal(j));
+  if(j) await reverseJournal(j.id, glAccounts, reason);
+}
+
+// Card bills / card payments that are in the books but whose card charge isn't yet.
+function pendingCardCharges(invoices, payments, journals, currentPct){
+  const live = new Set((journals||[]).filter(glIsLiveJournal).map(j=> j.sourceType + '|' + j.sourceId));
+  const pctOf = (doc)=> doc.cardChargePct!=null ? Number(doc.cardChargePct)||0 : Number(currentPct)||0;
+  const out = [];
+  (invoices||[]).forEach(inv=>{
+    if(inv.payment!=='card' || !live.has('SALE|' + inv.id) || live.has('CARD_CHARGE|' + inv.id) || live.has('BILL_TO_CREDIT|' + inv.id)) return;
+    const amount = invoiceBalanceInfo(inv).paidAmt, pct = pctOf(inv);
+    if(glToCents(cardChargeAmount(amount, pct)) > 0) out.push({ id:inv.id, amount, pct, date: glDocDate(inv), desc: 'Bill ' + (inv.billNo||inv.id) });
+  });
+  (payments||[]).forEach(p=>{
+    if(p.method!=='card' || !live.has('CUSTOMER_PAYMENT|' + p.id) || live.has('CARD_CHARGE|' + p.id)) return;
+    const pct = pctOf(p);
+    if(glToCents(cardChargeAmount(p.amount, pct)) > 0) out.push({ id:p.id, amount:Number(p.amount)||0, pct, date: glDocDate(p), desc: 'Card payment — ' + (p.customerName||'') });
+  });
+  return out;
 }
 
 // Opening-balance entry from the Finance health check: moves one control account (1100 AR,
@@ -3615,11 +3675,11 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
             const it = queue.shift();
             try{
               const acct = await g.post(it, glAccounts, glJournals);
-              await db.collection(g.coll).doc(it.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null, accountingError: null });
+              if(g.coll) await db.collection(g.coll).doc(it.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null, accountingError: null });
             }catch(err){
               failed++; lastError = err.message||String(err);
               console.error('Retry all —', g.label, it.id, err);
-              await db.collection(g.coll).doc(it.id).update({ accountingError: lastError }).catch(()=>{});
+              if(g.coll) await db.collection(g.coll).doc(it.id).update({ accountingError: lastError }).catch(()=>{});
             }
             done++;
             setBulk({label: g.label, done, total, failed});
@@ -3634,6 +3694,15 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
     }
     notify(failed ? ('⚠ ' + (done-failed) + ' posted, ' + failed + ' still failing — ' + lastError) : ('✓ ' + done + ' items posted to the books'));
   };
+  // Card charges (Bank Charges 6500) for card bills / card payments already in the books.
+  const [cardPct,setCardPct] = useState(null);
+  useEffect(()=>{ getCardChargePct().then(setCardPct); },[]);
+  const saveCardPct = async (val)=>{
+    setCardPct(val);
+    try{ await db.collection('meta').doc('settings').set({cardChargePercent:Number(val)||0}, {merge:true}); }catch(e){ console.error(e); notify('❌ Card charge % save වුනේ නැහැ'); }
+  };
+  const pendingCards = cardPct==null ? [] : pendingCardCharges(invoices, payments, glJournals, cardPct);
+  const CARD_GROUP = { label:'Card charges', coll:null, items: ()=> pendingCards, post: postCardChargeAccounting };
   const bulkButton = (groups, label)=>{
     const n = groups.reduce((s,g)=> s + g.items().length, 0);
     if(n===0) return null;
@@ -3749,6 +3818,11 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
           <div>{ok(health.orphans.length===0)} Deleted bills/GRNs still in the books: {health.orphans.length}</div>
           <div>{ok(BULK_GROUPS.every(g=> g.items().length===0))} Failed postings waiting for retry: {BULK_GROUPS.reduce((s,g)=> s + g.items().length, 0)}{bulkButton(BULK_GROUPS, 'Retry all failed')}</div>
           <div>ℹ Cash in books: <b>Rs. {health.cash.toFixed(2)}</b> · Bank in books: <b>Rs. {health.bank.toFixed(2)}</b> — drawer එකේ සල්ලි / bank statement එකත් එක්ක ගලපලා බලන්න.</div>
+          <div data-testid="card-charges">{ok(pendingCards.length===0)} 💳 Card charge
+            <input type="number" step="0.01" value={cardPct==null ? '' : cardPct} onChange={e=>saveCardPct(e.target.value)} style={{width:70, display:'inline-block', margin:'0 4px', padding:'2px 6px'}} />%
+            (bank එක card bill එකෙන් අඩු කරන ගාණ → 6500 Bank Charges) — books වලට තාම නොගිය: {pendingCards.length}
+            {pendingCards.length>0 && <> · Rs. {pendingCards.reduce((s,c)=> s + cardChargeAmount(c.amount, c.pct), 0).toFixed(2)}</>}
+            {bulkButton([CARD_GROUP], 'Post card charges')}</div>
         </div>
         <table data-testid="health-control">
           <thead><tr><th>Account</th><th>Books</th><th>Shop records</th><th>Difference</th><th></th></tr></thead>
@@ -5453,9 +5527,10 @@ function Customers({customers, invoices, payments, items, medReminders, notify, 
       const newDue = Math.max(0, (c.dueAmount||0) - actuallyApplied);
       batch.update(db.collection('customers').doc(c.id), {dueAmount:newDue});
       await batch.commit();
+      const payCardPct = method==='card' ? await getCardChargePct() : null;
       const payRef = await db.collection('payments').add({
         customerId:c.id, customerName:c.name, amount:actuallyApplied, method,
-        previousDue:c.dueAmount||0, newDue, appliedTo,
+        previousDue:c.dueAmount||0, newDue, appliedTo, ...(method==='card' ? { cardChargePct: payCardPct } : {}),
         createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       });
       setPayAmounts(p=>({...p,[c.id]:''}));
@@ -5470,6 +5545,10 @@ function Customers({customers, invoices, payments, items, medReminders, notify, 
       try{
         const acct = await postCustomerPaymentAccounting({id:payRef.id, customerId:c.id, customerName:c.name, amount:actuallyApplied, method, date:today}, glAccounts, glJournals);
         await db.collection('payments').doc(payRef.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null });
+        if(method==='card' && payCardPct>0){
+          try{ await postCardChargeAccounting({ id:payRef.id, amount:actuallyApplied, pct:payCardPct, date:today, desc:'Card payment — ' + c.name }, glAccounts, glJournals); }
+          catch(err){ console.error('Card charge accounting failed', err); notify('⚠ Card charge එක books වලට ගියේ නැහැ (' + err.message + ') — Finance tab එකෙන් post කරන්න'); }
+        }
       } catch(err){
         console.error('Customer payment accounting failed', err);
         try{ await db.collection('payments').doc(payRef.id).update({ accountingStatus:'FAILED', accountingError: err.message }); }catch(e2){ console.error(e2); }
@@ -7412,6 +7491,7 @@ function NewBill({items, batches, customers, invoices, notify, staffUser, prefil
         otherCharges:Number(otherCharges)||0, totalToPay, payment, staffName: staffUser?.name||'',
         // per-bill paid tracking (needed for Sales Report PAID/DUE badge + Customer Credit Ledger + partial cash/card payments)
         paidAmount: payment==='credit' ? 0 : paidAmountEffective, paid: dueToAdd<=0.001,
+        ...(payment==='card' ? { cardChargePct: await getCardChargePct() } : {}),
         createdAt: firebase.firestore.FieldValue.serverTimestamp(), createdAtMs: Date.now(),
       };
       const invRef = await db.collection('invoices').add(invoiceData);
@@ -7427,6 +7507,11 @@ function NewBill({items, batches, customers, invoices, notify, staffUser, prefil
         const acct = await postSaleAccounting({id:invRef.id, ...invoiceData}, glAccounts, glJournals);
         await db.collection('invoices').doc(invRef.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null });
         if(acct.status==='POSTED') notify('✓ Accounting posted for ' + billNo);
+        if(payment==='card' && invoiceData.cardChargePct>0){
+          try{
+            await postCardChargeAccounting({ id:invRef.id, amount:invoiceData.paidAmount, pct:invoiceData.cardChargePct, date:glDocDate(invoiceData), desc:'Bill ' + billNo }, glAccounts, glJournals);
+          }catch(err){ console.error('Card charge accounting failed', err); notify('⚠ ' + billNo + ' card charge එක books වලට ගියේ නැහැ (' + err.message + ') — Finance tab එකෙන් post කරන්න'); }
+        }
       } catch(err){
         console.error('Bill accounting failed', err);
         try{ await db.collection('invoices').doc(invRef.id).update({ accountingStatus:'FAILED', accountingError: err.message }); }catch(e2){ console.error(e2); }
@@ -8269,6 +8354,7 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
           const id = await createJournal({ date: todayISO(), description: lines[0].description, sourceType, sourceId, lines }, glAccounts);
           await postJournal(id, glAccounts, glJournals);
         }
+        await reverseCardCharge(inv.id, glAccounts, glJournals, 'Bill ' + inv.billNo + ' changed to credit — no card payment');
       }catch(err){ console.error('Bill-to-credit accounting failed', err); notify('⚠ Bill එක වෙනස් වුණා, ඒත් accounts entry එක fail වුණා: ' + err.message); }
     }
   };

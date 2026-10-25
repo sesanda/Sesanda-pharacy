@@ -403,3 +403,39 @@ test('Charts → item analysis: price history, busiest months, best brand of a g
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('Card charge: a card bill posts its % to 6500 Bank Charges from Bank; older card bills post from Finance', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.glAccounts.push({ id:'a6500', accountCode:'6500', accountName:'Bank Charges', accountType:'EXPENSE', isActive:true });
+  fx.collections.meta = [{ id:'settings', cardChargePercent:3 }];
+  fx.collections.invoices.push({ id:'inv0', billNo:'B0', customerName:'Walk-in', payment:'card', totalToPay:500, paidAmount:500, paid:true, accountingStatus:'POSTED', createdAtMs:2, items:[] });
+  fx.collections.glJournals.push({ id:'js0', journalNo:'JE-3', date:'2026-10-03', status:'POSTED', sourceType:'SALE', sourceId:'inv0', description:'Bill B0', lines:[L('1010',500,0), L('4000',0,500)] });
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await page.getByText('New Bill', { exact:true }).first().click();
+    await page.getByPlaceholder('type code or brand name...').fill('Testamol');
+    await page.locator('.ac-item', { hasText:'Testamol' }).first().dispatchEvent('mousedown');
+    await page.locator('input[type=number]').first().fill('2');
+    await page.getByRole('button', { name:'+ Add' }).click();
+    await page.locator('select:has(option[value="card"])').first().selectOption('card');
+    await page.getByRole('button', { name:'💾 Save Bill' }).click();
+    await page.waitForFunction(()=> (window.firebase.__store.glJournals||[]).some(j=> j.sourceType==='CARD_CHARGE' && j.status==='POSTED'));
+    const inv = await page.evaluate(()=> window.firebase.__store.invoices.find(i=> i.payment==='card' && i.id!=='inv0'));
+    assert.equal(inv.cardChargePct, 3);
+    const fee = Math.round(inv.paidAmount*3)/100;
+    const cj = await page.evaluate((id)=> window.firebase.__store.glJournals.find(j=> j.sourceType==='CARD_CHARGE' && j.sourceId===id), inv.id);
+    assert.deepEqual(cj.lines.map(l=>[l.accountId, l.debit, l.credit]), [['a6500',fee,0],['a1010',0,fee]]);
+
+    await page.getByText('Finance (Setup)', { exact:true }).first().click();
+    const box = page.getByTestId('card-charges');
+    assert.match(await box.innerText(), /නොගිය: 1 · Rs\. 15\.00/);                     // B0: 3% of 500
+    await box.getByRole('button', { name:/Post card charges \(1\)/ }).click();
+    await page.waitForFunction(()=> window.firebase.__store.glJournals.some(j=> j.sourceType==='CARD_CHARGE' && j.sourceId==='inv0' && j.status==='POSTED'));
+    await page.waitForFunction(()=> /නොගිය: 0/.test(document.querySelector('[data-testid="card-charges"]').innerText));
+    const t = await page.getByTestId('health-control').innerText();
+    assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
