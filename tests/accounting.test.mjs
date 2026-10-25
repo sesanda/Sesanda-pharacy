@@ -189,3 +189,12 @@ test('restockBatchFields: keeps the sold price and the source batch expiry', ()=
   assert.deepEqual(H.restockBatchFields({ itemId:'i', batchCode:'A-1', unitPrice:19, unitCost:12 }, batches), { unitSell:19, unitCost:12, expiryDate:'2027-03-01' });
   assert.deepEqual(H.restockBatchFields({ itemId:'i', batchCode:'?' }, batches, 11), { unitSell:20, unitCost:11, expiryDate:'' });
 });
+
+test('costPriceWarning flags a selling price equal to or below cost', ()=>{
+  const { costPriceWarning } = loadHelpers(['costPriceWarning']);
+  assert.equal(costPriceWarning(8, 10), null);
+  assert.equal(costPriceWarning('', 10), null);            // not typed yet
+  assert.equal(costPriceWarning(10, ''), null);
+  assert.match(costPriceWarning(10, 10), /සමානයි/);
+  assert.match(costPriceWarning('12', '10'), /අඩුයි/);
+});

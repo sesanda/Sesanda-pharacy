@@ -318,3 +318,26 @@ test('Sub GRN: items received by unit qty with unit cost/sales → stock, suppli
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+const field = (page, label)=> page.locator('xpath=//label[normalize-space(.)="' + label + '"]/following-sibling::input');
+test('GRN: selling price at or below cost shows a warning', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.suppliers = [{ id:'s1', name:'Supp' }];
+  fx.collections.items = [{ id:'it1', itemNumber:'T001', brandName:'Testamol', genericName:'Paracetamol', unit:'tab', packSize:10 }];
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await page.getByText('GRN Entry', { exact:true }).first().click();
+    await page.getByPlaceholder('type code or brand name...').fill('Testa');
+    await page.locator('.ac-item', { hasText:'Testamol' }).first().dispatchEvent('mousedown');
+    await field(page,'Pkt Cost (Rs.)').fill('120');
+    await field(page,'Pkt Sales (Rs.)').fill('150');
+    assert.equal(await page.getByTestId('grn-price-warning').count(), 0);
+    await field(page,'Pkt Sales (Rs.)').fill('120');
+    assert.match(await page.getByTestId('grn-price-warning').innerText(), /සමානයි/);
+    await field(page,'Pkt Sales (Rs.)').fill('100');
+    assert.match(await page.getByTestId('grn-price-warning').innerText(), /අඩුයි/);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});

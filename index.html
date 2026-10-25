@@ -6147,6 +6147,15 @@ async function nextGrnNo(){
   });
 }
 
+// Selling at or below cost is almost always a typing slip at GRN (sell price typed into the cost
+// box, or cost = MRP) — it makes COGS equal Sales in the books. Returns the warning text, or null.
+function costPriceWarning(unitCost, unitSell){
+  const c = Number(unitCost)||0, s = Number(unitSell)||0;
+  if(!(c>0) || !(s>0) || s > c) return null;
+  return s===c ? '⚠ Unit Sales price එක Unit Cost එකට සමානයි (Rs ' + c.toFixed(2) + ') — ලාභයක් නැහැ'
+    : '⚠ Unit Sales price එක (Rs ' + s.toFixed(2) + ') Unit Cost එකට (Rs ' + c.toFixed(2) + ') වඩා අඩුයි — පාඩුවට විකුණෙනවා';
+}
+
 function emptyGrnEntry(){
   return {itemId:'', itemCode:'', itemName:'', unit:'', packSize:0, pktQty:'', pktCost:'', pktSales:'', freeQty:'', expiry:'', looseQty:'', barcode:'', qty:'', unitCost:'', unitSales:''};
 }
@@ -6200,6 +6209,10 @@ function GRNEntry({items, batches, suppliers, notify, initialDraft, onDraftChang
       if(!(qtyUnits>0) || entry.unitCost==='' || entry.unitSales==='') return notify('Qty of items, Unit Cost, Unit Sales පුරවන්න');
     } else if(!entry.pktQty || !entry.pktCost || !entry.pktSales) return notify('Pkt Qty, Pkt Cost, Pkt Sales පුරවන්න');
     if(!entry.expiry) return notify('Expire Date එක ඕන');
+    const priceWarn = costPriceWarning(unitCost, unitSales);
+    if(priceWarn && !window.confirm(entry.itemName + '\n\n' + priceWarn + '\n\nCost / Sales මිල හරිද? OK = එහෙමම Add කරන්න · Cancel = ආපහු ගිහින් හදන්න')){
+      notify(priceWarn); return;
+    }
     if(purchaseOrderId && poRemainingMap[entry.itemId]!=null && qtyUnits > poRemainingMap[entry.itemId]){
       const ok = window.confirm('Purchase Order එකේ ඉතිරිව තිබුණේ ' + poRemainingMap[entry.itemId] + ' units විතරයි — ඊට වඩා receive කරනවා. ඉදිරියට යනවද?');
       if(!ok) return;
@@ -6407,6 +6420,10 @@ function OpeningStock({items, batches, notify}){
     if(!entry.pktQty && !entry.looseQty) return notify('Pkt Qty හෝ Loose units වලින් එකක් වත් දෙන්න');
     if(!entry.unitCost || !entry.unitSell) return notify('Unit Cost, Unit Sell දෙන්න');
     if(!entry.expiry) return notify('Expire Date එක ඕන (දන්නේ නැත්නම් approximate දිනයක් දෙන්න)');
+    const priceWarn = costPriceWarning(entry.unitCost, entry.unitSell);
+    if(priceWarn && !window.confirm(entry.itemName + '\n\n' + priceWarn + '\n\nCost / Sell මිල හරිද? OK = එහෙමම Add කරන්න · Cancel = ආපහු ගිහින් හදන්න')){
+      notify(priceWarn); return;
+    }
     setRows(rs=>[...rs, {...entry, qtyUnits, totalCost: entryTotalCost}]);
     setEntry(emptyOpeningEntry());
     setTimeout(()=> itemSearchRef.current && itemSearchRef.current.focus(), 0);
@@ -6568,6 +6585,11 @@ function OpeningStockEntryStrip({entry, patchEntry, pickItem, items, stockFor, q
           onKeyDown={e=>{ if(e.key==='Enter'){ e.preventDefault(); expRef.current.focus(); } }} placeholder="e.g. 22.14" /></div>
         <div><label>Total Qty (units)</label><input readOnly style={{background:'var(--card)'}} value={qtyUnits} /></div>
       </div>
+      {costPriceWarning(entry.unitCost, entry.unitSell) && (
+        <div style={{marginTop:10, padding:'8px 12px', borderRadius:8, background:'#fdecea', color:'#b3261e', fontWeight:600, fontSize:13.5}}>
+          {costPriceWarning(entry.unitCost, entry.unitSell)}
+        </div>
+      )}
 
       <div className="grid c3" style={{marginTop:12}}>
         <div><label>Amount (Rs.)</label><input readOnly style={{background:'var(--card)', fontWeight:700}} value={entryTotalCost.toFixed(2)} /></div>
@@ -6686,6 +6708,11 @@ function GrnEntryStrip({entry, patchEntry, pickItem, items, stockFor, qtyUnits, 
         <div><label>Unit Sales</label><input readOnly style={{background:'var(--card)'}} value={unitSales.toFixed(2)} /></div>
       </div>
       </>)}
+      {costPriceWarning(unitCost, unitSales) && (
+        <div data-testid="grn-price-warning" style={{marginTop:10, padding:'8px 12px', borderRadius:8, background:'#fdecea', color:'#b3261e', fontWeight:600, fontSize:13.5}}>
+          {costPriceWarning(unitCost, unitSales)}
+        </div>
+      )}
 
       <div className="grid c3" style={{marginTop:12}}>
         <div><label>Qty (units)</label><input readOnly style={{background:'var(--card)'}} value={qtyUnits} /></div>
