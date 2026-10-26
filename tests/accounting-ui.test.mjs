@@ -559,6 +559,18 @@ test('Stock Audit apply: stock follows the count, shortage goes to 6700 and the 
     assert.deepEqual(j.lines.map(l=>[l.accountId, l.debit, l.credit]), [[wo.id,180,0],['a1210',0,180]]);
     await box.locator('tbody tr').filter({ hasText:'17 tab' }).waitFor();
     assert.equal(await box.locator('tbody tr input').first().inputValue(), '');          // applied count cleared
+    // saved as SA-0001 in the history; view it, then a new audit starts empty
+    const hist = page.getByTestId('audit-history');
+    assert.match(await hist.innerText(), /SA-0001/);
+    const rec = await page.evaluate(()=> window.firebase.__store.adjustments.find(a=> a.type==='stockAuditRecord'));
+    assert.deepEqual([rec.auditNo, rec.counted, rec.adjustedLines, rec.netCost, rec.lines[0].systemQty, rec.lines[0].physical], ['SA-0001', 1, 1, -180, 20, 17]);
+    assert.equal(adj.auditRef, 'SA-0001');
+    assert.match(await page.getByTestId('audit-view').innerText(), /SA-0001[\s\S]*20 tab\s+17\s+-3/);
+    if(process.env.SHOT){ await page.setViewportSize({ width:1200, height:1200 }); await hist.screenshot({ path: process.env.SHOT }); }
+    await box.getByRole('button', { name:'➕ New audit' }).click();
+    assert.match(await box.innerText(), /උඩින් items search කරලා add කරන්න/);
+    await page.getByTestId('audit-history-search').fill('SA-0002');
+    assert.match(await hist.innerText(), /ඒ number එකෙන් audit එකක් නැහැ/);
     await goTo(page, 'Finance (Setup)');
     const t = await page.getByTestId('health-control').innerText();
     assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
