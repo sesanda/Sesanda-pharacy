@@ -4573,7 +4573,7 @@ function StaffApp({onExit}){
           {tab==='returns' && <Returns invoices={invoices} customers={customers} batches={batches} items={items} grns={grns} suppliers={suppliers} salesReturns={salesReturns} grnReturns={grnReturns} glAccounts={glAccounts} glJournals={glJournals} notify={notify}/>}
           {tab==='opening' && <OpeningStock items={items} batches={batches} notify={notify}/>}
           {tab==='stock' && <StockView items={items} batches={batches}/>}
-          {tab==='stockaudit' && <StockAudit items={items} batches={batches} notify={notify} glAccounts={glAccounts} glJournals={glJournals}/>}
+          {tab==='stockaudit' && <StockAudit items={items} batches={batches} notify={notify} glAccounts={glAccounts} glJournals={glJournals} adjustments={adjustments}/>}
           {tab==='suppliers' && <Suppliers suppliers={suppliers} grns={grns} glAccounts={glAccounts} glJournals={glJournals} notify={notify}/>}
           {tab==='customers' && <Customers customers={customers} invoices={invoices} payments={payments} items={items} medReminders={medReminders} notify={notify} glAccounts={glAccounts} glJournals={glJournals} customersLoading={customersLoading} customersError={customersError} invoicesError={invoicesError}/>}
           {tab==='orders' && <OrdersBoard orders={orders} items={items} batches={batches} notify={notify}/>}
@@ -8053,7 +8053,7 @@ function stockAuditSheetHtml(summary, meta){
     <td class="n">${l.systemQty} ${esc(l.unit)}</td><td class="n phys">${l.physical==null ? '' : l.physical}</td>
     <td class="n">${l.diff==null ? '' : (l.diff>0 ? '+' : '') + l.diff}</td></tr>`).join('');
   return `<div class="sheet"><h2>Sesanda Pharmacy — Stock Audit</h2>
-    <p>${esc(meta.date)} · ${esc(meta.scope)} · lines ${summary.total}${summary.counted ? ' · counted ' + summary.counted : ''}</p>
+    <p>${meta.auditNo ? '<b>' + esc(meta.auditNo) + '</b> · ' : ''}${esc(meta.date)} · ${esc(meta.scope)} · lines ${summary.total}${summary.counted ? ' · counted ' + summary.counted : ''}</p>
     <table><thead><tr><th>#</th><th>Item</th><th>Expiry</th><th>Cost</th><th>Sell</th><th>System Qty</th><th>Physical Qty</th><th>Diff</th></tr></thead><tbody>${rows}</tbody></table>
     ${summary.counted ? `<p class="sum">අඩු: ${summary.shortQty} units · Rs ${summary.shortCost.toFixed(2)} (cost) &nbsp; | &nbsp; වැඩි: ${summary.overQty} units · Rs ${summary.overCost.toFixed(2)} &nbsp; | &nbsp; Net: Rs ${summary.netCost.toFixed(2)} (cost) / Rs ${summary.netSell.toFixed(2)} (sell)</p>` : ''}
     <p class="sig">Counted by: ____________________ &nbsp;&nbsp; Checked by: ____________________ &nbsp;&nbsp; Date: __________</p></div>`;
@@ -8073,7 +8073,61 @@ function stockAuditCsv(summary){
     .map(r=> r.map(q).join(',')).join('\n');
 }
 
-function StockAudit({items, batches, notify, glAccounts, glJournals}){
+async function nextStockAuditNo(){
+  const ref = db.collection('meta').doc('counters');
+  const seq = await db.runTransaction(async tx=>{
+    const snap = await tx.get(ref);
+    const cur = ((snap.exists ? snap.data().stockAuditSeq : 0) || 0) + 1;
+    tx.set(ref, {stockAuditSeq: cur}, {merge:true});
+    return cur;
+  });
+  return 'SA-' + String(seq).padStart(4,'0');
+}
+
+// A saved audit (adjustments doc, type 'stockAuditRecord') back into the summary shape the sheet uses.
+function stockAuditRecordSummary(record){
+  const lines = (record.lines||[]).map(l=> ({ batchCodes:[], ...l }));
+  return stockAuditSummary(lines, Object.fromEntries(lines.map(l=> [l.key, l.physical])));
+}
+
+function printStockAuditSheet(summary, meta, notify){
+  if(!summary.lines.length) return notify('Items තෝරන්න');
+  const w = window.open('', '_blank');
+  if(!w) return notify('Popup block වෙලා — browser එකේ popups allow කරන්න');
+  w.document.write(`<html><head><title>Stock Audit ${meta.auditNo||meta.date}</title><style>${STOCK_AUDIT_CSS} body{margin:0}</style></head><body>${stockAuditSheetHtml(summary, meta)}<script>window.print();<\/script></body></html>`);
+  w.document.close();
+}
+async function shareStockAuditSheet(summary, meta, notify){
+  if(!summary.lines.length) return notify('Items තෝරන්න');
+  if(typeof html2canvas==='undefined') return notify('❌ Image tool එක load වෙලා නැහැ — Print → Save as PDF කරලා යවන්න');
+  const name = 'stock-audit-' + (meta.auditNo || meta.date);
+  const el = document.createElement('div');
+  el.style.cssText = 'position:fixed; left:-10000px; top:0; width:820px; background:#fff;';
+  el.innerHTML = `<style>${STOCK_AUDIT_CSS}</style>` + stockAuditSheetHtml(summary, meta);
+  document.body.appendChild(el);
+  try{
+    const canvas = await html2canvas(el, {scale:2, backgroundColor:'#ffffff'});
+    const blob = await new Promise(res=> canvas.toBlob(res, 'image/png'));
+    const file = new File([blob], name + '.png', {type:'image/png'});
+    if(navigator.canShare && navigator.canShare({files:[file]})){
+      try{ await navigator.share({files:[file], title:'Stock Audit ' + (meta.auditNo || meta.date)}); return; }
+      catch(err){ if(err && err.name==='AbortError') return; }
+    }
+    const url = URL.createObjectURL(blob), a = document.createElement('a');
+    a.href = url; a.download = file.name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=> URL.revokeObjectURL(url), 5000);
+    window.open('https://wa.me/?text=' + encodeURIComponent('Stock Audit ' + (meta.auditNo || meta.date) + ' — image එක attach කරලා තියෙනවා'), '_blank');
+    notify('📥 Image එක download වුණා — WhatsApp එකේ attach කරන්න');
+  }catch(e){ console.error('stock audit image failed', e); notify('❌ Image හදන්න බැරි වුණා: ' + (e.message||e)); }
+  finally{ el.remove(); }
+}
+function downloadStockAuditCsv(summary, meta){
+  const url = URL.createObjectURL(new Blob([stockAuditCsv(summary)], {type:'text/csv'})), a = document.createElement('a');
+  a.href = url; a.download = 'stock-audit-' + (meta.auditNo || meta.date) + '.csv'; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=> URL.revokeObjectURL(url), 5000);
+}
+
+function StockAudit({items, batches, notify, glAccounts, glJournals, adjustments}){
   const saved = (()=>{ try{ return JSON.parse(localStorage.getItem('stockAuditDraft')||'{}')||{}; }catch(e){ return {}; } })();
   const [mode,setMode] = useState(saved.mode||'select');
   const [selected,setSelected] = useState(saved.selected||[]);
@@ -8098,61 +8152,54 @@ function StockAudit({items, batches, notify, glAccounts, glJournals}){
   const meta = { date: todayISO(), scope: mode==='all' ? 'All items' : selected.length + ' selected items' };
   const sheetSummary = onlyDiff ? {...summary, lines: shown, total: shown.length} : summary;
 
-  const print = ()=>{
-    if(!rows.length) return notify('Items තෝරන්න');
-    const w = window.open('', '_blank');
-    if(!w) return notify('Popup block වෙලා — browser එකේ popups allow කරන්න');
-    w.document.write(`<html><head><title>Stock Audit ${meta.date}</title><style>${STOCK_AUDIT_CSS} body{margin:0}</style></head><body>${stockAuditSheetHtml(sheetSummary, meta)}<script>window.print();<\/script></body></html>`);
-    w.document.close();
-  };
-  const share = async ()=>{
-    if(!rows.length) return notify('Items තෝරන්න');
-    if(typeof html2canvas==='undefined') return notify('❌ Image tool එක load වෙලා නැහැ — Print → Save as PDF කරලා යවන්න');
-    const el = document.createElement('div');
-    el.style.cssText = 'position:fixed; left:-10000px; top:0; width:820px; background:#fff;';
-    el.innerHTML = `<style>${STOCK_AUDIT_CSS}</style>` + stockAuditSheetHtml(sheetSummary, meta);
-    document.body.appendChild(el);
-    try{
-      const canvas = await html2canvas(el, {scale:2, backgroundColor:'#ffffff'});
-      const blob = await new Promise(res=> canvas.toBlob(res, 'image/png'));
-      const file = new File([blob], 'stock-audit-' + meta.date + '.png', {type:'image/png'});
-      if(navigator.canShare && navigator.canShare({files:[file]})){
-        try{ await navigator.share({files:[file], title:'Stock Audit ' + meta.date}); return; }
-        catch(err){ if(err && err.name==='AbortError') return; }
-      }
-      const url = URL.createObjectURL(blob), a = document.createElement('a');
-      a.href = url; a.download = file.name; document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(()=> URL.revokeObjectURL(url), 5000);
-      window.open('https://wa.me/?text=' + encodeURIComponent('Stock Audit ' + meta.date + ' — image එක attach කරලා තියෙනවා'), '_blank');
-      notify('📥 Image එක download වුණා — WhatsApp එකේ attach කරන්න');
-    }catch(e){ console.error('stock audit image failed', e); notify('❌ Image හදන්න බැරි වුණා: ' + (e.message||e)); }
-    finally{ el.remove(); }
-  };
-  const csv = ()=>{
-    const url = URL.createObjectURL(new Blob([stockAuditCsv(sheetSummary)], {type:'text/csv'})), a = document.createElement('a');
-    a.href = url; a.download = 'stock-audit-' + meta.date + '.csv'; document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(()=> URL.revokeObjectURL(url), 5000);
-  };
+  const print = ()=> printStockAuditSheet(sheetSummary, meta, notify);
+  const share = ()=> shareStockAuditSheet(sheetSummary, meta, notify);
+  const csv = ()=> downloadStockAuditCsv(sheetSummary, meta);
   const itemName = (id)=> (items.find(it=> it.id===id)||{}).brandName || id;
   const [applying,setApplying] = useState(false);
+  const [viewNo,setViewNo] = useState(''), [histQ,setHistQ] = useState('');
   const plan = planStockAuditAdjustment(summary.lines, batches);
+  const records = (adjustments||[]).filter(a=> a.type==='stockAuditRecord').sort((a,b)=> String(b.auditNo).localeCompare(String(a.auditNo)));
+  const hq = histQ.trim().toLowerCase();
+  const histShown = records.filter(r=> !hq || String(r.auditNo).toLowerCase().includes(hq) || String(r.date).includes(hq)).slice(0, 30);
+  const viewed = records.find(r=> r.auditNo===viewNo);
+  const newAudit = ()=>{
+    if(Object.keys(counts).length && !window.confirm('ගහපු physical counts ' + Object.keys(counts).length + 'ක් තාම save කරලා නැහැ — ඒවා මකලා අලුත් audit එකක් පටන් ගන්නද?')) return;
+    setSelected([]); setCounts({}); setMode('select'); setOnlyDiff(false); setQ('');
+    notify('➕ අලුත් audit එකක් — items තෝරන්න');
+  };
   const apply = async ()=>{
-    if(!plan.adjustments.length) return notify(plan.skipped.length ? 'Stock batch නැති lines වලට වැඩි ගාණ දාන්න බැහැ — GRN / Opening Stock එකෙන් දාන්න' : 'වෙනසක් තියෙන counts නැහැ');
-    if(!window.confirm('Stock adjustments ' + plan.adjustments.length + 'ක් apply කරන්නද?\n\nඅඩු: ' + fmt(plan.shortCost) + ' (cost)\nවැඩි: ' + fmt(plan.overCost) + ' (cost)\nNet: ' + fmt(plan.net) +
-      (plan.skipped.length ? '\n\n⚠ Stock batch නැති lines ' + plan.skipped.length + 'ක් skip වෙනවා' : '') + '\n\nSystem stock එක physical count එකට සමාන වෙනවා. මේක undo කරන්න බැහැ.')) return;
-    if(!checkAdminPin('Stock audit adjustments apply කරන්න')) return;
+    if(!summary.counted) return notify('Physical counts ගහලා නැහැ');
+    if(!plan.adjustments.length){
+      if(!window.confirm('Counts ' + summary.counted + ' ම system stock එකට සමානයි' + (plan.skipped.length ? ' (stock batch නැති lines ' + plan.skipped.length + 'ක් skip වෙනවා)' : '') + ' — audit එක save කරන්නද?')) return;
+    } else {
+      if(!window.confirm('Stock adjustments ' + plan.adjustments.length + 'ක් apply කරන්නද?\n\nඅඩු: ' + fmt(plan.shortCost) + ' (cost)\nවැඩි: ' + fmt(plan.overCost) + ' (cost)\nNet: ' + fmt(plan.net) +
+        (plan.skipped.length ? '\n\n⚠ Stock batch නැති lines ' + plan.skipped.length + 'ක් skip වෙනවා' : '') + '\n\nSystem stock එක physical count එකට සමාන වෙනවා. මේක undo කරන්න බැහැ.')) return;
+      if(!checkAdminPin('Stock audit adjustments apply කරන්න')) return;
+    }
     setApplying(true);
-    const date = todayISO(), ref = 'SA-' + Date.now();
+    const date = todayISO();
+    let ref;
+    try{ ref = await nextStockAuditNo(); }catch(e){ console.error(e); setApplying(false); return notify('❌ Audit number එක ගන්න බැරි වුණා: ' + (e.message||e)); }
+    const counted = summary.lines.filter(l=> l.physical!=null);
+    const r2 = (n)=> Math.round(n*100)/100;
     try{
       const wb = db.batch();
+      wb.set(db.collection('adjustments').doc(), { type:'stockAuditRecord', auditNo: ref, date, scope: meta.scope,
+        lines: counted.map(l=> ({ key:l.key, itemId:l.itemId, name:l.name, code:l.code, generic:l.generic, unit:l.unit, expiry:l.expiry,
+          unitCost:l.unitCost, unitSell:l.unitSell, systemQty:l.systemQty, physical:l.physical, diff:l.diff, batchCodes:l.batchCodes })),
+        counted: counted.length, adjustedLines: plan.adjustments.length, skippedLines: plan.skipped.length,
+        shortCost: r2(summary.shortCost), overCost: r2(summary.overCost), netCost: r2(plan.net),
+        staffEmail: (firebase.auth().currentUser||{}).email || '', createdAt: firebase.firestore.FieldValue.serverTimestamp() });
       plan.updates.forEach(u=> wb.update(db.collection('batches').doc(u.id), { remainingUnits: u.remainingUnits }));
       plan.adjustments.forEach(a=> wb.set(db.collection('adjustments').doc(), { ...a, reason:'Stock audit ' + date, source:'stockAudit', auditRef: ref,
         date, createdAt: firebase.firestore.FieldValue.serverTimestamp() }));
       await wb.commit();
     }catch(e){ console.error('stock audit apply failed', e); setApplying(false); return notify('❌ Stock adjust කරන්න බැරි වුණා: ' + (e.message||e)); }
-    const applied = new Set(summary.lines.filter(l=> l.diff && !plan.skipped.includes(l)).map(l=> l.key));
+    const applied = new Set(counted.filter(l=> !plan.skipped.includes(l)).map(l=> l.key));
     setCounts(c=> Object.fromEntries(Object.entries(c).filter(([k])=> !applied.has(k))));
-    notify('✓ Stock adjust කළා — ' + plan.adjustments.length + ' lines');
+    setViewNo(ref);
+    notify('✓ ' + ref + ' save කළා' + (plan.adjustments.length ? ' — stock adjust කළා (' + plan.adjustments.length + ' lines)' : ''));
     if(glAccounts && glAccounts.length && glToCents(plan.net)!==0){
       try{
         let accounts = glAccounts;
@@ -8173,7 +8220,8 @@ function StockAudit({items, batches, notify, glAccounts, glJournals}){
   return (
     <div data-testid="stock-audit">
       <div className="card">
-        <h3>🧮 Stock Audit — count කරන්න items</h3>
+        <h3 style={{display:'flex', alignItems:'center', gap:8}}><span style={{flex:1}}>🧮 Stock Audit — count කරන්න items</span>
+          <button className="btn btn-primary btn-sm" onClick={newAudit}>➕ New audit</button></h3>
         <div style={{display:'flex', gap:8, marginBottom:12, flexWrap:'wrap'}}>
           <button className={"btn btn-sm " + (mode==='select' ? 'btn-primary' : 'btn-ghost')} onClick={()=>setMode('select')}>🔍 තෝරපු items</button>
           <button className={"btn btn-sm " + (mode==='all' ? 'btn-primary' : 'btn-ghost')} onClick={()=>setMode('all')}>📋 ඔක්කොම items</button>
@@ -8204,7 +8252,7 @@ function StockAudit({items, batches, notify, glAccounts, glJournals}){
           <button className="btn btn-primary btn-sm" onClick={share}>📲 WhatsApp</button>
           <button className="btn btn-ghost btn-sm" onClick={csv}>⬇ CSV</button>
           <button className="btn btn-ghost btn-sm" onClick={()=>{ if(window.confirm('ගහපු physical counts ඔක්කොම මකන්නද?')) setCounts({}); }}>🧹 Counts clear</button>
-          <button className="btn btn-danger btn-sm" disabled={applying || !plan.adjustments.length} onClick={apply}>{applying ? 'Applying…' : '✅ Apply adjustments (' + plan.adjustments.length + ')'}</button>
+          <button className="btn btn-danger btn-sm" disabled={applying || !summary.counted} onClick={apply}>{applying ? 'Saving…' : plan.adjustments.length ? '✅ Apply adjustments (' + plan.adjustments.length + ')' : '💾 Save audit'}</button>
         </div>
         {plan.adjustments.length>0 && <div style={{fontSize:12.5, color:'var(--ink-soft)', marginBottom:10}}>
           ✅ Apply කළාම system stock එක physical count එකට සමාන වෙනවා, වෙනස ({fmt(plan.net)} at cost) books වල 6700 Inventory Write-off එකට යනවා. Count කරලා ඉවර වුණු ගමන් — අලුත් bills දාන්න කලින් — apply කරන්න.</div>}
@@ -8225,6 +8273,37 @@ function StockAudit({items, batches, notify, glAccounts, glJournals}){
             <td style={{color: l.diff<0 ? 'var(--red)' : l.diff>0 ? 'var(--green)' : undefined, fontWeight: l.diff ? 700 : 400}}>{l.diff==null ? '' : (l.diff>0 ? '+' : '') + l.diff}</td>
             <td>{l.diff ? fmt(l.diff*l.unitCost) : ''}</td></tr>)}</tbody>
         </table></div>}
+      </div>
+
+      <div className="card" data-testid="audit-history">
+        <h3>📚 පරණ stock audits</h3>
+        <input data-testid="audit-history-search" value={histQ} onChange={e=>setHistQ(e.target.value)} placeholder="Audit No (e.g. SA-0003) හෝ දිනය (2026-10) type කරන්න" style={{marginBottom:10}} />
+        {histShown.length===0 ? <div className="empty">{records.length ? 'ඒ number එකෙන් audit එකක් නැහැ' : 'තවම save කරපු audits නැහැ — counts ගහලා ✅ Apply / 💾 Save කළාම මෙතන එනවා'}</div> :
+        <div style={{overflowX:'auto'}}><table>
+          <thead><tr><th>Audit No</th><th>Date</th><th>Items</th><th>Lines counted</th><th>Adjusted</th><th>අඩු (cost)</th><th>වැඩි (cost)</th><th>Net</th><th></th></tr></thead>
+          <tbody>{histShown.map(r=> <tr key={r.id} style={r.auditNo===viewNo ? {background:'var(--teal-100)'} : undefined}>
+            <td><b>{r.auditNo}</b></td><td>{r.date}</td><td>{r.scope}</td><td>{r.counted}</td><td>{r.adjustedLines}</td>
+            <td>{fmt(r.shortCost)}</td><td>{fmt(r.overCost)}</td><td>{fmt(r.netCost)}</td>
+            <td><button className="btn btn-ghost btn-sm" onClick={()=>setViewNo(v=> v===r.auditNo ? '' : r.auditNo)}>{r.auditNo===viewNo ? 'වහන්න' : '👁 බලන්න'}</button></td></tr>)}</tbody>
+        </table></div>}
+        {viewed && (()=>{
+          const vs = stockAuditRecordSummary(viewed), vm = { date: viewed.date, scope: viewed.scope, auditNo: viewed.auditNo };
+          return <div style={{marginTop:14}} data-testid="audit-view">
+            <div style={{display:'flex', gap:8, flexWrap:'wrap', alignItems:'center', marginBottom:8}}>
+              <b style={{flex:1}}>{viewed.auditNo} · {viewed.date}{viewed.staffEmail ? ' · ' + viewed.staffEmail : ''}</b>
+              <button className="btn btn-primary btn-sm" onClick={()=>printStockAuditSheet(vs, vm, notify)}>🖨 Print</button>
+              <button className="btn btn-primary btn-sm" onClick={()=>shareStockAuditSheet(vs, vm, notify)}>📲 WhatsApp</button>
+              <button className="btn btn-ghost btn-sm" onClick={()=>downloadStockAuditCsv(vs, vm)}>⬇ CSV</button>
+            </div>
+            <div style={{overflowX:'auto'}}><table>
+              <thead><tr><th>#</th><th>Item</th><th>Expiry</th><th>Cost</th><th>Sell</th><th>System Qty</th><th>Physical Qty</th><th>Diff</th><th>Diff (cost)</th></tr></thead>
+              <tbody>{vs.lines.map((l,i)=> <tr key={l.key + i}><td>{i+1}</td><td>{l.name}<div style={{fontSize:11.5, color:'var(--ink-soft)'}}>{l.code}</div></td>
+                <td>{l.expiry||'—'}</td><td>{Number(l.unitCost).toFixed(2)}</td><td>{Number(l.unitSell).toFixed(2)}</td><td>{l.systemQty} {l.unit}</td><td>{l.physical}</td>
+                <td style={{color: l.diff<0 ? 'var(--red)' : l.diff>0 ? 'var(--green)' : undefined, fontWeight: l.diff ? 700 : 400}}>{(l.diff>0 ? '+' : '') + l.diff}</td>
+                <td>{l.diff ? fmt(l.diff*l.unitCost) : ''}</td></tr>)}</tbody>
+            </table></div>
+          </div>;
+        })()}
       </div>
     </div>
   );

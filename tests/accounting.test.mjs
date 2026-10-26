@@ -338,3 +338,13 @@ test('stock audit apply: batches set to the count, journal at cost, no-batch exc
   assert.deepEqual(C.buildStockAuditLines(7, chart, 'x').map(l=>[l.accountId, l.debit, l.credit]), [['a1210',7,0],['a6700',0,7]]);
   assert.deepEqual(C.buildStockAuditLines(0, chart, 'x'), []);
 });
+
+test('stock audit record: saved lines summarise like the live sheet', ()=>{
+  const C = loadHelpers(['stockAuditSummary','stockAuditRecordSummary']);
+  const s = C.stockAuditRecordSummary({ lines:[
+    { key:'k1', name:'A', unitCost:5, unitSell:8, systemQty:14, physical:12, diff:-2 },
+    { key:'k2', name:'B', unitCost:6, unitSell:9, systemQty:6, physical:7, diff:1 },
+    { key:'k3', name:'C', unitCost:2, unitSell:3, systemQty:4, physical:4, diff:0 } ] });
+  assert.deepEqual([s.counted, s.shortCost, s.overCost, s.netCost, s.netSell], [3, 10, 6, -4, -7]);
+  assert.deepEqual(s.lines.map(l=> l.batchCodes), [[], [], []]);
+});
