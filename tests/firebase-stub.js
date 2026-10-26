@@ -48,7 +48,7 @@
       set(r,v,o){ window.__writes.push({op:'tx.set',name:r.__name,v}); const d=(store[r.__name]||[]).find(x=>x.id===r.id); apply.set(r.__name, r.id, o&&o.merge ? {...(d||{}), ...v} : v); },
       update(r,v){ window.__writes.push({op:'tx.update',name:r.__name,v}); apply.update(r.__name, r.id, v); } }) };
   const firestore = ()=> db; firestore.FieldValue = { serverTimestamp: ()=>({__ts:true}), increment:n=>n, arrayUnion:(...a)=>a, delete:()=>null };
-  firestore.Timestamp = { now: ()=>({toMillis:()=>Date.now()}) };
+  firestore.Timestamp = { now: ()=>({toMillis:()=>Date.now()}), fromMillis: (ms)=>({toMillis:()=>ms}) };
   const auth = ()=>({
     get currentUser(){ return currentUser; },
     onAuthStateChanged(cb){ authCbs.add(cb); setTimeout(()=>cb(currentUser),0); return ()=>authCbs.delete(cb); },

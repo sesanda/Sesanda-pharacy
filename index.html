@@ -4363,12 +4363,16 @@ function StaffApp({onExit}){
     return unsub;
   },[]);
   // Which bank account card money goes to (🏦 Bank Accounts) — read once signed in.
+  const [lastBackupAt,setLastBackupAt] = useState(undefined);
   useEffect(()=>{
     if(!user) return;
     db.collection('meta').doc('settings').get().then(snap=>{
       if(snap.exists && snap.data().cardBankAccountCode) GL_CARD_BANK_CODE = String(snap.data().cardBankAccountCode);
+      setLastBackupAt(snap.exists ? snap.data().lastBackupAt||null : null);
     }).catch(e=> console.error('settings read failed', e));
   },[user]);
+  const backupDays = lastBackupAt===undefined ? 0 : backupDaysSince(lastBackupAt, Date.now());
+  const backupDue = lastBackupAt!==undefined && (backupDays==null || backupDays>=BACKUP_DUE_DAYS);
 
   const [items] = useCollection('items');
   const [batches] = useCollection('batches');
@@ -4485,13 +4489,14 @@ function StaffApp({onExit}){
     {id:'expenses', label:'Expenses', ic:'💸'},
     {id:'capitalloans', label:'Capital & Loans', ic:'💰'},
     {id:'ai', label:'AI Insights', ic:'🤖'},
+    {id:'backup', label:'Backup', ic:'💾'},
   ];
   // Sidebar groups — Dashboard / New Bill stay on top; the rest fold under a heading. A group opens
   // when clicked (remembered on this device) and always when it holds the open page.
   const NAV_GROUPS = [
     {id:'stockGrp', label:'Stock & Purchasing', ic:'📦', items:['items','purchaseOrders','grn','subgrn','returns','opening','stock','stockaudit','suppliers']},
     {id:'custGrp', label:'Customers & Orders', ic:'👥', items:['customers','orders','special']},
-    {id:'reportGrp', label:'Reports & Cash', ic:'📈', items:['reports','cashcontrol','ai']},
+    {id:'reportGrp', label:'Reports & Cash', ic:'📈', items:['reports','cashcontrol','ai','backup']},
     {id:'acctGrp', label:'Accounting', ic:'💰', items:['finance','banks','ledger','trialbalance','pnl','balancesheet','ar','ap','cashflow','expenses','capitalloans']},
   ];
   const grouped = new Set(NAV_GROUPS.flatMap(g=> g.items));
@@ -4536,6 +4541,13 @@ function StaffApp({onExit}){
           <span className="conn-pill"><span className="dot"></span>Live</span>
         </div>
         <div className="content">
+          {backupDue && tab!=='backup' && (
+            <div className="card" data-testid="backup-reminder" style={{display:'flex', alignItems:'center', gap:10, flexWrap:'wrap', border:'1.5px solid var(--amber)'}}>
+              <span style={{flex:1}}>💾 {backupDays==null ? 'තවම data backup එකක් අරන් නැහැ' : 'අන්තිම backup එක දින ' + backupDays + 'කට කලින්'} — data ආරක්ෂාවට backup එකක් ගන්න.</span>
+              <button className="btn btn-primary btn-sm" onClick={()=>setTab('backup')}>💾 Backup ගන්න</button>
+            </div>
+          )}
+          {tab==='backup' && <Backup notify={notify} onBackedUp={setLastBackupAt} />}
           {tab==='dashboard' && <Dashboard items={items} batches={batches} orders={orders} suppliers={suppliers} customers={customers} invoices={invoices} grns={grns} medReminders={medReminders} notify={notify} purchaseOrders={purchaseOrders} glAccounts={glAccounts} glJournals={glJournals}/>}
           {tab==='billing' && (
             <div>
@@ -4660,6 +4672,169 @@ function DraftTabBar({drafts, activeId, label, onSwitch, onNew, onClose, icon}){
         </div>
       ))}
       <button className="btn btn-ghost btn-sm" onClick={onNew}>+ New</button>
+    </div>
+  );
+}
+
+/* ---------- 💾 Backup ----------
+   Downloads every collection the app uses as one JSON file (Firestore timestamps kept as
+   {__ts: millis}). A backup file can be checked (counts per collection) and used to put back
+   documents that are missing from the live database — it never overwrites or deletes a document
+   that still exists. The time of the last backup is kept in meta/settings.lastBackupAt so the app
+   can remind when one is due. */
+const BACKUP_COLLECTIONS = ['items','batches','suppliers','customers','invoices','payments','grns','supplierPayments','purchaseOrders',
+  'salesReturns','grnReturns','adjustments','journal','expenses','opExpenses','capitalLoanTransactions','glAccounts','glJournals',
+  'cashChecks','orders','specialOrders','medReminders','calendarEvents','vitals','healthReports','combinedAnalyses','meta'];
+const BACKUP_DUE_DAYS = 7;
+
+function backupEncode(v){
+  if(v==null || typeof v!=='object') return v;
+  if(typeof v.toMillis==='function') return { __ts: v.toMillis() };
+  if(Array.isArray(v)) return v.map(backupEncode);
+  const out = {}; Object.keys(v).forEach(k=>{ out[k] = backupEncode(v[k]); }); return out;
+}
+function backupDecode(v, toTimestamp){
+  if(v==null || typeof v!=='object') return v;
+  if(Array.isArray(v)) return v.map(x=> backupDecode(x, toTimestamp));
+  if(Object.keys(v).length===1 && typeof v.__ts==='number') return toTimestamp(v.__ts);
+  const out = {}; Object.keys(v).forEach(k=>{ out[k] = backupDecode(v[k], toTimestamp); }); return out;
+}
+// Pure check of a parsed backup file: {ok, error, createdAt, counts:{name:n}, total}
+function inspectBackup(data){
+  if(!data || data.app!=='sesanda-pharmacy' || typeof data.collections!=='object') return { ok:false, error:'මේක Sesanda Pharmacy backup file එකක් නෙවෙයි' };
+  const counts = {}; let total = 0;
+  Object.keys(data.collections).forEach(k=>{ const n = Array.isArray(data.collections[k]) ? data.collections[k].length : 0; counts[k] = n; total += n; });
+  return { ok:true, createdAt: data.createdAt, counts, total, errors: data.errors||{} };
+}
+// Documents in the backup whose id isn't in the live collection: {name: [doc, …]}
+function backupMissingDocs(data, liveIdsByCollection){
+  const out = {};
+  Object.keys(data.collections||{}).forEach(name=>{
+    const live = liveIdsByCollection[name]; if(!live) return;
+    const miss = (data.collections[name]||[]).filter(d=> d && d.id && !live.has(d.id));
+    if(miss.length) out[name] = miss;
+  });
+  return out;
+}
+function backupDaysSince(lastMs, nowMs){ return lastMs ? Math.floor((nowMs - lastMs)/86400000) : null; }
+
+function Backup({notify, onBackedUp}){
+  const [busy,setBusy] = useState(''), [last,setLast] = useState(null);
+  const [file,setFile] = useState(null), [info,setInfo] = useState(null), [missing,setMissing] = useState(null);
+  useEffect(()=>{ db.collection('meta').doc('settings').get().then(s=> setLast(s.exists ? s.data().lastBackupAt||null : null)).catch(()=>{}); },[]);
+  const days = backupDaysSince(last, Date.now());
+
+  const takeBackup = async ()=>{
+    setBusy('backup');
+    let wake = null; try{ if(navigator.wakeLock) wake = await navigator.wakeLock.request('screen'); }catch(e){}
+    try{
+      const collections = {}, errors = {};
+      for(const name of BACKUP_COLLECTIONS){
+        try{ collections[name] = (await db.collection(name).get()).docs.map(d=> ({ id:d.id, ...backupEncode(d.data()) })); }
+        catch(e){ errors[name] = e.code || e.message || String(e); }
+      }
+      const now = new Date();
+      const data = { app:'sesanda-pharmacy', version:1, createdAt: now.toISOString(), by: (firebase.auth().currentUser||{}).email||'', collections, errors };
+      const total = Object.values(collections).reduce((s,a)=> s + a.length, 0);
+      const name = 'sesanda-backup-' + localDateStr(now) + '-' + String(now.getHours()).padStart(2,'0') + String(now.getMinutes()).padStart(2,'0') + '.json';
+      const blob = new Blob([JSON.stringify(data)], {type:'application/json'});
+      const f = new File([blob], name, {type:'application/json'});
+      let shared = false;
+      if(navigator.canShare && navigator.canShare({files:[f]}) && /Android|iPhone|iPad/i.test(navigator.userAgent||'')){
+        try{ await navigator.share({files:[f], title:'Sesanda backup ' + localDateStr(now)}); shared = true; }catch(e){ if(e && e.name==='AbortError') shared = true; }
+      }
+      if(!shared){
+        const url = URL.createObjectURL(blob), a = document.createElement('a');
+        a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(()=> URL.revokeObjectURL(url), 10000);
+      }
+      const ms = Date.now();
+      await db.collection('meta').doc('settings').set({ lastBackupAt: ms }, {merge:true}).catch(()=>{});
+      setLast(ms); onBackedUp && onBackedUp(ms);
+      const errN = Object.keys(errors).length;
+      notify('✓ Backup එක ගත්තා — records ' + total + (errN ? ' (⚠ ' + errN + ' collections කියවන්න බැරි වුණා)' : '') + ' · ' + name);
+    }catch(e){ console.error('backup failed', e); notify('❌ Backup එක ගන්න බැරි වුණා: ' + (e.message||e)); }
+    finally{ if(wake) wake.release().catch(()=>{}); setBusy(''); }
+  };
+
+  const openFile = async (e)=>{
+    const f = e.target.files[0]; e.target.value = '';
+    setInfo(null); setMissing(null); setFile(null);
+    if(!f) return;
+    try{
+      const data = JSON.parse(await f.text());
+      const i = inspectBackup(data);
+      if(!i.ok) return notify('❌ ' + i.error);
+      setFile(data); setInfo(i);
+    }catch(err){ notify('❌ File එක කියවන්න බැහැ — මේක backup .json file එකක්ද?'); }
+  };
+  const findMissing = async ()=>{
+    setBusy('check');
+    try{
+      const live = {};
+      for(const name of Object.keys(file.collections)){
+        try{ live[name] = new Set((await db.collection(name).get()).docs.map(d=> d.id)); }catch(e){}
+      }
+      setMissing(backupMissingDocs(file, live));
+    }catch(e){ notify('❌ ' + (e.message||e)); }
+    setBusy('');
+  };
+  const restoreMissing = async ()=>{
+    const n = Object.values(missing).reduce((s,a)=> s + a.length, 0);
+    if(!n) return;
+    if(!window.confirm('Backup එකේ තියෙන, දැන් app එකේ නැති records ' + n + 'ක් ආපහු දාන්නද?\n\nදැනට තියෙන records වෙනස් වෙන්නෙත් නැහැ, delete වෙන්නෙත් නැහැ.')) return;
+    if(!checkAdminPin('Backup එකෙන් records restore කරන්න')) return;
+    setBusy('restore');
+    const toTs = (ms)=> firebase.firestore.Timestamp.fromMillis(ms);
+    try{
+      let done = 0;
+      for(const [name, docs] of Object.entries(missing)){
+        for(let i=0; i<docs.length; i+=400){
+          const wb = db.batch();
+          docs.slice(i, i+400).forEach(d=>{ const {id, ...rest} = d; wb.set(db.collection(name).doc(id), backupDecode(rest, toTs)); });
+          await wb.commit(); done += Math.min(400, docs.length - i);
+        }
+      }
+      setMissing({});
+      notify('✓ Records ' + done + 'ක් ආපහු දැම්මා — Ctrl+F5 කරලා බලන්න, Finance health check එකත් බලන්න');
+    }catch(e){ console.error('restore failed', e); notify('❌ Restore එක අතරමග නැවතුණා: ' + (e.message||e) + ' — ආයෙත් "හොයන්න" ඔබලා ඉතුරු ටික දාන්න'); }
+    setBusy('');
+  };
+  const missingTotal = missing ? Object.values(missing).reduce((s,a)=> s + a.length, 0) : 0;
+
+  return (
+    <div data-testid="backup">
+      <div className="card">
+        <h3>💾 Backup — data ඔක්කොම file එකකට</h3>
+        <p style={{marginTop:0}} data-testid="backup-last">
+          {last ? <>අන්තිම backup එක: <b>{new Date(last).toLocaleString()}</b> ({days===0 ? 'අද' : 'දින ' + days + 'කට කලින්'})</> : <b>තවම backup එකක් අරන් නැහැ</b>}
+          {(days==null || days>=BACKUP_DUE_DAYS) && <span style={{color:'var(--red)', fontWeight:700}}> — ⚠ අලුත් backup එකක් ගන්න</span>}
+        </p>
+        <button className="btn btn-primary" disabled={!!busy} onClick={takeBackup}>{busy==='backup' ? '⏳ Backup ගන්නවා… (tab එක වහන්න එපා)' : '💾 Backup එක ගන්න (Download)'}</button>
+        <div style={{fontSize:13, color:'var(--ink-soft)', marginTop:12, lineHeight:1.6}}>
+          • Items, stock, bills, customers, suppliers, GRNs, payments, returns, accounts (journals) ඇතුළු ඔක්කොම <b>.json</b> file එකකට download වෙනවා.<br/>
+          • File එක computer එකේ <b>Downloads</b> folder එකට යනවා — ඒක <b>Google Drive / email / pen drive</b> එකකටත් copy කරලා තියන්න (computer එක නරක් වුණත් ආරක්ෂිතයි).<br/>
+          • අඩුම තරමින් <b>සතියකට එක පාරක්</b> ගන්න — දින {BACKUP_DUE_DAYS}ක් පැනපු ගමන් app එක මතක් කරනවා.<br/>
+          • Backup එකෙන් data කිසිම දෙයක් වෙනස් වෙන්නේ නැහැ.
+        </div>
+      </div>
+
+      <div className="card">
+        <h3>📂 Backup file එකක් check / restore කරන්න</h3>
+        <input type="file" accept=".json,application/json" data-testid="backup-file" onChange={openFile} />
+        {info && <div style={{marginTop:12}} data-testid="backup-info">
+          <div>✓ Backup එක ගත්තේ: <b>{new Date(info.createdAt).toLocaleString()}</b> · records <b>{info.total}</b>
+            {Object.keys(info.errors).length>0 && <span style={{color:'var(--red)'}}> · ⚠ ඒ වෙලාවේ කියවන්න බැරි වුණු: {Object.keys(info.errors).join(', ')}</span>}</div>
+          <div style={{display:'flex', flexWrap:'wrap', gap:6, margin:'8px 0'}}>{Object.entries(info.counts).filter(([,n])=> n>0).map(([k,n])=> <span key={k} className="tag">{k}: {n}</span>)}</div>
+          <button className="btn btn-ghost btn-sm" disabled={!!busy} onClick={findMissing}>{busy==='check' ? 'හොයනවා…' : '🔍 දැන් app එකේ නැති records හොයන්න'}</button>
+          {missing && (missingTotal===0 ? <div className="empty" style={{marginTop:8}}>✓ Backup එකේ තියෙන ඔක්කොම records app එකේ තියෙනවා — restore කරන්න දෙයක් නැහැ.</div> :
+            <div style={{marginTop:10}} data-testid="backup-missing">
+              <div>⚠ App එකේ නැති records <b>{missingTotal}</b>: {Object.entries(missing).map(([k,a])=> k + ' ' + a.length).join(', ')}</div>
+              <button className="btn btn-danger btn-sm" style={{marginTop:8}} disabled={!!busy} onClick={restoreMissing}>{busy==='restore' ? 'Restore කරනවා…' : '♻ නැති records ' + missingTotal + ' ආපහු දාන්න'}</button>
+              <div style={{fontSize:12.5, color:'var(--ink-soft)', marginTop:6}}>දැනට තියෙන records වෙනස් වෙන්නේ නැහැ — delete වුණු ඒවා විතරක් ආපහු එනවා. (Admin PIN ඕන)</div>
+            </div>)}
+        </div>}
+      </div>
     </div>
   );
 }
