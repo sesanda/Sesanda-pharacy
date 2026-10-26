@@ -7,6 +7,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+// Sidebar pages sit inside folding groups: open the page's group first if it's closed.
+async function goTo(page, label){
+  const btn = page.locator('.side .nav-btn').filter({ has: page.getByText(label, { exact:true }) }).first();
+  if(!(await btn.isVisible().catch(()=>false))) await page.locator('.side .nav-group[data-labels*="|' + label + '|"]').first().click();
+  await btn.click();
+}
 const here = path.dirname(fileURLToPath(import.meta.url));
 const DEPS = process.env.TEST_DEPS;
 const HTML_FILE = process.env.TEST_HTML || path.join(here, '..', 'index.html');
@@ -54,7 +60,7 @@ async function signIn(){
   await page.getByText('Staff / Admin Portal').click();
   const inputs = page.locator('input'); await inputs.nth(0).fill('t@example.test'); await inputs.nth(1).fill('x');
   await page.getByRole('button', { name:'Login' }).click();
-  await page.getByText('Finance (Setup)', { exact:true }).first().waitFor();
+  await page.locator('.side .brand').waitFor();
   return { browser, page, errors };
 }
 const controlRows = async (page)=> (await page.getByTestId('health-control').innerText());
@@ -62,12 +68,12 @@ const controlRows = async (page)=> (await page.getByTestId('health-control').inn
 test('sales return posts to the books and the health check still matches the shop', { skip }, async()=>{
   const { browser, page, errors } = await signIn();
   try{
-    await page.getByText('Finance (Setup)', { exact:true }).first().click();
+    await goTo(page, 'Finance (Setup)');
     await page.getByTestId('health-check').waitFor();
     let t = await controlRows(page);
     assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
 
-    await page.getByText('Returns', { exact:true }).first().click();
+    await goTo(page, 'Returns');
     await page.getByPlaceholder('Bill No (e.g. INV-1234)').fill('B1');
     await page.getByRole('button', { name:'🔍 Find Bill' }).click();
     await page.locator('input[type=number]').first().fill('2');
@@ -79,7 +85,7 @@ test('sales return posts to the books and the health check still matches the sho
     const ret = await page.evaluate(()=> window.firebase.__store.batches.find(b=> b.isReturn));
     assert.deepEqual([ret.unitSell, ret.expiryDate, ret.remainingUnits], [100, '2027-05-01', 2]);   // bills again at its real price
 
-    await page.getByText('Finance (Setup)', { exact:true }).first().click();
+    await goTo(page, 'Finance (Setup)');
     t = await controlRows(page);
     assert.match(t, /1100[^\n]*Rs\. 800\.00\s+Rs\. 800\.00/);
     assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
@@ -90,7 +96,7 @@ test('sales return posts to the books and the health check still matches the sho
 test('deleted bill: its sale entry is reversed in the books', { skip }, async()=>{
   const { browser, page, errors } = await signIn();
   try{
-    await page.getByText('Reports', { exact:true }).first().click();
+    await goTo(page, 'Reports');
     await page.getByRole('button', { name:'🧾 Sales Report' }).click();
     await page.locator('input[type=date]').first().fill('1970-01-01');
     await page.getByTitle('Delete invoice (Admin PIN required)').first().click();
@@ -98,7 +104,7 @@ test('deleted bill: its sale entry is reversed in the books', { skip }, async()=
     const rev = await page.evaluate(()=> window.firebase.__store.glJournals.find(j=> j.reversalOfJournalId==='js1'));
     assert.equal(rev.status, 'POSTED');
     assert.deepEqual(rev.lines.map(l=>[l.accountId, l.debit, l.credit]), [['a1100',0,1000],['a4000',1000,0],['a5000',0,600],['a1210',600,0]]);
-    await page.getByText('Finance (Setup)', { exact:true }).first().click();
+    await goTo(page, 'Finance (Setup)');
     const t = await page.getByTestId('health-check').innerText();
     assert.match(t, /Deleted bills\/GRNs still in the books: 0/);
     assert.match(t, /Trial Balance balanced/);
@@ -127,7 +133,7 @@ test('no Chart of Accounts yet: load it, Retry all posts failed bills/GRNs/payme
   const { browser, page, errors } = await signIn();
   fixture.collections = saved;
   try{
-    await page.getByText('Finance (Setup)', { exact:true }).first().click();
+    await goTo(page, 'Finance (Setup)');
     await page.getByText('Accounts are not set up yet').waitFor();
     await page.getByRole('button', { name:'🌱 Load default Chart of Accounts' }).click();
     await page.getByTestId('health-check').waitFor();
@@ -153,7 +159,7 @@ test('Retry all with many bills: runs side by side, each bill posted once, uniqu
   const { browser, page, errors } = await signIn();
   fixture.collections = saved;
   try{
-    await page.getByText('Finance (Setup)', { exact:true }).first().click();
+    await goTo(page, 'Finance (Setup)');
     await page.getByTestId('health-check').waitFor();
     await page.getByRole('button', { name:/Retry all failed \(60\)/ }).click();
     await page.waitForFunction(()=> (window.firebase.__store.glJournals||[]).filter(j=> j.status==='POSTED').length===60, null, { timeout:60000 });
@@ -173,7 +179,7 @@ test('New Bill: a credit customer\'s bill saved as cash asks first; Cancel saves
     page.removeAllListeners('dialog');
     let answer = false;
     page.on('dialog', d=>{ dialogs.push(d.message()); answer ? d.accept() : d.dismiss(); });
-    await page.getByText('New Bill', { exact:true }).first().click();
+    await goTo(page, 'New Bill');
     await page.getByText('Use registered customer').first().click();
     await page.getByPlaceholder('Search customer name or tel...').fill('Alpha');
     await page.locator('.ac-item', { hasText:'Alpha Test' }).first().dispatchEvent('mousedown');
@@ -205,7 +211,7 @@ test('Sales Report: change a walk-in cash bill to credit for a customer — due,
   const { browser, page, errors } = await signIn();
   fixture.collections = saved;
   try{
-    await page.getByText('Reports', { exact:true }).first().click();
+    await goTo(page, 'Reports');
     await page.getByRole('button', { name:'🧾 Sales Report' }).click();
     await page.locator('input[type=date]').first().fill('1970-01-01');
     const row = page.locator('tr', { hasText:'B2' });
@@ -218,7 +224,7 @@ test('Sales Report: change a walk-in cash bill to credit for a customer — due,
     assert.equal(await page.evaluate(()=> window.firebase.__store.customers.find(c=> c.id==='c1').dueAmount), 1300);
     const j = await page.evaluate(()=> window.firebase.__store.glJournals.find(j=> j.sourceType==='BILL_TO_CREDIT'));
     assert.deepEqual(j.lines.map(l=>[l.accountId, l.debit, l.credit]), [['a1100',300,0],['a1000',0,300]]);
-    await page.getByText('Finance (Setup)', { exact:true }).first().click();
+    await goTo(page, 'Finance (Setup)');
     const t = await page.getByTestId('health-control').innerText();
     assert.match(t, /1100[^\n]*Rs\. 1300\.00\s+Rs\. 1300\.00/);
     assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
@@ -235,7 +241,7 @@ test('Suppliers: old unpaid bill with no stock → supplier due and books, stock
   const { browser, page, errors } = await signIn();
   fixture.collections = saved;
   try{
-    await page.getByText('Suppliers', { exact:true }).first().click();
+    await goTo(page, 'Suppliers');
     const card = page.getByTestId('old-supplier-bill');
     await card.locator('select').selectOption('s1');
     await card.locator('input[type=number]').fill('500');
@@ -248,7 +254,7 @@ test('Suppliers: old unpaid bill with no stock → supplier due and books, stock
     assert.equal(await page.evaluate(()=> window.firebase.__store.batches.length), 1);               // no stock added
 
     // settle it with goods from another GRN; the supplier credits Rs 500 for stock that cost Rs 300
-    await page.getByText('Returns', { exact:true }).first().click();
+    await goTo(page, 'Returns');
     await page.getByRole('button', { name:'📦 GRN Return' }).click();
     await page.getByPlaceholder('GRN No').fill(g.grnNo);
     await page.getByRole('button', { name:'🔍 Find GRN' }).click();
@@ -263,7 +269,7 @@ test('Suppliers: old unpaid bill with no stock → supplier due and books, stock
     const rj = await page.evaluate(()=> window.firebase.__store.glJournals.find(j=> j.sourceType==='GRN_RETURN'));
     assert.deepEqual(rj.lines.map(l=>[l.accountId, l.debit, l.credit]), [['a2100',500,0],['a1210',0,300],['a4100',0,200]]);
     assert.equal(await page.evaluate(()=> window.firebase.__store.batches.find(b=> b.id==='b1').remainingUnits), 15);
-    await page.getByText('Finance (Setup)', { exact:true }).first().click();
+    await goTo(page, 'Finance (Setup)');
     const t = await page.getByTestId('health-control').innerText();
     assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
     assert.deepEqual(errors, []);
@@ -273,7 +279,7 @@ test('Suppliers: old unpaid bill with no stock → supplier due and books, stock
 test('Sales Report search finds a bill from any date by its number', { skip }, async()=>{
   const { browser, page, errors } = await signIn();
   try{
-    await page.getByText('Reports', { exact:true }).first().click();
+    await goTo(page, 'Reports');
     await page.getByRole('button', { name:'🧾 Sales Report' }).click();
     assert.ok(!(await page.locator('tbody').innerText()).includes('B1'));          // 1970 bill is outside today's range
     await page.getByTestId('bill-search').fill('b1');
@@ -291,7 +297,7 @@ test('Sub GRN: items received by unit qty with unit cost/sales → stock, suppli
   const { browser, page, errors } = await signIn();
   fixture.collections = saved;
   try{
-    await page.getByText('Sub GRN Entry', { exact:true }).first().click();
+    await goTo(page, 'Sub GRN Entry');
     await page.getByText('🧩 Sub GRN Entry (units)').waitFor();
     for(const l of ['Pack Size','Pkt Qty (full packs)','Free Qty (packs)','Pkt Cost (Rs.)','Pkt Sales (Rs.)'])
       assert.equal(await page.getByText(l, { exact:true }).count(), 0, l);
@@ -312,7 +318,248 @@ test('Sub GRN: items received by unit qty with unit cost/sales → stock, suppli
     assert.deepEqual([b.remainingUnits, b.unitCost, b.unitSell, b.qtyPacks, b.looseQty, b.expiryDate], [25, 4, 6, 2, 5, '2027-08-01']);
     const j = await page.evaluate((id)=> window.firebase.__store.glJournals.find(j=> j.sourceId===id), g.id);
     assert.deepEqual(j.lines.map(l=>[l.accountId, l.debit, l.credit]), [['a1210',100,0],['a2100',0,100]]);
-    await page.getByText('Finance (Setup)', { exact:true }).first().click();
+    await goTo(page, 'Finance (Setup)');
+    const t = await page.getByTestId('health-control').innerText();
+    assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+const field = (page, label)=> page.locator('xpath=//label[normalize-space(.)="' + label + '"]/following-sibling::input');
+test('GRN: last prices show when an item is typed; selling price at or below cost shows a warning', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.suppliers = [{ id:'s1', name:'Supp' }];
+  fx.collections.items = [{ id:'it1', itemNumber:'T001', brandName:'Testamol', genericName:'Paracetamol', unit:'tab', packSize:10 }];
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await goTo(page, 'GRN Entry');
+    await page.getByPlaceholder('type code or brand name...').fill('Testa');
+    assert.match(await page.locator('.ac-item', { hasText:'Testamol' }).first().innerText(), /cost 60\.00 · sell 100\.00/);
+    await page.locator('.ac-item', { hasText:'Testamol' }).first().dispatchEvent('mousedown');
+    assert.match(await page.getByTestId('last-price-note').innerText(), /Unit Cost Rs 60\.00 · Unit Sell Rs 100\.00/);
+    await field(page,'Pkt Cost (Rs.)').fill('120');
+    await field(page,'Pkt Sales (Rs.)').fill('150');
+    assert.equal(await page.getByTestId('grn-price-warning').count(), 0);
+    await field(page,'Pkt Sales (Rs.)').fill('120');
+    assert.match(await page.getByTestId('grn-price-warning').innerText(), /සමානයි/);
+    await field(page,'Pkt Sales (Rs.)').fill('100');
+    assert.match(await page.getByTestId('grn-price-warning').innerText(), /අඩුයි/);
+
+    await goTo(page, 'Stock');
+    await page.getByTestId('stock-search').fill('testa');
+    const row = await page.locator('tr', { hasText:'Testamol' }).innerText();
+    assert.match(row, /60\.00\s+100\.00/);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('Reports → Charts: tiles, trend chart with hover, top items, payment mix', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.invoices[0].createdAtMs = Date.now();
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await page.setViewportSize({ width:1200, height:1400 });
+    await goTo(page, 'Reports');
+    await page.getByRole('button', { name:'📊 Charts' }).click();
+    await page.getByRole('button', { name:'දින 30' }).click();
+    const charts = page.getByTestId('charts');
+    const text = await charts.innerText();
+    assert.match(text, /Rs\. 1,000\.00/);            // sales
+    assert.match(text, /40\.0% margin/);             // (1000-600)/1000
+    assert.match(text, /Testamol/);
+    assert.match(text, /Credit/);
+    await charts.locator('svg rect[fill="transparent"]').last().hover();
+    assert.match(await charts.innerText(), /Gross profit: Rs\. 400\.00/);
+    if(process.env.SHOT) await charts.screenshot({ path: process.env.SHOT });
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('Charts → item analysis: price history, busiest months, best brand of a generic', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.items = [{ id:'it1', itemNumber:'T001', brandName:'Testamol', genericName:'Paracetamol', unit:'tab', packSize:10 },
+    { id:'it2', itemNumber:'P002', brandName:'Panadol', genericName:'Paracetamol', unit:'tab', packSize:10 }];
+  fx.collections.batches.push({ id:'b2', itemId:'it1', brandName:'Testamol', remainingUnits:5, unitCost:70, unitSell:110, expiryDate:'2027-09-01', openingDate:'2026-10-10', isOpeningStock:true });
+  fx.collections.invoices[0].createdAtMs = Date.now();
+  fx.collections.invoices.push({ id:'inv2', billNo:'B2', customerName:'Walk-in', payment:'cash', totalToPay:300, paidAmount:300, paid:true, createdAtMs:Date.now(),
+    items:[{ itemId:'it2', brandName:'Panadol', qty:3, unitPrice:100, lineTotal:300, costTotal:270, unitCost:90 }] });
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await page.setViewportSize({ width:1200, height:1400 });
+    await goTo(page, 'Reports');
+    await page.getByRole('button', { name:'📊 Charts' }).click();
+    await page.getByRole('button', { name:'දින 30' }).click();
+    const box = page.getByTestId('item-analysis');
+    await page.getByTestId('analysis-item').fill('testa');
+    await box.locator('.ac-item', { hasText:'Testamol' }).dispatchEvent('mousedown');
+    const t = await box.innerText();
+    assert.match(t, /cost 16\.7%, sell 10\.0% වෙනස් වෙලා/);       // 60→70, 100→110
+    assert.match(t, /වැඩිම: \S+ \d\d \(10\)/);
+    await page.getByTestId('analysis-generic').fill('Paracetamol');
+    const t2 = await box.innerText();
+    assert.match(t2, /වැඩියෙන්ම profit: Testamol — Rs\. 400\.00/);
+    assert.match(t2, /Panadol/);
+    if(process.env.SHOT) await box.screenshot({ path: process.env.SHOT });
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('Card charge: a card bill posts its % to 6500 Bank Charges from Bank; older card bills post from Finance', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.glAccounts.push({ id:'a6500', accountCode:'6500', accountName:'Bank Charges', accountType:'EXPENSE', isActive:true });
+  fx.collections.meta = [{ id:'settings', cardChargePercent:3 }];
+  fx.collections.invoices.push({ id:'inv0', billNo:'B0', customerName:'Walk-in', payment:'card', totalToPay:500, paidAmount:500, paid:true, accountingStatus:'POSTED', createdAtMs:2, items:[] });
+  fx.collections.glJournals.push({ id:'js0', journalNo:'JE-3', date:'2026-10-03', status:'POSTED', sourceType:'SALE', sourceId:'inv0', description:'Bill B0', lines:[L('1010',500,0), L('4000',0,500)] });
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await goTo(page, 'New Bill');
+    await page.getByPlaceholder('type code or brand name...').fill('Testamol');
+    await page.locator('.ac-item', { hasText:'Testamol' }).first().dispatchEvent('mousedown');
+    await page.locator('input[type=number]').first().fill('2');
+    await page.getByRole('button', { name:'+ Add' }).click();
+    await page.locator('select:has(option[value="card"])').first().selectOption('card');
+    await page.getByRole('button', { name:'💾 Save Bill' }).click();
+    await page.waitForFunction(()=> (window.firebase.__store.glJournals||[]).some(j=> j.sourceType==='CARD_CHARGE' && j.status==='POSTED'));
+    const inv = await page.evaluate(()=> window.firebase.__store.invoices.find(i=> i.payment==='card' && i.id!=='inv0'));
+    assert.equal(inv.cardChargePct, 3);
+    const fee = Math.round(inv.paidAmount*3)/100;
+    const cj = await page.evaluate((id)=> window.firebase.__store.glJournals.find(j=> j.sourceType==='CARD_CHARGE' && j.sourceId===id), inv.id);
+    assert.deepEqual(cj.lines.map(l=>[l.accountId, l.debit, l.credit]), [['a6500',fee,0],['a1010',0,fee]]);
+
+    await goTo(page, 'Finance (Setup)');
+    const box = page.getByTestId('card-charges');
+    assert.match(await box.innerText(), /නොගිය: 1 · Rs\. 15\.00/);                     // B0: 3% of 500
+    await box.getByRole('button', { name:/Post card charges \(1\)/ }).click();
+    await page.waitForFunction(()=> window.firebase.__store.glJournals.some(j=> j.sourceType==='CARD_CHARGE' && j.sourceId==='inv0' && j.status==='POSTED'));
+    await page.waitForFunction(()=> /නොගිය: 0/.test(document.querySelector('[data-testid="card-charges"]').innerText));
+    const t = await page.getByTestId('health-control').innerText();
+    assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('Bank Accounts: add a bank, send card money there, deposit cash into it', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.glAccounts.push({ id:'a6500', accountCode:'6500', accountName:'Bank Charges', accountType:'EXPENSE', isActive:true });
+  fx.collections.glJournals.push({ id:'jc', journalNo:'JE-9', date:'2026-10-01', status:'POSTED', sourceType:'OWNER_CAPITAL', sourceId:'c', description:'cap', lines:[L('1000',2000,0), L('3000',0,2000)] });
+  fx.collections.meta = [{ id:'settings', cardChargePercent:2 }];
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await goTo(page, 'Bank Accounts');
+    await page.getByTestId('new-bank-name').fill('BOC Current');
+    await page.getByRole('button', { name:'➕ Add bank account' }).click();
+    await page.locator('tr', { hasText:'BOC Current' }).waitFor();
+    const boc = await page.evaluate(()=> window.firebase.__store.glAccounts.find(a=> a.accountName==='BOC Current'));
+    assert.deepEqual([boc.accountCode, boc.accountType, boc.isBank], ['1011','ASSET',true]);
+    await page.locator('tr', { hasText:'BOC Current' }).getByRole('button', { name:'මෙතනට යවන්න' }).click();
+    await page.locator('tr', { hasText:'BOC Current' }).getByText('💳 මෙතනට').waitFor();
+    assert.equal(await page.evaluate(()=> window.firebase.__store.meta.find(m=> m.id==='settings').cardBankAccountCode), '1011');
+
+    await page.getByTestId('dep-to').selectOption('1011');
+    await page.getByTestId('dep-amount').fill('1500');
+    await page.getByRole('button', { name:'💾 Save deposit' }).click();
+    await page.waitForFunction(()=> window.firebase.__store.glJournals.some(j=> j.sourceType==='BANK_TRANSFER' && j.status==='POSTED'));
+    const dj = await page.evaluate(()=> window.firebase.__store.glJournals.find(j=> j.sourceType==='BANK_TRANSFER'));
+    assert.deepEqual(dj.lines.map(l=>[l.accountId, l.debit, l.credit]), [[boc.id,1500,0],['a1000',0,1500]]);
+    await page.locator('tr', { hasText:'BOC Current' }).filter({ hasText:'Rs. 1,500.00' }).first().waitFor();
+    if(process.env.SHOT) await page.getByTestId('bank-accounts').screenshot({ path: process.env.SHOT });
+
+    // a card bill now lands in BOC, and its 2% charge comes out of BOC
+    await goTo(page, 'New Bill');
+    await page.getByPlaceholder('type code or brand name...').fill('Testamol');
+    await page.locator('.ac-item', { hasText:'Testamol' }).first().dispatchEvent('mousedown');
+    await page.locator('input[type=number]').first().fill('1');
+    await page.getByRole('button', { name:'+ Add' }).click();
+    await page.locator('select:has(option[value="card"])').first().selectOption('card');
+    await page.getByRole('button', { name:'💾 Save Bill' }).click();
+    await page.waitForFunction(()=> window.firebase.__store.glJournals.some(j=> j.sourceType==='CARD_CHARGE' && j.status==='POSTED'));
+    const inv = await page.evaluate(()=> window.firebase.__store.invoices.find(i=> i.payment==='card'));
+    assert.equal(inv.cardBankCode, '1011');
+    const sj = await page.evaluate((id)=> window.firebase.__store.glJournals.find(j=> j.sourceType==='SALE' && j.sourceId===id), inv.id);
+    assert.equal(sj.lines[0].accountId, boc.id);
+    const cj = await page.evaluate((id)=> window.firebase.__store.glJournals.find(j=> j.sourceType==='CARD_CHARGE' && j.sourceId===id), inv.id);
+    assert.deepEqual(cj.lines.map(l=>l.accountId), ['a6500', boc.id]);
+
+    await goTo(page, 'Finance (Setup)');
+    const t = await page.getByTestId('health-control').innerText();
+    assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
+    assert.match(await page.getByTestId('health-check').innerText(), /Bank in books: Rs\. [\d,]+\.\d\d/);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('Stock Audit: pick items, lots split by price/expiry, physical counts, print sheet', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.items = [{ id:'it1', itemNumber:'T001', brandName:'Testamol', genericName:'Paracetamol', unit:'tab', packSize:10 },
+    { id:'it2', itemNumber:'P002', brandName:'Panadol', genericName:'Paracetamol', unit:'tab', packSize:10 }];
+  fx.collections.batches.push(
+    { id:'b2', itemId:'it1', brandName:'Testamol', remainingUnits:5, unitCost:70, unitSell:110, expiryDate:'2027-09-01', batchCode:'B-2' },
+    { id:'b3', itemId:'it1', brandName:'Testamol', remainingUnits:4, unitCost:60, unitSell:100, expiryDate:'2027-05-01', batchCode:'B-3' },
+    { id:'b4', itemId:'it2', brandName:'Panadol', remainingUnits:9, unitCost:8, unitSell:10, expiryDate:'2027-02-01', batchCode:'P-1' });
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await goTo(page, 'Stock Audit');
+    await page.getByTestId('audit-search').fill('testa');
+    await page.getByTestId('audit-search').press('Enter');
+    const box = page.getByTestId('stock-audit');
+    await box.locator('tbody tr').nth(1).waitFor();
+    assert.equal(await box.locator('tbody tr').count(), 2);                      // 24 @60/100 and 5 @70/110 — Panadol not picked
+    assert.match(await box.locator('tbody tr').nth(0).innerText(), /2027-05-01\s+60\.00\s+100\.00\s+24 tab/);
+    assert.match(await box.locator('tbody tr').nth(1).innerText(), /2027-09-01\s+70\.00\s+110\.00\s+5 tab/);
+    await box.locator('tbody tr').nth(0).locator('input').fill('22');
+    await box.locator('tbody tr').nth(1).locator('input').fill('5');
+    const sum = await page.getByTestId('audit-summary').innerText();
+    assert.match(sum, /Rs\. 120\.00[\s\S]*2 units/);                             // 2 short × Rs 60
+    assert.match(sum, /Rs\. -200\.00/);                                          // at sell price
+
+    if(process.env.SHOT){ await page.setViewportSize({ width:1200, height:1000 }); await box.screenshot({ path: process.env.SHOT }); }
+    await box.getByRole('button', { name:'📋 ඔක්කොම items' }).click();
+    assert.equal(await box.locator('tbody tr').count(), 3);
+    const [popup] = await Promise.all([ page.waitForEvent('popup'), box.getByRole('button', { name:'🖨 Print' }).click() ]);
+    await popup.waitForLoadState();
+    const sheet = await popup.locator('.sheet').innerText();
+    assert.match(sheet, /Stock Audit/);
+    assert.match(sheet, /Panadol/);
+    assert.match(sheet, /Counted by/);
+    if(process.env.SHOT) await popup.screenshot({ path: process.env.SHOT.replace('.png','-print.png') });
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('Stock Audit apply: stock follows the count, shortage goes to 6700 and the health check still matches', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.items = [{ id:'it1', itemNumber:'T001', brandName:'Testamol', genericName:'Paracetamol', unit:'tab', packSize:10 }];
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await goTo(page, 'Stock Audit');
+    const box = page.getByTestId('stock-audit');
+    await box.getByRole('button', { name:'📋 ඔක්කොම items' }).click();
+    await box.locator('tbody tr input').first().fill('17');
+    await box.getByRole('button', { name:'✅ Apply adjustments (1)' }).click();
+    await page.waitForFunction(()=> (window.firebase.__store.glJournals||[]).some(j=> j.sourceType==='STOCK_AUDIT' && j.status==='POSTED'));
+    assert.equal(await page.evaluate(()=> window.firebase.__store.batches.find(b=> b.id==='b1').remainingUnits), 17);
+    const adj = await page.evaluate(()=> window.firebase.__store.adjustments.find(a=> a.source==='stockAudit'));
+    assert.deepEqual([adj.itemId, adj.qty, adj.valueAtCost], ['it1', -3, -180]);
+    const wo = await page.evaluate(()=> window.firebase.__store.glAccounts.find(a=> a.accountCode==='6700'));
+    const j = await page.evaluate(()=> window.firebase.__store.glJournals.find(j=> j.sourceType==='STOCK_AUDIT'));
+    assert.deepEqual(j.lines.map(l=>[l.accountId, l.debit, l.credit]), [[wo.id,180,0],['a1210',0,180]]);
+    await box.locator('tbody tr').filter({ hasText:'17 tab' }).waitFor();
+    assert.equal(await box.locator('tbody tr input').first().inputValue(), '');          // applied count cleared
+    await goTo(page, 'Finance (Setup)');
     const t = await page.getByTestId('health-control').innerText();
     assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
     assert.deepEqual(errors, []);

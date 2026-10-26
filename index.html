@@ -117,6 +117,13 @@
   .nav-btn{display:flex; align-items:center; gap:10px; width:100%; text-align:left; background:transparent; border:none; color:rgba(255,255,255,.78); padding:11px 12px; border-radius:10px; font-size:13.5px; margin-bottom:3px;}
   .nav-btn.active{background:rgba(255,255,255,.14); color:#fff; font-weight:600;}
   .nav-btn:hover{background:rgba(255,255,255,.08);}
+  .nav-group{display:flex; align-items:center; gap:10px; width:100%; text-align:left; background:transparent; border:none; color:#fff; padding:10px 12px; border-radius:10px; font-size:13.5px; font-weight:600; margin:4px 0 3px;}
+  .nav-group:hover{background:rgba(255,255,255,.08);}
+  .nav-group .chev{opacity:.6; font-size:11px; transition:transform .15s;}
+  .nav-group.open .chev{transform:rotate(90deg);}
+  .nav-sub{margin-left:12px; padding-left:8px; border-left:1px solid rgba(255,255,255,.12); margin-bottom:6px;}
+  .nav-sub .nav-btn{padding:9px 10px; font-size:13px;}
+  .side{overflow-y:auto;}
   .side-foot{margin-top:auto; padding-top:14px; border-top:1px solid rgba(255,255,255,.12); font-size:12px; opacity:.7;}
   .side-foot button{background:none;border:none;color:#fff;opacity:.85;font-size:12.5px;padding:8px 0;}
 
@@ -1298,7 +1305,7 @@ async function postSaleAccounting(invoice, glAccounts, existingJournals){
 
   const lines = [];
   if(paidPortion > 0.001){
-    const cashCode = invoice.payment==='card' ? '1010' : '1000'; // card settlements land in Bank, not till Cash
+    const cashCode = invoice.payment==='card' ? glCardBankCode(invoice) : '1000'; // card settlements land in the card bank account, not till Cash
     const cashAcc = findGlAccountByCode(glAccounts, cashCode);
     if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
     lines.push({ accountId: cashAcc.id, debit: paidPortion, credit: 0, description: desc });
@@ -1334,7 +1341,35 @@ async function postSaleAccounting(invoice, glAccounts, existingJournals){
    createJournal()/postJournal() path as GRN/Sale. Uses the exact payment amount already recorded
    operationally — never recalculated here. Card settles to Bank (1010), matching Step 3's mapping;
    cash uses 1000 — no other payment method exists in either flow, so none is invented. */
-function glCashAccountCodeForMethod(method){ return method==='card' ? '1010' : '1000'; }
+function glCashAccountCodeForMethod(method, doc){ return method==='card' ? glCardBankCode(doc) : '1000'; }
+
+/* ---------- Bank accounts ----------
+   1010 Bank plus any bank account added from 🏦 Bank Accounts (ASSET, isBank, codes 1011–1099).
+   Card money goes to the one chosen there (meta/settings cardBankAccountCode, loaded at sign-in
+   into GL_CARD_BANK_CODE); each card bill/payment stores the code it went to (cardBankCode) so
+   its charge, refund or change-to-credit later hits the same bank. */
+let GL_CARD_BANK_CODE = '1010';
+function glCardBankCode(doc){ return (doc && doc.cardBankCode) || (typeof GL_CARD_BANK_CODE!=='undefined' ? GL_CARD_BANK_CODE : '1010'); }
+function glBankAccounts(glAccounts){
+  return (glAccounts||[]).filter(a=> a.accountType==='ASSET' && a.isActive!==false && (a.accountCode==='1010' || a.isBank))
+    .sort((a,b)=> a.accountCode<b.accountCode ? -1 : 1);
+}
+function nextBankAccountCode(glAccounts){
+  const used = new Set((glAccounts||[]).map(a=> String(a.accountCode)));
+  for(let c=1011; c<1100; c++) if(!used.has(String(c))) return String(c);
+  return null;
+}
+// A cash deposit / bank-to-bank move: DR the account the money went into, CR where it came from.
+function buildBankTransferLines(fromCode, toCode, amount, glAccounts, desc){
+  if(fromCode===toCode) throw new Error('From සහ To එකම account එක වෙන්න බැහැ');
+  if(glToCents(amount) <= 0) throw new Error('Amount එක 0ට වඩා වැඩි වෙන්න ඕන');
+  const from = findGlAccountByCode(glAccounts, fromCode), to = findGlAccountByCode(glAccounts, toCode);
+  if(!from || !to) throw new Error('Account ' + (!from ? fromCode : toCode) + ' Chart of Accounts එකේ නැහැ');
+  return [
+    { accountId: to.id, debit: Number(amount), credit: 0, description: desc },
+    { accountId: from.id, debit: 0, credit: Number(amount), description: desc },
+  ];
+}
 
 async function postCustomerPaymentAccounting(payment, glAccounts, existingJournals){
   const sourceType = 'CUSTOMER_PAYMENT', sourceId = payment.id;
@@ -1346,7 +1381,7 @@ async function postCustomerPaymentAccounting(payment, glAccounts, existingJourna
 
   const arAcc = findGlAccountByCode(glAccounts, '1100');
   if(!arAcc) throw new Error('Chart of Accounts has no active 1100 Accounts Receivable account — load/check it in Finance');
-  const cashCode = glCashAccountCodeForMethod(payment.method);
+  const cashCode = glCashAccountCodeForMethod(payment.method, payment);
   const cashAcc = findGlAccountByCode(glAccounts, cashCode);
   if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
 
@@ -1370,7 +1405,7 @@ async function postSupplierPaymentAccounting(payment, glAccounts, existingJourna
 
   const apAcc = findGlAccountByCode(glAccounts, '2100');
   if(!apAcc) throw new Error('Chart of Accounts has no active 2100 Supplier Payables account — load/check it in Finance');
-  const cashCode = glCashAccountCodeForMethod(payment.method);
+  const cashCode = glCashAccountCodeForMethod(payment.method, payment);
   const cashAcc = findGlAccountByCode(glAccounts, cashCode);
   if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
 
@@ -1427,7 +1462,7 @@ async function postExpenseAccounting(expense, glAccounts, existingJournals){
   if(!check.valid) throw new Error(check.errors.join('; '));
 
   const categoryAcc = (glAccounts||[]).find(a=>a.id===expense.categoryAccountId);
-  const cashCode = glCashAccountCodeForMethod(expense.paymentMethod);
+  const cashCode = glCashAccountCodeForMethod(expense.paymentMethod, expense);
   const cashAcc = findGlAccountByCode(glAccounts, cashCode);
   if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
 
@@ -1449,7 +1484,7 @@ async function postExpenseAccounting(expense, glAccounts, existingJournals){
    matching this module's own vocabulary — glCashOrBankAccountCode() is a distinct small mapping
    from glCashAccountCodeForMethod() (Step 8) because that one treats anything non-'card' as cash,
    which would wrongly resolve 'bank' to 1000 here. */
-function glCashOrBankAccountCode(method){ return method==='bank' ? '1010' : '1000'; }
+function glCashOrBankAccountCode(method, bankCode){ return method==='bank' ? (bankCode || '1010') : '1000'; }
 
 async function nextCapitalLoanNo(){
   const ref = db.collection('meta').doc('counters');
@@ -1512,7 +1547,7 @@ async function _postCapitalLoanEntry(txn, glAccounts, existingJournals, sourceTy
 }
 
 async function postOwnerCapitalAccounting(txn, glAccounts, existingJournals){
-  const cashCode = glCashOrBankAccountCode(txn.paymentMethod);
+  const cashCode = glCashOrBankAccountCode(txn.paymentMethod, txn.bankCode);
   const cashAcc = findGlAccountByCode(glAccounts, cashCode);
   if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
   const capitalAcc = findGlAccountByCode(glAccounts, '3000');
@@ -1521,7 +1556,7 @@ async function postOwnerCapitalAccounting(txn, glAccounts, existingJournals){
 }
 
 async function postOwnerDrawingAccounting(txn, glAccounts, existingJournals){
-  const cashCode = glCashOrBankAccountCode(txn.paymentMethod);
+  const cashCode = glCashOrBankAccountCode(txn.paymentMethod, txn.bankCode);
   const cashAcc = findGlAccountByCode(glAccounts, cashCode);
   if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
   const drawingsAcc = findGlAccountByCode(glAccounts, '3200');
@@ -1530,7 +1565,7 @@ async function postOwnerDrawingAccounting(txn, glAccounts, existingJournals){
 }
 
 async function postLoanReceivedAccounting(txn, glAccounts, existingJournals){
-  const cashCode = glCashOrBankAccountCode(txn.paymentMethod);
+  const cashCode = glCashOrBankAccountCode(txn.paymentMethod, txn.bankCode);
   const cashAcc = findGlAccountByCode(glAccounts, cashCode);
   if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
   const loanAcc = (glAccounts||[]).find(a=>a.id===txn.accountId && a.accountType==='LIABILITY' && a.isActive!==false);
@@ -1539,7 +1574,7 @@ async function postLoanReceivedAccounting(txn, glAccounts, existingJournals){
 }
 
 async function postLoanRepaymentAccounting(txn, glAccounts, existingJournals){
-  const cashCode = glCashOrBankAccountCode(txn.paymentMethod);
+  const cashCode = glCashOrBankAccountCode(txn.paymentMethod, txn.bankCode);
   const cashAcc = findGlAccountByCode(glAccounts, cashCode);
   if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
   const loanAcc = (glAccounts||[]).find(a=>a.id===txn.accountId && a.accountType==='LIABILITY' && a.isActive!==false);
@@ -1548,7 +1583,7 @@ async function postLoanRepaymentAccounting(txn, glAccounts, existingJournals){
 }
 
 async function postLoanInterestAccounting(txn, glAccounts, existingJournals){
-  const cashCode = glCashOrBankAccountCode(txn.paymentMethod);
+  const cashCode = glCashOrBankAccountCode(txn.paymentMethod, txn.bankCode);
   const cashAcc = findGlAccountByCode(glAccounts, cashCode);
   if(!cashAcc) throw new Error('Chart of Accounts has no active ' + cashCode + ' account — load/check it in Finance');
   const interestAcc = (glAccounts||[]).find(a=>a.id===txn.accountId && a.accountType==='EXPENSE' && a.isActive!==false);
@@ -1611,7 +1646,7 @@ async function postInventoryWriteOffAccounting(writeOff, glAccounts, existingJou
 // Pure: journal lines for a sales return. dueReduction/cashRefund come straight from
 // applySalesReturnToInvoice() (they sum to the return value); restockCost is the cost of the
 // resellable units put back on the shelf (damaged units stay expensed in COGS, as before).
-function buildSalesReturnLines({dueReduction, cashRefund, restockCost, payment, desc}, glAccounts){
+function buildSalesReturnLines({dueReduction, cashRefund, restockCost, payment, desc, bankCode}, glAccounts){
   const need = (code)=>{ const a = findGlAccountByCode(glAccounts, code); if(!a) throw new Error('Chart of Accounts has no active ' + code + ' account — load/check it in Finance'); return a; };
   const due = Math.max(0, Number(dueReduction)||0), cash = Math.max(0, Number(cashRefund)||0), cost = Math.max(0, Number(restockCost)||0);
   const value = due + cash;
@@ -1620,7 +1655,7 @@ function buildSalesReturnLines({dueReduction, cashRefund, restockCost, payment, 
   if(value > 0.001){
     lines.push({ accountId: need('4000').id, debit: value, credit: 0, description: desc });
     if(due > 0.001) lines.push({ accountId: need('1100').id, debit: 0, credit: due, description: desc });
-    if(cash > 0.001) lines.push({ accountId: need(payment==='card' ? '1010' : '1000').id, debit: 0, credit: cash, description: desc });
+    if(cash > 0.001) lines.push({ accountId: need(payment==='card' ? (bankCode || glCardBankCode()) : '1000').id, debit: 0, credit: cash, description: desc });
   }
   if(cost > 0.001){
     lines.push({ accountId: need('1210').id, debit: cost, credit: 0, description: desc });
@@ -1637,7 +1672,7 @@ async function postSalesReturnAccounting(ret, glAccounts, existingJournals){
   const sale = (existingJournals||[]).find(j=> j.sourceType==='SALE' && j.sourceId===ret.invoiceId && glIsLiveJournal(j));
   if(!sale && !glOpeningBalancesPosted(existingJournals)) return { status:'SKIPPED', journalId:null, journalNo:null, reason:'Bill ' + (ret.billNo||ret.invoiceId) + ' has no sale entry in the books (before accounting started)' };
   const desc = 'Sales return — Bill ' + (ret.billNo||ret.invoiceId) + (ret.customerName? (' — '+ret.customerName) : '');
-  const lines = buildSalesReturnLines({ dueReduction:ret.dueReduction, cashRefund:ret.cashRefund, restockCost:ret.restockCost, payment:ret.payment, desc }, glAccounts);
+  const lines = buildSalesReturnLines({ dueReduction:ret.dueReduction, cashRefund:ret.cashRefund, restockCost:ret.restockCost, payment:ret.payment, desc, bankCode:ret.cardBankCode }, glAccounts);
   const journalId = await createJournal({ date: ret.date || todayISO(), description: desc, sourceType, sourceId, lines }, glAccounts);
   await postJournal(journalId, glAccounts, existingJournals);
   return { status:'POSTED', journalId, journalNo: null };
@@ -1689,7 +1724,68 @@ async function reverseSaleForDeletedInvoice(invoiceId, billNo, glAccounts, exist
   const sale = (existingJournals||[]).find(j=> j.sourceType==='SALE' && j.sourceId===invoiceId && glIsLiveJournal(j));
   if(!sale) return { status:'NOT_IN_BOOKS' };
   const reversalId = await reverseJournal(sale.id, glAccounts, 'Bill ' + (billNo||invoiceId) + ' deleted');
+  await reverseCardCharge(invoiceId, glAccounts, existingJournals, 'Bill ' + (billNo||invoiceId) + ' deleted');
   return { status:'REVERSED', journalId: reversalId };
+}
+
+/* ---------- Card charges → Accounting ----------
+   The bank keeps its card fee (Reports → P&L Overview "Card charge %", stored in meta/settings)
+   and pays in the rest, so each card receipt — a card bill's paid amount, or a customer's due
+   paid by card — posts its fee as its own journal: DR 6500 Bank Charges / CR 1010 Bank. The
+   customer's bill is untouched. The % in force when the bill/payment was saved is stored on it
+   (cardChargePct); older ones use the current setting. */
+function cardChargeAmount(amount, pct){ return Math.round((Number(amount)||0) * (Number(pct)||0)) / 100; }
+
+function buildCardChargeLines(fee, glAccounts, desc, bankCode){
+  const code = bankCode || glCardBankCode();
+  const charges = findGlAccountByCode(glAccounts, '6500'), bank = findGlAccountByCode(glAccounts, code);
+  if(!charges || !bank) throw new Error('Chart of Accounts has no active ' + (!charges ? '6500 Bank Charges' : code + ' Bank') + ' account — add it in Finance');
+  return [
+    { accountId: charges.id, debit: fee, credit: 0, description: desc },
+    { accountId: bank.id, debit: 0, credit: fee, description: desc },
+  ];
+}
+
+async function getCardChargePct(){
+  try{ const snap = await db.collection('meta').doc('settings').get(); return snap.exists ? (Number(snap.data().cardChargePercent)||0) : 0; }
+  catch(e){ console.error('card charge % read failed', e); return 0; }
+}
+
+// charge: {id (source doc id), amount (card money received), pct, date, desc}
+async function postCardChargeAccounting(charge, glAccounts, existingJournals){
+  const sourceType = 'CARD_CHARGE', sourceId = charge.id;
+  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j));
+  if(dup) return { status:'ALREADY_POSTED', journalId: dup.id };
+  const fee = cardChargeAmount(charge.amount, charge.pct);
+  if(glToCents(fee) <= 0) return { status:'NO_CHARGE' };
+  const desc = 'Card charge ' + charge.pct + '% — ' + charge.desc;
+  const lines = buildCardChargeLines(fee, glAccounts, desc, charge.bankCode);
+  const journalId = await createJournal({ date: charge.date || todayISO(), description: desc, sourceType, sourceId, lines }, glAccounts);
+  await postJournal(journalId, glAccounts, existingJournals);
+  return { status:'POSTED', journalId };
+}
+
+async function reverseCardCharge(sourceId, glAccounts, existingJournals, reason){
+  const j = (existingJournals||[]).find(j=> j.sourceType==='CARD_CHARGE' && j.sourceId===sourceId && glIsLiveJournal(j));
+  if(j) await reverseJournal(j.id, glAccounts, reason);
+}
+
+// Card bills / card payments that are in the books but whose card charge isn't yet.
+function pendingCardCharges(invoices, payments, journals, currentPct){
+  const live = new Set((journals||[]).filter(glIsLiveJournal).map(j=> j.sourceType + '|' + j.sourceId));
+  const pctOf = (doc)=> doc.cardChargePct!=null ? Number(doc.cardChargePct)||0 : Number(currentPct)||0;
+  const out = [];
+  (invoices||[]).forEach(inv=>{
+    if(inv.payment!=='card' || !live.has('SALE|' + inv.id) || live.has('CARD_CHARGE|' + inv.id) || live.has('BILL_TO_CREDIT|' + inv.id)) return;
+    const amount = invoiceBalanceInfo(inv).paidAmt, pct = pctOf(inv);
+    if(glToCents(cardChargeAmount(amount, pct)) > 0) out.push({ id:inv.id, amount, pct, date: glDocDate(inv), desc: 'Bill ' + (inv.billNo||inv.id), bankCode: inv.cardBankCode });
+  });
+  (payments||[]).forEach(p=>{
+    if(p.method!=='card' || !live.has('CUSTOMER_PAYMENT|' + p.id) || live.has('CARD_CHARGE|' + p.id)) return;
+    const pct = pctOf(p);
+    if(glToCents(cardChargeAmount(p.amount, pct)) > 0) out.push({ id:p.id, amount:Number(p.amount)||0, pct, date: glDocDate(p), desc: 'Card payment — ' + (p.customerName||''), bankCode: p.cardBankCode });
+  });
+  return out;
 }
 
 // Opening-balance entry from the Finance health check: moves one control account (1100 AR,
@@ -2206,7 +2302,8 @@ function validateAPReconciliation(ap){
 // glAccounts (not hard-coded by name), and never invented beyond what already exists.
 const GL_CASH_ACCOUNT_CODES = ['1000','1010'];
 function glCashBankAccounts(glAccounts){
-  return GL_CASH_ACCOUNT_CODES.map(code=> findGlAccountByCode(glAccounts, code)).filter(Boolean);
+  const base = GL_CASH_ACCOUNT_CODES.map(code=> findGlAccountByCode(glAccounts, code)).filter(Boolean);
+  return base.concat(glBankAccounts(glAccounts).filter(a=> !base.includes(a)));
 }
 
 // Classifies a POSTED journal's cash/bank line by its journal's sourceType alone (not by the
@@ -2228,6 +2325,8 @@ function glClassifyCashLine(sourceType){
   if(sourceType==='SALES_RETURN') return { section:'operating', label:'Customer Refunds (Sales Returns)' };
   if(sourceType==='BILL_TO_CREDIT') return { section:'operating', label:'Customer Sales Receipts' };
   if(sourceType==='OPENING_BALANCE') return { section:'financing', label:'Opening Balance Entries' };
+  if(sourceType==='CARD_CHARGE') return { section:'operating', label:'Card / Bank Charges' };
+  if(sourceType==='BANK_TRANSFER') return { section:'transfer', label:'Cash deposits / bank transfers' };
   return null;
 }
 
@@ -2257,6 +2356,7 @@ function computeCashFlow(glAccounts, glJournals, dateFrom, dateTo){
       const row = { date:j.date, journalNo:j.journalNo, description:l.description||j.description,
         sourceType:j.sourceType||'', sourceId:j.sourceId||'', debit, credit, net };
       const classified = glClassifyCashLine(j.sourceType);
+      if(classified && classified.section==='transfer') return; // cash ↔ bank moves net to zero inside Cash & Bank
       if(classified && classified.section==='operating') operatingLines.push({...row, label:classified.label});
       else if(classified && classified.section==='financing') financingLines.push({...row, label:classified.label});
       else unclassifiedLines.push(row);
@@ -2371,7 +2471,7 @@ function computeAccountsHealth(d, asOfDate){
   const bsCheck = validateBalanceSheet(computeBalanceSheet(glAccounts, glJournals, asOfDate));
   const openingPosted = glJournals.some(j=> glIsLiveJournal(j) && j.sourceType==='OPENING_BALANCE');
   return { asOfDate, hasChart: glAccounts.length>0, journalCount: glJournals.length, openingPosted,
-    trialBalance: tbCheck, balanceSheet: bsCheck, cash: bal('1000'), bank: bal('1010'),
+    trialBalance: tbCheck, balanceSheet: bsCheck, cash: bal('1000'), bank: r2(glBankAccounts(glAccounts).reduce((s,a)=> s + bal(a.accountCode), 0)),
     control, unposted, orphans };
 }
 
@@ -3260,6 +3360,7 @@ function CapitalLoans({glAccounts, glJournals, capitalLoanTxns, notify}){
   const [transactionDate,setTransactionDate] = useState(todayISO());
   const [amount,setAmount] = useState('');
   const [paymentMethod,setPaymentMethod] = useState('cash');
+  const [bankCode,setBankCode] = useState('1010');
   const [loanAccountId,setLoanAccountId] = useState('');
   const [interestAccountId,setInterestAccountId] = useState('');
   const [description,setDescription] = useState('');
@@ -3315,6 +3416,7 @@ function CapitalLoans({glAccounts, glJournals, capitalLoanTxns, notify}){
       const acc = glAccounts.find(a=>a.id===accountId);
       const txnRef = await db.collection('capitalLoanTransactions').add({
         transactionNo, transactionDate, transactionType, amount:Number(amount)||0, paymentMethod,
+        ...(paymentMethod==='bank' ? {bankCode} : {}),
         accountId, accountCode:acc.accountCode, accountName:acc.accountName,
         description:description||'', referenceNo:referenceNo||'', notes:notes||'',
         accountingStatus:'PENDING', accountingError:null, journalId:null, createdBy:null,
@@ -3328,7 +3430,7 @@ function CapitalLoans({glAccounts, glJournals, capitalLoanTxns, notify}){
       // transaction stays recorded regardless, and the failure is surfaced + made retryable
       // (Finance tab) rather than silently swallowed — same pattern as every prior step.
       try{
-        const acct = await postCapitalLoanAccounting({id:txnRef.id, transactionNo, transactionDate, transactionType, amount:Number(amount)||0, paymentMethod, accountId, description}, glAccounts, glJournals);
+        const acct = await postCapitalLoanAccounting({id:txnRef.id, transactionNo, transactionDate, transactionType, amount:Number(amount)||0, paymentMethod, ...(paymentMethod==='bank' ? {bankCode} : {}), accountId, description}, glAccounts, glJournals);
         await db.collection('capitalLoanTransactions').doc(txnRef.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null });
         if(acct.status==='POSTED') notify('✓ Accounting posted for ' + transactionNo);
       } catch(err){
@@ -3367,8 +3469,9 @@ function CapitalLoans({glAccounts, glJournals, capitalLoanTxns, notify}){
           <div><label>Date</label><input type="date" value={transactionDate} onChange={e=>setTransactionDate(e.target.value)} /></div>
           <div><label>Amount (Rs.)</label><input type="number" value={amount} onChange={e=>setAmount(e.target.value)} /></div>
           <div><label>Payment Account</label>
-            <select value={paymentMethod} onChange={e=>setPaymentMethod(e.target.value)}>
-              <option value="cash">Cash (1000)</option><option value="bank">Bank (1010)</option>
+            <select value={paymentMethod==='bank' ? 'bank:' + bankCode : 'cash'} onChange={e=>{ const v = e.target.value; if(v==='cash') setPaymentMethod('cash'); else { setPaymentMethod('bank'); setBankCode(v.slice(5)); } }}>
+              <option value="cash">Cash (1000)</option>
+              {glBankAccounts(glAccounts).map(a=> <option key={a.id} value={'bank:' + a.accountCode}>{a.accountName} ({a.accountCode})</option>)}
             </select></div>
 
           {(transactionType==='OWNER_CAPITAL') && (
@@ -3440,6 +3543,119 @@ function CapitalLoans({glAccounts, glJournals, capitalLoanTxns, notify}){
             </tbody>
           </table>
         )}
+      </div>
+    </div>
+  );
+}
+
+
+/* ---------- 🏦 Bank Accounts: add accounts, pick the card account, record deposits / transfers ---------- */
+function BankAccounts({glAccounts, glJournals, notify}){
+  const banks = glBankAccounts(glAccounts);
+  const cashAcc = findGlAccountByCode(glAccounts, '1000');
+  const tb = computeTrialBalance(glAccounts, glJournals, todayISO());
+  const balOf = (a)=>{ const r = tb.rows.find(x=> x.accountId===a.id || x.accountCode===a.accountCode); return r ? Math.round((r.debit - r.credit)*100)/100 : 0; };
+  const [cardCode,setCardCode] = useState(GL_CARD_BANK_CODE);
+  const [newName,setNewName] = useState(''), [newNo,setNewNo] = useState('');
+  const [busy,setBusy] = useState(false);
+  const [dep,setDep] = useState({date: todayISO(), from:'1000', to: GL_CARD_BANK_CODE, amount:'', ref:''});
+  useEffect(()=>{ db.collection('meta').doc('settings').get().then(snap=>{
+    const c = snap.exists && snap.data().cardBankAccountCode; if(c){ setCardCode(String(c)); GL_CARD_BANK_CODE = String(c); }
+  }).catch(()=>{}); },[]);
+
+  const saveCardCode = async (code)=>{
+    setCardCode(code); GL_CARD_BANK_CODE = code;
+    try{ await db.collection('meta').doc('settings').set({cardBankAccountCode: code}, {merge:true});
+      const a = findGlAccountByCode(glAccounts, code); notify('✓ Card payments දැන් යන්නේ ' + code + ' ' + (a ? a.accountName : '') + ' එකට'); }
+    catch(e){ console.error(e); notify('❌ Save වුනේ නැහැ'); }
+  };
+  const addBank = async ()=>{
+    const name = newName.trim();
+    if(!name) return notify('Bank account එකේ නම දෙන්න (e.g. BOC Current)');
+    const code = nextBankAccountCode(glAccounts);
+    if(!code) return notify('තවත් bank accounts දාන්න codes ඉතුරු නැහැ');
+    setBusy(true);
+    try{
+      await db.collection('glAccounts').add({ accountCode: code, accountName: name + (newNo.trim() ? ' — ' + newNo.trim() : ''), accountType:'ASSET',
+        isBank:true, bankAccountNo: newNo.trim(), parentAccountId:null, isActive:true,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(), updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+      setNewName(''); setNewNo(''); notify('✓ ' + code + ' ' + name + ' bank account එක හැදුවා');
+    }catch(e){ console.error(e); notify('❌ Account එක හදන්න බැරි වුණා: ' + (e.message||e)); }
+    setBusy(false);
+  };
+  const renameBank = async (a)=>{
+    const name = window.prompt(a.accountCode + ' account එකේ අලුත් නම (e.g. Commercial Bank — 1234):', a.accountName);
+    if(!name || !name.trim() || name.trim()===a.accountName) return;
+    try{ await db.collection('glAccounts').doc(a.id).update({ accountName: name.trim(), updatedAt: firebase.firestore.FieldValue.serverTimestamp() }); notify('✓ නම වෙනස් කළා'); }
+    catch(e){ console.error(e); notify('❌ නම වෙනස් කරන්න බැරි වුණා'); }
+  };
+  const saveTransfer = async ()=>{
+    const from = findGlAccountByCode(glAccounts, dep.from), to = findGlAccountByCode(glAccounts, dep.to);
+    const desc = (dep.from==='1000' ? 'Cash deposit' : 'Bank transfer') + ' → ' + (to ? to.accountName : dep.to) + (dep.ref.trim() ? ' (slip ' + dep.ref.trim() + ')' : '');
+    let lines;
+    try{ lines = buildBankTransferLines(dep.from, dep.to, Number(dep.amount), glAccounts, desc); }catch(e){ return notify('❌ ' + e.message); }
+    if(dep.from==='1000' && Number(dep.amount) > balOf(cashAcc) + 0.001 &&
+      !window.confirm('Books වල Cash තියෙන්නේ ' + fmt(balOf(cashAcc)) + ' යි — ' + fmt(Number(dep.amount)) + ' deposit කරනවද?')) return;
+    setBusy(true);
+    try{
+      const id = await createJournal({ date: dep.date || todayISO(), description: desc, sourceType:'BANK_TRANSFER', sourceId: 'BT-' + Date.now(), lines }, glAccounts);
+      await postJournal(id, glAccounts, glJournals);
+      notify('✓ ' + fmt(Number(dep.amount)) + ' — ' + (from ? from.accountName : '') + ' → ' + (to ? to.accountName : ''));
+      setDep(d=> ({...d, amount:'', ref:''}));
+    }catch(e){ console.error(e); notify('❌ Save වුනේ නැහැ: ' + (e.message||e)); }
+    setBusy(false);
+  };
+  const recent = (glJournals||[]).filter(j=> j.sourceType==='BANK_TRANSFER' && glIsLiveJournal(j))
+    .sort((a,b)=> (b.date||'').localeCompare(a.date||'') || String(b.journalNo||'').localeCompare(String(a.journalNo||''))).slice(0,20);
+  const nameOf = (id)=>{ const a = (glAccounts||[]).find(x=> x.id===id); return a ? a.accountCode + ' ' + a.accountName : id; };
+  const options = [cashAcc, ...banks].filter(Boolean);
+
+  if(!glAccounts.length) return <div className="card"><div className="empty">මුලින්ම Finance (Setup) එකෙන් Chart of Accounts load කරන්න</div></div>;
+  return (
+    <div data-testid="bank-accounts">
+      <div className="card">
+        <h3>🏦 Bank Accounts — balances (books)</h3>
+        <table><thead><tr><th>Code</th><th>Account</th><th>Balance</th><th>Card payments</th></tr></thead>
+          <tbody>
+            {cashAcc && <tr><td>{cashAcc.accountCode}</td><td>{cashAcc.accountName} (drawer)</td><td>{fmt(balOf(cashAcc))}</td><td></td></tr>}
+            {banks.map(a=> <tr key={a.id}><td>{a.accountCode}</td><td>{a.accountName} <button className="btn btn-ghost btn-sm" title="නම වෙනස් කරන්න" onClick={()=>renameBank(a)}>✏</button></td><td>{fmt(balOf(a))}</td>
+              <td>{a.accountCode===cardCode ? <b>💳 මෙතනට</b> : <button className="btn btn-ghost btn-sm" onClick={()=>saveCardCode(a.accountCode)}>මෙතනට යවන්න</button>}</td></tr>)}
+          </tbody></table>
+        <p style={{fontSize:12.5, color:'var(--ink-soft)', marginBottom:0}}>💳 කියලා තියෙන account එකට card bills, card වලින් ගෙවන ණය, card charges ඔක්කොම යනවා. වෙනස් කළොත් ඊළඟ card bills වල ඉඳන් අලුත් account එකට යනවා.</p>
+      </div>
+
+      <div className="card" style={{background:'var(--teal-100)', border:'1.5px solid var(--teal-500)'}}>
+        <h3>💵 Cash deposit / Bank transfer</h3>
+        <div className="grid c3">
+          <div><label>Date</label><input type="date" value={dep.date} onChange={e=>setDep({...dep, date:e.target.value})} /></div>
+          <div><label>From (සල්ලි ගත්ත තැන)</label>
+            <select data-testid="dep-from" value={dep.from} onChange={e=>setDep({...dep, from:e.target.value})}>
+              {options.map(a=> <option key={a.id} value={a.accountCode}>{a.accountCode} {a.accountName} — {fmt(balOf(a))}</option>)}</select></div>
+          <div><label>To (deposit කරපු bank account එක)</label>
+            <select data-testid="dep-to" value={dep.to} onChange={e=>setDep({...dep, to:e.target.value})}>
+              {options.map(a=> <option key={a.id} value={a.accountCode}>{a.accountCode} {a.accountName}</option>)}</select></div>
+          <div><label>Amount (Rs.)</label><input data-testid="dep-amount" type="number" value={dep.amount} onChange={e=>setDep({...dep, amount:e.target.value})} /></div>
+          <div><label>Slip / Ref No (optional)</label><input value={dep.ref} onChange={e=>setDep({...dep, ref:e.target.value})} /></div>
+          <div style={{display:'flex', alignItems:'flex-end'}}><button className="btn btn-primary" disabled={busy} onClick={saveTransfer}>💾 Save deposit</button></div>
+        </div>
+      </div>
+
+      <div className="card">
+        <h3>➕ අලුත් bank account එකක්</h3>
+        <div className="grid c3">
+          <div><label>Bank / account නම</label><input data-testid="new-bank-name" value={newName} onChange={e=>setNewName(e.target.value)} placeholder="e.g. BOC Current" /></div>
+          <div><label>Account No (optional)</label><input value={newNo} onChange={e=>setNewNo(e.target.value)} placeholder="e.g. 0012345678" /></div>
+          <div style={{display:'flex', alignItems:'flex-end'}}><button className="btn btn-primary" disabled={busy} onClick={addBank}>➕ Add bank account</button></div>
+        </div>
+        <p style={{fontSize:12.5, color:'var(--ink-soft)', marginBottom:0}}>Chart of Accounts එකට ASSET account එකක් විදියට ({nextBankAccountCode(glAccounts)||'—'}) එකතු වෙනවා. පරණ 1010 Bank එක ඒ විදියටම තියෙනවා — ✏ ඔබලා ඒකේ නම (ඔයාගේ bank එකේ නම) දාන්න පුළුවන්.</p>
+      </div>
+
+      <div className="card">
+        <h3>🧾 අන්තිම deposits / transfers</h3>
+        {recent.length===0 ? <div className="empty">තවම deposits නැහැ</div> :
+        <table><thead><tr><th>Date</th><th>JE</th><th>To</th><th>From</th><th>Amount</th><th>Note</th></tr></thead>
+          <tbody>{recent.map(j=>{ const dr = (j.lines||[]).find(l=> Number(l.debit)>0), cr = (j.lines||[]).find(l=> Number(l.credit)>0);
+            return <tr key={j.id}><td>{j.date}</td><td>{j.journalNo}</td><td>{dr && nameOf(dr.accountId)}</td><td>{cr && nameOf(cr.accountId)}</td><td>{fmt(dr ? dr.debit : 0)}</td><td>{j.description}</td></tr>; })}</tbody></table>}
       </div>
     </div>
   );
@@ -3615,11 +3831,11 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
             const it = queue.shift();
             try{
               const acct = await g.post(it, glAccounts, glJournals);
-              await db.collection(g.coll).doc(it.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null, accountingError: null });
+              if(g.coll) await db.collection(g.coll).doc(it.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null, accountingError: null });
             }catch(err){
               failed++; lastError = err.message||String(err);
               console.error('Retry all —', g.label, it.id, err);
-              await db.collection(g.coll).doc(it.id).update({ accountingError: lastError }).catch(()=>{});
+              if(g.coll) await db.collection(g.coll).doc(it.id).update({ accountingError: lastError }).catch(()=>{});
             }
             done++;
             setBulk({label: g.label, done, total, failed});
@@ -3634,6 +3850,15 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
     }
     notify(failed ? ('⚠ ' + (done-failed) + ' posted, ' + failed + ' still failing — ' + lastError) : ('✓ ' + done + ' items posted to the books'));
   };
+  // Card charges (Bank Charges 6500) for card bills / card payments already in the books.
+  const [cardPct,setCardPct] = useState(null);
+  useEffect(()=>{ getCardChargePct().then(setCardPct); },[]);
+  const saveCardPct = async (val)=>{
+    setCardPct(val);
+    try{ await db.collection('meta').doc('settings').set({cardChargePercent:Number(val)||0}, {merge:true}); }catch(e){ console.error(e); notify('❌ Card charge % save වුනේ නැහැ'); }
+  };
+  const pendingCards = cardPct==null ? [] : pendingCardCharges(invoices, payments, glJournals, cardPct);
+  const CARD_GROUP = { label:'Card charges', coll:null, items: ()=> pendingCards, post: postCardChargeAccounting };
   const bulkButton = (groups, label)=>{
     const n = groups.reduce((s,g)=> s + g.items().length, 0);
     if(n===0) return null;
@@ -3749,6 +3974,11 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
           <div>{ok(health.orphans.length===0)} Deleted bills/GRNs still in the books: {health.orphans.length}</div>
           <div>{ok(BULK_GROUPS.every(g=> g.items().length===0))} Failed postings waiting for retry: {BULK_GROUPS.reduce((s,g)=> s + g.items().length, 0)}{bulkButton(BULK_GROUPS, 'Retry all failed')}</div>
           <div>ℹ Cash in books: <b>Rs. {health.cash.toFixed(2)}</b> · Bank in books: <b>Rs. {health.bank.toFixed(2)}</b> — drawer එකේ සල්ලි / bank statement එකත් එක්ක ගලපලා බලන්න.</div>
+          <div data-testid="card-charges">{ok(pendingCards.length===0)} 💳 Card charge
+            <input type="number" step="0.01" value={cardPct==null ? '' : cardPct} onChange={e=>saveCardPct(e.target.value)} style={{width:70, display:'inline-block', margin:'0 4px', padding:'2px 6px'}} />%
+            (bank එක card bill එකෙන් අඩු කරන ගාණ → 6500 Bank Charges) — books වලට තාම නොගිය: {pendingCards.length}
+            {pendingCards.length>0 && <> · Rs. {pendingCards.reduce((s,c)=> s + cardChargeAmount(c.amount, c.pct), 0).toFixed(2)}</>}
+            {bulkButton([CARD_GROUP], 'Post card charges')}</div>
         </div>
         <table data-testid="health-control">
           <thead><tr><th>Account</th><th>Books</th><th>Shop records</th><th>Difference</th><th></th></tr></thead>
@@ -4045,6 +4275,7 @@ function StaffApp({onExit}){
   const [billPrefill,setBillPrefill] = useState(null);
   const [billDrafts,setBillDrafts] = useState([{id:1}]);
   const [activeBillDraftId,setActiveBillDraftId] = useState(1);
+  const [openGroups,setOpenGroups] = useState(()=>{ try{ return JSON.parse(localStorage.getItem('navGroups')||'{}')||{}; }catch(e){ return {}; } });
   const [grnDrafts,setGrnDrafts] = useState([{id:1}]);
   const [activeGrnDraftId,setActiveGrnDraftId] = useState(1);
   const [subGrnDrafts,setSubGrnDrafts] = useState([{id:1}]);
@@ -4131,6 +4362,13 @@ function StaffApp({onExit}){
     });
     return unsub;
   },[]);
+  // Which bank account card money goes to (🏦 Bank Accounts) — read once signed in.
+  useEffect(()=>{
+    if(!user) return;
+    db.collection('meta').doc('settings').get().then(snap=>{
+      if(snap.exists && snap.data().cardBankAccountCode) GL_CARD_BANK_CODE = String(snap.data().cardBankAccountCode);
+    }).catch(e=> console.error('settings read failed', e));
+  },[user]);
 
   const [items] = useCollection('items');
   const [batches] = useCollection('batches');
@@ -4228,6 +4466,7 @@ function StaffApp({onExit}){
     {id:'returns', label:'Returns', ic:'↩️'},
     {id:'opening', label:'Opening Stock', ic:'📥'},
     {id:'stock', label:'Stock', ic:'📋'},
+    {id:'stockaudit', label:'Stock Audit', ic:'🧮'},
     {id:'suppliers', label:'Suppliers', ic:'🚚'},
     {id:'customers', label:'Customers', ic:'👥'},
     {id:'orders', label:'Orders', ic:'🔔', badge:newOrders.length},
@@ -4235,6 +4474,7 @@ function StaffApp({onExit}){
     {id:'reports', label:'Reports', ic:'📈'},
     {id:'cashcontrol', label:'Cash Control', ic:'🧾'},
     {id:'finance', label:'Finance (Setup)', ic:'💰'},
+    {id:'banks', label:'Bank Accounts', ic:'🏦'},
     {id:'ledger', label:'General Ledger', ic:'📖'},
     {id:'trialbalance', label:'Trial Balance', ic:'⚖'},
     {id:'pnl', label:'Profit & Loss', ic:'📊'},
@@ -4246,18 +4486,42 @@ function StaffApp({onExit}){
     {id:'capitalloans', label:'Capital & Loans', ic:'💰'},
     {id:'ai', label:'AI Insights', ic:'🤖'},
   ];
+  // Sidebar groups — Dashboard / New Bill stay on top; the rest fold under a heading. A group opens
+  // when clicked (remembered on this device) and always when it holds the open page.
+  const NAV_GROUPS = [
+    {id:'stockGrp', label:'Stock & Purchasing', ic:'📦', items:['items','purchaseOrders','grn','subgrn','returns','opening','stock','stockaudit','suppliers']},
+    {id:'custGrp', label:'Customers & Orders', ic:'👥', items:['customers','orders','special']},
+    {id:'reportGrp', label:'Reports & Cash', ic:'📈', items:['reports','cashcontrol','ai']},
+    {id:'acctGrp', label:'Accounting', ic:'💰', items:['finance','banks','ledger','trialbalance','pnl','balancesheet','ar','ap','cashflow','expenses','capitalloans']},
+  ];
+  const grouped = new Set(NAV_GROUPS.flatMap(g=> g.items));
+  const navBtn = (n)=> (
+    <button key={n.id} className={"nav-btn"+(tab===n.id?" active":"")} onClick={()=>{setTab(n.id); setSideOpen(false);}}>
+      <span>{n.ic}</span><span style={{flex:1}}>{n.label}</span>
+      {!!n.badge && <span className="tag pending">{n.badge}</span>}
+    </button>
+  );
+  const toggleGroup = (id, isOpen)=> setOpenGroups(o=>{ const next = {...o, [id]: !isOpen}; try{ localStorage.setItem('navGroups', JSON.stringify(next)); }catch(e){} return next; });
 
   return (
     <div className="app">
       {sideOpen && <div className="side-backdrop" onClick={()=>setSideOpen(false)}></div>}
       <div className={"side"+(sideOpen?" open":"")}>
         <div className="brand">Sesanda Pharmacy<small>Staff Portal — {user.name}</small></div>
-        {NAV.map(n=>(
-          <button key={n.id} className={"nav-btn"+(tab===n.id?" active":"")} onClick={()=>{setTab(n.id); setSideOpen(false);}}>
-            <span>{n.ic}</span><span style={{flex:1}}>{n.label}</span>
-            {!!n.badge && <span className="tag pending">{n.badge}</span>}
-          </button>
-        ))}
+        {NAV.filter(n=> !grouped.has(n.id)).map(navBtn)}
+        {NAV_GROUPS.map(g=>{
+          const items = g.items.map(id=> NAV.find(n=> n.id===id)).filter(Boolean);
+          const open = openGroups[g.id]!=null ? openGroups[g.id] : g.items.includes(tab);
+          const badge = items.reduce((s,n)=> s + (n.badge||0), 0);
+          return <div key={g.id}>
+            <button className={"nav-group"+(open?" open":"")} data-labels={'|' + items.map(n=>n.label).join('|') + '|'} onClick={()=>toggleGroup(g.id, open)}>
+              <span>{g.ic}</span><span style={{flex:1}}>{g.label}</span>
+              {!open && badge>0 && <span className="tag pending">{badge}</span>}
+              <span className="chev">▶</span>
+            </button>
+            {open && <div className="nav-sub">{items.map(navBtn)}</div>}
+          </div>;
+        })}
         <div className="side-foot">
           <button onClick={()=>firebase.auth().signOut()}>↩ Sign out</button><br/>
           <button onClick={onExit}>🏠 Home</button>
@@ -4309,6 +4573,7 @@ function StaffApp({onExit}){
           {tab==='returns' && <Returns invoices={invoices} customers={customers} batches={batches} items={items} grns={grns} suppliers={suppliers} salesReturns={salesReturns} grnReturns={grnReturns} glAccounts={glAccounts} glJournals={glJournals} notify={notify}/>}
           {tab==='opening' && <OpeningStock items={items} batches={batches} notify={notify}/>}
           {tab==='stock' && <StockView items={items} batches={batches}/>}
+          {tab==='stockaudit' && <StockAudit items={items} batches={batches} notify={notify} glAccounts={glAccounts} glJournals={glJournals}/>}
           {tab==='suppliers' && <Suppliers suppliers={suppliers} grns={grns} glAccounts={glAccounts} glJournals={glJournals} notify={notify}/>}
           {tab==='customers' && <Customers customers={customers} invoices={invoices} payments={payments} items={items} medReminders={medReminders} notify={notify} glAccounts={glAccounts} glJournals={glJournals} customersLoading={customersLoading} customersError={customersError} invoicesError={invoicesError}/>}
           {tab==='orders' && <OrdersBoard orders={orders} items={items} batches={batches} notify={notify}/>}
@@ -4318,6 +4583,7 @@ function StaffApp({onExit}){
             suppliers={suppliers} expenses={expenses} adjustments={adjustments} salesReturns={salesReturns} grnReturns={grnReturns}
             glAccounts={glAccounts} glJournals={glJournals} customers={customers} payments={payments} notify={notify}/>}
           {tab==='cashcontrol' && <CashControl invoices={invoices} payments={payments} cashChecks={cashChecks} notify={notify} />}
+          {tab==='banks' && <BankAccounts glAccounts={glAccounts} glJournals={glJournals} notify={notify} />}
           {tab==='finance' && <Finance glAccounts={glAccounts} glJournals={glJournals} grns={grns} invoices={invoices} payments={payments} supplierPayments={supplierPayments} expenses={opExpenses} capitalLoanTxns={capitalLoanTxns} batches={batches} customers={customers} salesReturns={salesReturns} grnReturns={grnReturns} notify={notify} />}
           {tab==='ledger' && <GeneralLedger glAccounts={glAccounts} glJournals={glJournals} />}
           {tab==='trialbalance' && <TrialBalance glAccounts={glAccounts} glJournals={glJournals} />}
@@ -5315,8 +5581,9 @@ function buildBillToCreditLines(inv, glAccounts){
   const paid = invoiceBalanceInfo(inv).paidAmt;
   if(glToCents(paid) <= 0) throw new Error('Nothing was recorded as paid on this bill');
   const ar = findGlAccountByCode(glAccounts, '1100');
-  const cash = findGlAccountByCode(glAccounts, inv.payment==='card' ? '1010' : '1000');
-  if(!ar || !cash) throw new Error('Chart of Accounts is missing 1100 / ' + (inv.payment==='card' ? '1010' : '1000'));
+  const cashCode = inv.payment==='card' ? glCardBankCode(inv) : '1000';
+  const cash = findGlAccountByCode(glAccounts, cashCode);
+  if(!ar || !cash) throw new Error('Chart of Accounts is missing 1100 / ' + cashCode);
   const desc = 'Bill ' + (inv.billNo||inv.id) + ' changed from ' + (inv.payment||'cash') + ' to credit';
   return [
     { accountId: ar.id, debit: paid, credit: 0, description: desc },
@@ -5453,9 +5720,10 @@ function Customers({customers, invoices, payments, items, medReminders, notify, 
       const newDue = Math.max(0, (c.dueAmount||0) - actuallyApplied);
       batch.update(db.collection('customers').doc(c.id), {dueAmount:newDue});
       await batch.commit();
+      const payCardPct = method==='card' ? await getCardChargePct() : null;
       const payRef = await db.collection('payments').add({
         customerId:c.id, customerName:c.name, amount:actuallyApplied, method,
-        previousDue:c.dueAmount||0, newDue, appliedTo,
+        previousDue:c.dueAmount||0, newDue, appliedTo, ...(method==='card' ? { cardChargePct: payCardPct, cardBankCode: GL_CARD_BANK_CODE } : {}),
         createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       });
       setPayAmounts(p=>({...p,[c.id]:''}));
@@ -5468,8 +5736,12 @@ function Customers({customers, invoices, payments, items, medReminders, notify, 
       // made retryable (Finance tab → Pending Customer Payment Accounting) rather than silently
       // swallowed or rolled back — same pattern as GRN/Bill accounting in Steps 2/3.
       try{
-        const acct = await postCustomerPaymentAccounting({id:payRef.id, customerId:c.id, customerName:c.name, amount:actuallyApplied, method, date:today}, glAccounts, glJournals);
+        const acct = await postCustomerPaymentAccounting({id:payRef.id, customerId:c.id, customerName:c.name, amount:actuallyApplied, method, date:today, ...(method==='card' ? {cardBankCode: GL_CARD_BANK_CODE} : {})}, glAccounts, glJournals);
         await db.collection('payments').doc(payRef.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null });
+        if(method==='card' && payCardPct>0){
+          try{ await postCardChargeAccounting({ id:payRef.id, amount:actuallyApplied, pct:payCardPct, date:today, desc:'Card payment — ' + c.name, bankCode: GL_CARD_BANK_CODE }, glAccounts, glJournals); }
+          catch(err){ console.error('Card charge accounting failed', err); notify('⚠ Card charge එක books වලට ගියේ නැහැ (' + err.message + ') — Finance tab එකෙන් post කරන්න'); }
+        }
       } catch(err){
         console.error('Customer payment accounting failed', err);
         try{ await db.collection('payments').doc(payRef.id).update({ accountingStatus:'FAILED', accountingError: err.message }); }catch(e2){ console.error(e2); }
@@ -5819,7 +6091,8 @@ function Returns({invoices, customers, batches, items, grns, suppliers, salesRet
       });
       const {update, dueReduction, cashRefundDue} = applySalesReturnToInvoice(foundInvoice, totalRefund);
       const acctRet = { invoiceId: foundInvoice.id, billNo: foundInvoice.billNo, customerName: foundInvoice.customerName,
-        payment: foundInvoice.payment, dueReduction, cashRefund: cashRefundDue, restockCost: +restockCost.toFixed(2), date: todayISO() };
+        payment: foundInvoice.payment, ...(foundInvoice.cardBankCode ? {cardBankCode: foundInvoice.cardBankCode} : {}),
+        dueReduction, cashRefund: cashRefundDue, restockCost: +restockCost.toFixed(2), date: todayISO() };
       for(const r of rows){
         const qty = Number(r.qty);
         const unitPrice = r.item.qty>0 ? r.item.lineTotal/r.item.qty : 0;
@@ -6147,6 +6420,43 @@ async function nextGrnNo(){
   });
 }
 
+// Latest known prices of an item: unit cost from its newest priced stock batch (GRN / opening stock;
+// returned stock is skipped — its cost is the sold bill's), unit sell = the price New Bill charges.
+function itemLastPrices(itemId, batches){
+  const mine = (batches||[]).filter(b=> b.itemId===itemId && Number(b.unitCost) > 0);
+  const newest = (list)=> list.slice().sort((a,b)=> (b.createdAt?.seconds||0) - (a.createdAt?.seconds||0))[0];
+  const last = newest(mine.filter(b=> !b.isReturn)) || newest(mine);
+  return { unitCost: last ? Number(last.unitCost) : 0, unitSell: itemSellPrice(itemId, batches),
+    grnNo: last ? (last.grnNo || (last.isOpeningStock ? 'Opening stock' : '')) : '', expiryDate: last ? (last.expiryDate||'') : '' };
+}
+function LastPriceTag({itemId, batches}){
+  const p = itemLastPrices(itemId, batches);
+  if(!p.unitCost && !p.unitSell) return null;
+  return <span style={{float:'right', fontSize:12, color:'var(--ink-soft)'}}>cost {p.unitCost.toFixed(2)} · sell {p.unitSell.toFixed(2)}</span>;
+}
+function LastPriceNote({itemId, batches, unit, packSize}){
+  const p = itemLastPrices(itemId, batches);
+  const pk = Number(packSize)||0;
+  return (
+    <div data-testid="last-price-note" style={{marginTop:10, padding:'8px 12px', borderRadius:8, background:'var(--card)', fontSize:13.5}}>
+      {(!p.unitCost && !p.unitSell) ? 'මේ item එකට කලින් prices නැහැ (අලුත් item එකක්)' : <>
+        💲 කලින් prices — <b>Unit Cost Rs {p.unitCost.toFixed(2)}</b> · <b>Unit Sell Rs {p.unitSell.toFixed(2)}</b>
+        {pk>1 && <span style={{color:'var(--ink-soft)'}}> (pack {pk}: cost {(p.unitCost*pk).toFixed(2)} · sell {(p.unitSell*pk).toFixed(2)})</span>}
+        {p.grnNo && <span style={{color:'var(--ink-soft)'}}> · {p.grnNo}</span>}
+      </>}
+    </div>
+  );
+}
+
+// Selling at or below cost is almost always a typing slip at GRN (sell price typed into the cost
+// box, or cost = MRP) — it makes COGS equal Sales in the books. Returns the warning text, or null.
+function costPriceWarning(unitCost, unitSell){
+  const c = Number(unitCost)||0, s = Number(unitSell)||0;
+  if(!(c>0) || !(s>0) || s > c) return null;
+  return s===c ? '⚠ Unit Sales price එක Unit Cost එකට සමානයි (Rs ' + c.toFixed(2) + ') — ලාභයක් නැහැ'
+    : '⚠ Unit Sales price එක (Rs ' + s.toFixed(2) + ') Unit Cost එකට (Rs ' + c.toFixed(2) + ') වඩා අඩුයි — පාඩුවට විකුණෙනවා';
+}
+
 function emptyGrnEntry(){
   return {itemId:'', itemCode:'', itemName:'', unit:'', packSize:0, pktQty:'', pktCost:'', pktSales:'', freeQty:'', expiry:'', looseQty:'', barcode:'', qty:'', unitCost:'', unitSales:''};
 }
@@ -6200,6 +6510,10 @@ function GRNEntry({items, batches, suppliers, notify, initialDraft, onDraftChang
       if(!(qtyUnits>0) || entry.unitCost==='' || entry.unitSales==='') return notify('Qty of items, Unit Cost, Unit Sales පුරවන්න');
     } else if(!entry.pktQty || !entry.pktCost || !entry.pktSales) return notify('Pkt Qty, Pkt Cost, Pkt Sales පුරවන්න');
     if(!entry.expiry) return notify('Expire Date එක ඕන');
+    const priceWarn = costPriceWarning(unitCost, unitSales);
+    if(priceWarn && !window.confirm(entry.itemName + '\n\n' + priceWarn + '\n\nCost / Sales මිල හරිද? OK = එහෙමම Add කරන්න · Cancel = ආපහු ගිහින් හදන්න')){
+      notify(priceWarn); return;
+    }
     if(purchaseOrderId && poRemainingMap[entry.itemId]!=null && qtyUnits > poRemainingMap[entry.itemId]){
       const ok = window.confirm('Purchase Order එකේ ඉතිරිව තිබුණේ ' + poRemainingMap[entry.itemId] + ' units විතරයි — ඊට වඩා receive කරනවා. ඉදිරියට යනවද?');
       if(!ok) return;
@@ -6327,7 +6641,7 @@ function GRNEntry({items, batches, suppliers, notify, initialDraft, onDraftChang
 
       <div className="card" style={{background:'var(--teal-100)', border:'1.5px solid var(--teal-500)'}}>
         <h3 style={{color:'var(--accent)'}}>➕ Add Item</h3>
-        <GrnEntryStrip entry={entry} patchEntry={patchEntry} pickItem={pickItem} items={items}
+        <GrnEntryStrip entry={entry} patchEntry={patchEntry} pickItem={pickItem} items={items} batches={batches}
           stockFor={stockFor} qtyUnits={qtyUnits} freeUnits={freeUnits} unitCost={unitCost} unitSales={unitSales}
           entryTotalCost={entryTotalCost} itemSearchRef={itemSearchRef} onAdd={addRow} notify={notify} subMode={subMode} />
         <div style={{display:'flex', gap:10, marginTop:14}}>
@@ -6407,6 +6721,10 @@ function OpeningStock({items, batches, notify}){
     if(!entry.pktQty && !entry.looseQty) return notify('Pkt Qty හෝ Loose units වලින් එකක් වත් දෙන්න');
     if(!entry.unitCost || !entry.unitSell) return notify('Unit Cost, Unit Sell දෙන්න');
     if(!entry.expiry) return notify('Expire Date එක ඕන (දන්නේ නැත්නම් approximate දිනයක් දෙන්න)');
+    const priceWarn = costPriceWarning(entry.unitCost, entry.unitSell);
+    if(priceWarn && !window.confirm(entry.itemName + '\n\n' + priceWarn + '\n\nCost / Sell මිල හරිද? OK = එහෙමම Add කරන්න · Cancel = ආපහු ගිහින් හදන්න')){
+      notify(priceWarn); return;
+    }
     setRows(rs=>[...rs, {...entry, qtyUnits, totalCost: entryTotalCost}]);
     setEntry(emptyOpeningEntry());
     setTimeout(()=> itemSearchRef.current && itemSearchRef.current.focus(), 0);
@@ -6461,7 +6779,7 @@ function OpeningStock({items, batches, notify}){
 
       <div className="card" style={{background:'var(--teal-100)', border:'1.5px solid var(--teal-500)'}}>
         <h3 style={{color:'var(--accent)'}}>➕ Add Item</h3>
-        <OpeningStockEntryStrip entry={entry} patchEntry={patchEntry} pickItem={pickItem} items={items}
+        <OpeningStockEntryStrip entry={entry} patchEntry={patchEntry} pickItem={pickItem} items={items} batches={batches}
           stockFor={stockFor} qtyUnits={qtyUnits} entryTotalCost={entryTotalCost}
           itemSearchRef={itemSearchRef} onAdd={addRow} notify={notify} />
         <div style={{display:'flex', gap:10, marginTop:14}}>
@@ -6507,7 +6825,7 @@ function emptyOpeningEntry(){
   return {itemId:'', itemCode:'', itemName:'', unit:'', packSize:0, pktQty:'', looseQty:'', unitCost:'', unitSell:'', expiry:''};
 }
 
-function OpeningStockEntryStrip({entry, patchEntry, pickItem, items, stockFor, qtyUnits, entryTotalCost, itemSearchRef, onAdd, notify}){
+function OpeningStockEntryStrip({entry, patchEntry, pickItem, items, batches, stockFor, qtyUnits, entryTotalCost, itemSearchRef, onAdd, notify}){
   const [query,setQuery] = useState('');
   const [open,setOpen] = useState(false);
   const [hi,setHi] = useState(0);
@@ -6543,6 +6861,7 @@ function OpeningStockEntryStrip({entry, patchEntry, pickItem, items, stockFor, q
               {matches.map((m,i)=>(
                 <div key={m.id} className={"ac-item"+(i===hi?" hi":"")} onMouseDown={()=>choose(m)}>
                   <b>{m.itemNumber}</b> — {m.brandName} <span style={{color:'var(--ink-soft)'}}>({m.genericName})</span>
+                  <LastPriceTag itemId={m.id} batches={batches} />
                 </div>
               ))}
             </div>
@@ -6551,6 +6870,7 @@ function OpeningStockEntryStrip({entry, patchEntry, pickItem, items, stockFor, q
         <div><label>Expire Date</label>
           <input ref={expRef} type="date" value={entry.expiry} onChange={e=>patchEntry({expiry:e.target.value})} /></div>
       </div>
+      {entry.itemId && <LastPriceNote itemId={entry.itemId} batches={batches} unit={entry.unit} packSize={entry.packSize} />}
 
       <div className="grid c4" style={{marginTop:12}}>
         <div><label>Pack Size (auto)</label><input readOnly style={{background:'var(--card)'}} value={entry.packSize||''} /></div>
@@ -6568,6 +6888,11 @@ function OpeningStockEntryStrip({entry, patchEntry, pickItem, items, stockFor, q
           onKeyDown={e=>{ if(e.key==='Enter'){ e.preventDefault(); expRef.current.focus(); } }} placeholder="e.g. 22.14" /></div>
         <div><label>Total Qty (units)</label><input readOnly style={{background:'var(--card)'}} value={qtyUnits} /></div>
       </div>
+      {costPriceWarning(entry.unitCost, entry.unitSell) && (
+        <div style={{marginTop:10, padding:'8px 12px', borderRadius:8, background:'#fdecea', color:'#b3261e', fontWeight:600, fontSize:13.5}}>
+          {costPriceWarning(entry.unitCost, entry.unitSell)}
+        </div>
+      )}
 
       <div className="grid c3" style={{marginTop:12}}>
         <div><label>Amount (Rs.)</label><input readOnly style={{background:'var(--card)', fontWeight:700}} value={entryTotalCost.toFixed(2)} /></div>
@@ -6576,7 +6901,7 @@ function OpeningStockEntryStrip({entry, patchEntry, pickItem, items, stockFor, q
   );
 }
 
-function GrnEntryStrip({entry, patchEntry, pickItem, items, stockFor, qtyUnits, freeUnits, unitCost, unitSales, entryTotalCost, itemSearchRef, onAdd, notify, showLooseQty, subMode}){
+function GrnEntryStrip({entry, patchEntry, pickItem, items, batches, stockFor, qtyUnits, freeUnits, unitCost, unitSales, entryTotalCost, itemSearchRef, onAdd, notify, showLooseQty, subMode}){
   const [query,setQuery] = useState('');
   const [open,setOpen] = useState(false);
   const [hi,setHi] = useState(0);
@@ -6629,6 +6954,7 @@ function GrnEntryStrip({entry, patchEntry, pickItem, items, stockFor, qtyUnits, 
               {matches.map((m,i)=>(
                 <div key={m.id} className={"ac-item"+(i===hi?" hi":"")} onMouseDown={()=>choose(m)}>
                   <b>{m.itemNumber}</b> — {m.brandName} <span style={{color:'var(--ink-soft)'}}>({m.genericName})</span>
+                  <LastPriceTag itemId={m.id} batches={batches} />
                 </div>
               ))}
             </div>
@@ -6637,6 +6963,7 @@ function GrnEntryStrip({entry, patchEntry, pickItem, items, stockFor, qtyUnits, 
         <div><label>Expire Date</label>
           <input ref={expRef} type="date" value={entry.expiry} onChange={e=>patchEntry({expiry:e.target.value})} /></div>
       </div>
+      {entry.itemId && <LastPriceNote itemId={entry.itemId} batches={batches} unit={entry.unit} packSize={entry.packSize} />}
 
       <div className="grid c2" style={{marginTop:12}}>
         <div>
@@ -6686,6 +7013,11 @@ function GrnEntryStrip({entry, patchEntry, pickItem, items, stockFor, qtyUnits, 
         <div><label>Unit Sales</label><input readOnly style={{background:'var(--card)'}} value={unitSales.toFixed(2)} /></div>
       </div>
       </>)}
+      {costPriceWarning(unitCost, unitSales) && (
+        <div data-testid="grn-price-warning" style={{marginTop:10, padding:'8px 12px', borderRadius:8, background:'#fdecea', color:'#b3261e', fontWeight:600, fontSize:13.5}}>
+          {costPriceWarning(unitCost, unitSales)}
+        </div>
+      )}
 
       <div className="grid c3" style={{marginTop:12}}>
         <div><label>Qty (units)</label><input readOnly style={{background:'var(--card)'}} value={qtyUnits} /></div>
@@ -7353,6 +7685,7 @@ function NewBill({items, batches, customers, invoices, notify, staffUser, prefil
         otherCharges:Number(otherCharges)||0, totalToPay, payment, staffName: staffUser?.name||'',
         // per-bill paid tracking (needed for Sales Report PAID/DUE badge + Customer Credit Ledger + partial cash/card payments)
         paidAmount: payment==='credit' ? 0 : paidAmountEffective, paid: dueToAdd<=0.001,
+        ...(payment==='card' ? { cardChargePct: await getCardChargePct(), cardBankCode: GL_CARD_BANK_CODE } : {}),
         createdAt: firebase.firestore.FieldValue.serverTimestamp(), createdAtMs: Date.now(),
       };
       const invRef = await db.collection('invoices').add(invoiceData);
@@ -7368,6 +7701,11 @@ function NewBill({items, batches, customers, invoices, notify, staffUser, prefil
         const acct = await postSaleAccounting({id:invRef.id, ...invoiceData}, glAccounts, glJournals);
         await db.collection('invoices').doc(invRef.id).update({ accountingStatus: acct.status, journalId: acct.journalId||null });
         if(acct.status==='POSTED') notify('✓ Accounting posted for ' + billNo);
+        if(payment==='card' && invoiceData.cardChargePct>0){
+          try{
+            await postCardChargeAccounting({ id:invRef.id, amount:invoiceData.paidAmount, pct:invoiceData.cardChargePct, date:glDocDate(invoiceData), desc:'Bill ' + billNo, bankCode:invoiceData.cardBankCode }, glAccounts, glJournals);
+          }catch(err){ console.error('Card charge accounting failed', err); notify('⚠ ' + billNo + ' card charge එක books වලට ගියේ නැහැ (' + err.message + ') — Finance tab එකෙන් post කරන්න'); }
+        }
       } catch(err){
         console.error('Bill accounting failed', err);
         try{ await db.collection('invoices').doc(invRef.id).update({ accountingStatus:'FAILED', accountingError: err.message }); }catch(e2){ console.error(e2); }
@@ -7618,27 +7956,306 @@ function BillEntryStrip({entry, patchEntry, pickItem, items, stockFor, entryTota
 }
 
 /* ---------- Stock View ---------- */
+/* ---------- 🧮 Stock Audit (stock count sheet) ----------
+   One row per item + expiry + cost + sell price: batches that differ in any of these are counted
+   separately, so the physical count shows exactly which price/expiry lot is short or over. */
+function buildStockAuditRows(items, batches, selectedIds, includeZero){
+  const pick = selectedIds ? new Set(selectedIds) : null;
+  const r2 = (n)=> Math.round((Number(n)||0)*100)/100;
+  const byKey = {};
+  (batches||[]).forEach(b=>{
+    if(!(Number(b.remainingUnits)>0) || (pick && !pick.has(b.itemId))) return;
+    const key = b.itemId + '|' + (b.expiryDate||'') + '|' + r2(b.unitCost) + '|' + r2(b.unitSell);
+    const row = byKey[key] || (byKey[key] = { key, itemId:b.itemId, expiry:b.expiryDate||'', unitCost:r2(b.unitCost), unitSell:r2(b.unitSell), systemQty:0, batchCodes:[], batchIds:[] });
+    row.systemQty += Number(b.remainingUnits)||0;
+    if(b.id) row.batchIds.push(b.id);
+    if(b.batchCode) row.batchCodes.push(b.batchCode);
+  });
+  const itemById = Object.fromEntries((items||[]).map(it=> [it.id, it]));
+  const rows = Object.values(byKey).filter(r=> itemById[r.itemId]);
+  const withStock = new Set(rows.map(r=> r.itemId));
+  (items||[]).forEach(it=>{
+    if(withStock.has(it.id)) return;
+    if(pick ? pick.has(it.id) : includeZero) rows.push({ key: it.id + '|none', itemId: it.id, expiry:'', unitCost:0, unitSell:0, systemQty:0, batchCodes:[], batchIds:[] });
+  });
+  return rows.map(r=>{ const it = itemById[r.itemId];
+    return { ...r, code: it.itemNumber||'', name: it.brandName||'', generic: it.genericName||'', unit: it.unit||'' }; })
+    .sort((a,b)=> a.name.localeCompare(b.name) || (a.expiry||'9').localeCompare(b.expiry||'9') || a.unitCost - b.unitCost);
+}
+
+// counts: {rowKey: physical qty as typed}. Only rows with a count are compared.
+function stockAuditSummary(rows, counts){
+  let counted = 0, shortQty = 0, overQty = 0, shortCost = 0, overCost = 0, diffSell = 0;
+  const lines = rows.map(r=>{
+    const raw = counts && counts[r.key];
+    if(raw==null || raw==='') return { ...r, physical:null, diff:null };
+    const physical = Number(raw)||0, diff = physical - r.systemQty;
+    counted++;
+    if(diff<0){ shortQty += -diff; shortCost += -diff*r.unitCost; }
+    if(diff>0){ overQty += diff; overCost += diff*r.unitCost; }
+    diffSell += diff*r.unitSell;
+    return { ...r, physical, diff };
+  });
+  const r2 = (n)=> Math.round(n*100)/100;
+  return { lines, counted, total: rows.length, shortQty, overQty, shortCost: r2(shortCost), overCost: r2(overCost),
+    netCost: r2(overCost - shortCost), netSell: r2(diffSell) };
+}
+
+// What applying the counts does: each counted lot's batches are set to the physical qty (a shortage
+// comes off the lot's batches in turn, an excess goes onto its first batch). A lot with no stock
+// batch can't take an excess (no cost/price/expiry known) — it's skipped; add it by GRN / Opening Stock.
+function planStockAuditAdjustment(lines, batches){
+  const byId = Object.fromEntries((batches||[]).map(b=> [b.id, b]));
+  const updates = {}, adjustments = [], skipped = [];
+  let shortCost = 0, overCost = 0;
+  (lines||[]).forEach(l=>{
+    if(l.diff==null || l.diff===0) return;
+    const lot = (l.batchIds||[]).map(id=> byId[id]).filter(Boolean);
+    if(!lot.length){ skipped.push(l); return; }
+    if(l.diff>0){
+      const b = lot[0];
+      updates[b.id] = (updates[b.id]!=null ? updates[b.id] : Number(b.remainingUnits)||0) + l.diff;
+      overCost += l.diff * l.unitCost;
+    } else {
+      let need = -l.diff;
+      for(const b of lot){
+        if(need<=0) break;
+        const cur = updates[b.id]!=null ? updates[b.id] : Number(b.remainingUnits)||0;
+        const take = Math.min(cur, need);
+        updates[b.id] = cur - take; need -= take;
+      }
+      shortCost += (-l.diff - need) * l.unitCost;
+    }
+    adjustments.push({ itemId:l.itemId, itemName:l.name, qty:l.diff, expiry:l.expiry, unitCost:l.unitCost, unitSell:l.unitSell,
+      valueAtCost: Math.round(l.diff * l.unitCost * 100)/100 });
+  });
+  const r2 = (n)=> Math.round(n*100)/100;
+  return { updates: Object.entries(updates).map(([id, remainingUnits])=> ({ id, remainingUnits })), adjustments, skipped,
+    shortCost: r2(shortCost), overCost: r2(overCost), net: r2(overCost - shortCost) };
+}
+
+// Net stock-count difference at cost into the books: a loss DR 6700 Inventory Write-off / CR 1210,
+// a gain the other way round.
+function buildStockAuditLines(net, glAccounts, desc){
+  const wo = findGlAccountByCode(glAccounts, '6700'), inv = findGlAccountByCode(glAccounts, '1210');
+  if(!wo || !inv) throw new Error('Chart of Accounts has no active ' + (!wo ? '6700 Inventory Write-off' : '1210 Pharmacy Inventory') + ' account');
+  const amt = Math.abs(Number(net)||0);
+  if(glToCents(amt) <= 0) return [];
+  return net < 0
+    ? [{ accountId: wo.id, debit: amt, credit: 0, description: desc }, { accountId: inv.id, debit: 0, credit: amt, description: desc }]
+    : [{ accountId: inv.id, debit: amt, credit: 0, description: desc }, { accountId: wo.id, debit: 0, credit: amt, description: desc }];
+}
+
+function stockAuditSheetHtml(summary, meta){
+  const esc = (s)=> String(s==null?'':s).replace(/[&<>"]/g, c=> ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const rows = summary.lines.map((l,i)=> `<tr><td>${i+1}</td><td>${esc(l.name)}<br><small>${esc(l.code)}${l.generic ? ' · ' + esc(l.generic) : ''}</small></td>
+    <td>${esc(l.expiry||'-')}</td><td class="n">${l.unitCost.toFixed(2)}</td><td class="n">${l.unitSell.toFixed(2)}</td>
+    <td class="n">${l.systemQty} ${esc(l.unit)}</td><td class="n phys">${l.physical==null ? '' : l.physical}</td>
+    <td class="n">${l.diff==null ? '' : (l.diff>0 ? '+' : '') + l.diff}</td></tr>`).join('');
+  return `<div class="sheet"><h2>Sesanda Pharmacy — Stock Audit</h2>
+    <p>${esc(meta.date)} · ${esc(meta.scope)} · lines ${summary.total}${summary.counted ? ' · counted ' + summary.counted : ''}</p>
+    <table><thead><tr><th>#</th><th>Item</th><th>Expiry</th><th>Cost</th><th>Sell</th><th>System Qty</th><th>Physical Qty</th><th>Diff</th></tr></thead><tbody>${rows}</tbody></table>
+    ${summary.counted ? `<p class="sum">අඩු: ${summary.shortQty} units · Rs ${summary.shortCost.toFixed(2)} (cost) &nbsp; | &nbsp; වැඩි: ${summary.overQty} units · Rs ${summary.overCost.toFixed(2)} &nbsp; | &nbsp; Net: Rs ${summary.netCost.toFixed(2)} (cost) / Rs ${summary.netSell.toFixed(2)} (sell)</p>` : ''}
+    <p class="sig">Counted by: ____________________ &nbsp;&nbsp; Checked by: ____________________ &nbsp;&nbsp; Date: __________</p></div>`;
+}
+const STOCK_AUDIT_CSS = `.sheet{font-family:Arial,sans-serif; color:#000; background:#fff; padding:14px;}
+  .sheet h2{margin:0 0 4px; font-size:18px;} .sheet p{margin:4px 0; font-size:12px;}
+  .sheet table{width:100%; border-collapse:collapse; font-size:11.5px; margin-top:8px;}
+  .sheet th,.sheet td{border:1px solid #999; padding:4px 5px; text-align:left; vertical-align:top;}
+  .sheet th{background:#eee;} .sheet td.n{text-align:right; white-space:nowrap;} .sheet td.phys{min-width:70px;}
+  .sheet small{color:#555;} .sheet .sum{font-weight:bold; margin-top:8px;} .sheet .sig{margin-top:22px;}`;
+
+function stockAuditCsv(summary){
+  const q = (v)=> '"' + String(v==null?'':v).replace(/"/g,'""') + '"';
+  return [['Item','Code','Generic','Expiry','Unit cost','Unit sell','System qty','Physical qty','Diff','Diff value (cost)','Batches']]
+    .concat(summary.lines.map(l=> [l.name, l.code, l.generic, l.expiry, l.unitCost, l.unitSell, l.systemQty, l.physical, l.diff,
+      l.diff==null ? '' : Math.round(l.diff*l.unitCost*100)/100, l.batchCodes.join(' ')]))
+    .map(r=> r.map(q).join(',')).join('\n');
+}
+
+function StockAudit({items, batches, notify, glAccounts, glJournals}){
+  const saved = (()=>{ try{ return JSON.parse(localStorage.getItem('stockAuditDraft')||'{}')||{}; }catch(e){ return {}; } })();
+  const [mode,setMode] = useState(saved.mode||'select');
+  const [selected,setSelected] = useState(saved.selected||[]);
+  const [includeZero,setIncludeZero] = useState(!!saved.includeZero);
+  const [counts,setCounts] = useState(saved.counts||{});
+  const [q,setQ] = useState(''), [open,setOpen] = useState(false), [hi,setHi] = useState(0);
+  const [onlyDiff,setOnlyDiff] = useState(false);
+  useEffect(()=>{ try{ localStorage.setItem('stockAuditDraft', JSON.stringify({mode, selected, includeZero, counts})); }catch(e){} },[mode, selected, includeZero, counts]);
+
+  const ql = q.trim().toLowerCase();
+  const matches = ql ? items.filter(it=> !selected.includes(it.id) && (String(it.brandName||'').toLowerCase().includes(ql) || String(it.genericName||'').toLowerCase().includes(ql) || String(it.itemNumber||'').toLowerCase().includes(ql))).slice(0,8) : [];
+  const addItem = (it)=>{ setSelected(s=> s.includes(it.id) ? s : [...s, it.id]); setQ(''); setHi(0); };
+  const onKey = (e)=>{
+    if(!matches.length) return;
+    if(e.key==='ArrowDown'){ e.preventDefault(); setHi(h=> Math.min(h+1, matches.length-1)); }
+    else if(e.key==='ArrowUp'){ e.preventDefault(); setHi(h=> Math.max(h-1, 0)); }
+    else if(e.key==='Enter'){ e.preventDefault(); addItem(matches[hi]); }
+  };
+  const rows = buildStockAuditRows(items, batches, mode==='all' ? null : selected, includeZero);
+  const summary = stockAuditSummary(rows, counts);
+  const shown = onlyDiff ? summary.lines.filter(l=> l.diff) : summary.lines;
+  const meta = { date: todayISO(), scope: mode==='all' ? 'All items' : selected.length + ' selected items' };
+  const sheetSummary = onlyDiff ? {...summary, lines: shown, total: shown.length} : summary;
+
+  const print = ()=>{
+    if(!rows.length) return notify('Items තෝරන්න');
+    const w = window.open('', '_blank');
+    if(!w) return notify('Popup block වෙලා — browser එකේ popups allow කරන්න');
+    w.document.write(`<html><head><title>Stock Audit ${meta.date}</title><style>${STOCK_AUDIT_CSS} body{margin:0}</style></head><body>${stockAuditSheetHtml(sheetSummary, meta)}<script>window.print();<\/script></body></html>`);
+    w.document.close();
+  };
+  const share = async ()=>{
+    if(!rows.length) return notify('Items තෝරන්න');
+    if(typeof html2canvas==='undefined') return notify('❌ Image tool එක load වෙලා නැහැ — Print → Save as PDF කරලා යවන්න');
+    const el = document.createElement('div');
+    el.style.cssText = 'position:fixed; left:-10000px; top:0; width:820px; background:#fff;';
+    el.innerHTML = `<style>${STOCK_AUDIT_CSS}</style>` + stockAuditSheetHtml(sheetSummary, meta);
+    document.body.appendChild(el);
+    try{
+      const canvas = await html2canvas(el, {scale:2, backgroundColor:'#ffffff'});
+      const blob = await new Promise(res=> canvas.toBlob(res, 'image/png'));
+      const file = new File([blob], 'stock-audit-' + meta.date + '.png', {type:'image/png'});
+      if(navigator.canShare && navigator.canShare({files:[file]})){
+        try{ await navigator.share({files:[file], title:'Stock Audit ' + meta.date}); return; }
+        catch(err){ if(err && err.name==='AbortError') return; }
+      }
+      const url = URL.createObjectURL(blob), a = document.createElement('a');
+      a.href = url; a.download = file.name; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=> URL.revokeObjectURL(url), 5000);
+      window.open('https://wa.me/?text=' + encodeURIComponent('Stock Audit ' + meta.date + ' — image එක attach කරලා තියෙනවා'), '_blank');
+      notify('📥 Image එක download වුණා — WhatsApp එකේ attach කරන්න');
+    }catch(e){ console.error('stock audit image failed', e); notify('❌ Image හදන්න බැරි වුණා: ' + (e.message||e)); }
+    finally{ el.remove(); }
+  };
+  const csv = ()=>{
+    const url = URL.createObjectURL(new Blob([stockAuditCsv(sheetSummary)], {type:'text/csv'})), a = document.createElement('a');
+    a.href = url; a.download = 'stock-audit-' + meta.date + '.csv'; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=> URL.revokeObjectURL(url), 5000);
+  };
+  const itemName = (id)=> (items.find(it=> it.id===id)||{}).brandName || id;
+  const [applying,setApplying] = useState(false);
+  const plan = planStockAuditAdjustment(summary.lines, batches);
+  const apply = async ()=>{
+    if(!plan.adjustments.length) return notify(plan.skipped.length ? 'Stock batch නැති lines වලට වැඩි ගාණ දාන්න බැහැ — GRN / Opening Stock එකෙන් දාන්න' : 'වෙනසක් තියෙන counts නැහැ');
+    if(!window.confirm('Stock adjustments ' + plan.adjustments.length + 'ක් apply කරන්නද?\n\nඅඩු: ' + fmt(plan.shortCost) + ' (cost)\nවැඩි: ' + fmt(plan.overCost) + ' (cost)\nNet: ' + fmt(plan.net) +
+      (plan.skipped.length ? '\n\n⚠ Stock batch නැති lines ' + plan.skipped.length + 'ක් skip වෙනවා' : '') + '\n\nSystem stock එක physical count එකට සමාන වෙනවා. මේක undo කරන්න බැහැ.')) return;
+    if(!checkAdminPin('Stock audit adjustments apply කරන්න')) return;
+    setApplying(true);
+    const date = todayISO(), ref = 'SA-' + Date.now();
+    try{
+      const wb = db.batch();
+      plan.updates.forEach(u=> wb.update(db.collection('batches').doc(u.id), { remainingUnits: u.remainingUnits }));
+      plan.adjustments.forEach(a=> wb.set(db.collection('adjustments').doc(), { ...a, reason:'Stock audit ' + date, source:'stockAudit', auditRef: ref,
+        date, createdAt: firebase.firestore.FieldValue.serverTimestamp() }));
+      await wb.commit();
+    }catch(e){ console.error('stock audit apply failed', e); setApplying(false); return notify('❌ Stock adjust කරන්න බැරි වුණා: ' + (e.message||e)); }
+    const applied = new Set(summary.lines.filter(l=> l.diff && !plan.skipped.includes(l)).map(l=> l.key));
+    setCounts(c=> Object.fromEntries(Object.entries(c).filter(([k])=> !applied.has(k))));
+    notify('✓ Stock adjust කළා — ' + plan.adjustments.length + ' lines');
+    if(glAccounts && glAccounts.length && glToCents(plan.net)!==0){
+      try{
+        let accounts = glAccounts;
+        if(!findGlAccountByCode(accounts, '6700')){
+          const accRef = await db.collection('glAccounts').add({ accountCode:'6700', accountName:'Inventory Write-off', accountType:'EXPENSE', parentAccountId:null, isActive:true,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp(), updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+          accounts = [...accounts, { id: accRef.id, accountCode:'6700', accountName:'Inventory Write-off', accountType:'EXPENSE', isActive:true }];
+        }
+        const desc = 'Stock audit ' + date + ' — ' + plan.adjustments.length + ' lines (' + (plan.net<0 ? 'shortage' : 'excess') + ')';
+        const id = await createJournal({ date, description: desc, sourceType:'STOCK_AUDIT', sourceId: ref, lines: buildStockAuditLines(plan.net, accounts, desc) }, accounts);
+        await postJournal(id, accounts, glJournals);
+        notify('✓ Books update කළා — ' + fmt(plan.net) + ' (6700 Inventory Write-off)');
+      }catch(err){ console.error('stock audit accounting failed', err); notify('⚠ Stock adjust වුණා, ඒත් books entry එක fail වුණා: ' + err.message); }
+    }
+    setApplying(false);
+  };
+
+  return (
+    <div data-testid="stock-audit">
+      <div className="card">
+        <h3>🧮 Stock Audit — count කරන්න items</h3>
+        <div style={{display:'flex', gap:8, marginBottom:12, flexWrap:'wrap'}}>
+          <button className={"btn btn-sm " + (mode==='select' ? 'btn-primary' : 'btn-ghost')} onClick={()=>setMode('select')}>🔍 තෝරපු items</button>
+          <button className={"btn btn-sm " + (mode==='all' ? 'btn-primary' : 'btn-ghost')} onClick={()=>setMode('all')}>📋 ඔක්කොම items</button>
+        </div>
+        {mode==='select' ? <>
+          <div className="autocomplete">
+            <input data-testid="audit-search" value={q} placeholder="Item නම / generic / code type කරලා Enter (හෝ click)" autoComplete="off"
+              onChange={e=>{ setQ(e.target.value); setOpen(true); setHi(0); }} onKeyDown={onKey} onFocus={()=>setOpen(true)} onBlur={()=>setTimeout(()=>setOpen(false),150)} />
+            {open && matches.length>0 && <div className="ac-list">{matches.map((m,i)=>
+              <div key={m.id} className={"ac-item" + (i===hi ? " hi" : "")} onMouseDown={()=>addItem(m)}>
+                <b>{m.itemNumber}</b> — {m.brandName} <span style={{color:'var(--ink-soft)'}}>({m.genericName})</span></div>)}</div>}
+          </div>
+          <div style={{display:'flex', gap:6, flexWrap:'wrap', marginTop:10}}>
+            {selected.map(id=> <span key={id} className="tag" style={{display:'inline-flex', alignItems:'center', gap:6}}>{itemName(id)}
+              <button className="btn btn-ghost btn-sm" style={{padding:'0 6px'}} onClick={()=>setSelected(s=> s.filter(x=> x!==id))}>✕</button></span>)}
+            {selected.length>0 && <button className="btn btn-ghost btn-sm" onClick={()=>setSelected([])}>🧹 ඔක්කොම අයින් කරන්න</button>}
+          </div>
+        </> : <label style={{display:'flex', gap:8, alignItems:'center', fontSize:13}}>
+          <input type="checkbox" style={{width:'auto'}} checked={includeZero} onChange={e=>setIncludeZero(e.target.checked)} /> Stock 0 items-ත් ගන්න
+        </label>}
+      </div>
+
+      <div className="card">
+        <div style={{display:'flex', gap:8, flexWrap:'wrap', alignItems:'center', marginBottom:12}}>
+          <b style={{flex:1}}>Lines {rows.length} · counted {summary.counted}</b>
+          <label style={{display:'flex', gap:6, alignItems:'center', fontSize:13}}><input type="checkbox" style={{width:'auto'}} checked={onlyDiff} onChange={e=>setOnlyDiff(e.target.checked)} /> වෙනස තියෙන ඒවා විතරක්</label>
+          <button className="btn btn-primary btn-sm" onClick={print}>🖨 Print</button>
+          <button className="btn btn-primary btn-sm" onClick={share}>📲 WhatsApp</button>
+          <button className="btn btn-ghost btn-sm" onClick={csv}>⬇ CSV</button>
+          <button className="btn btn-ghost btn-sm" onClick={()=>{ if(window.confirm('ගහපු physical counts ඔක්කොම මකන්නද?')) setCounts({}); }}>🧹 Counts clear</button>
+          <button className="btn btn-danger btn-sm" disabled={applying || !plan.adjustments.length} onClick={apply}>{applying ? 'Applying…' : '✅ Apply adjustments (' + plan.adjustments.length + ')'}</button>
+        </div>
+        {plan.adjustments.length>0 && <div style={{fontSize:12.5, color:'var(--ink-soft)', marginBottom:10}}>
+          ✅ Apply කළාම system stock එක physical count එකට සමාන වෙනවා, වෙනස ({fmt(plan.net)} at cost) books වල 6700 Inventory Write-off එකට යනවා. Count කරලා ඉවර වුණු ගමන් — අලුත් bills දාන්න කලින් — apply කරන්න.</div>}
+        {summary.counted>0 && <div className="grid c4" style={{marginBottom:12}} data-testid="audit-summary">
+          <div className="card" style={{margin:0}}><div style={{fontSize:12.5, color:'var(--ink-soft)'}}>අඩු (shortage)</div><div style={{fontSize:18, fontWeight:700, color:'var(--red)'}}>{fmt(summary.shortCost)}</div><div style={{fontSize:12, color:'var(--ink-soft)'}}>{summary.shortQty} units · cost</div></div>
+          <div className="card" style={{margin:0}}><div style={{fontSize:12.5, color:'var(--ink-soft)'}}>වැඩි (excess)</div><div style={{fontSize:18, fontWeight:700}}>{fmt(summary.overCost)}</div><div style={{fontSize:12, color:'var(--ink-soft)'}}>{summary.overQty} units · cost</div></div>
+          <div className="card" style={{margin:0}}><div style={{fontSize:12.5, color:'var(--ink-soft)'}}>Net වෙනස (cost)</div><div style={{fontSize:18, fontWeight:700}}>{fmt(summary.netCost)}</div><div style={{fontSize:12, color:'var(--ink-soft)'}}>ලාභයට බලපාන ගාණ</div></div>
+          <div className="card" style={{margin:0}}><div style={{fontSize:12.5, color:'var(--ink-soft)'}}>Net වෙනස (sell price)</div><div style={{fontSize:18, fontWeight:700}}>{fmt(summary.netSell)}</div><div style={{fontSize:12, color:'var(--ink-soft)'}}>විකුණුවා නම් ලැබෙන ගාණ</div></div>
+        </div>}
+        {rows.length===0 ? <div className="empty">{mode==='select' ? 'උඩින් items search කරලා add කරන්න' : 'Stock තියෙන items නැහැ'}</div> :
+        <div style={{overflowX:'auto'}}><table>
+          <thead><tr><th>#</th><th>Item</th><th>Expiry</th><th>Cost</th><th>Sell</th><th>System Qty</th><th>Physical Qty</th><th>Diff</th><th>Diff (cost)</th></tr></thead>
+          <tbody>{shown.map((l,i)=> <tr key={l.key}>
+            <td>{i+1}</td><td>{l.name}<div style={{fontSize:11.5, color:'var(--ink-soft)'}}>{l.code}{l.generic ? ' · ' + l.generic : ''}</div></td>
+            <td>{l.expiry||'—'}</td><td>{l.unitCost.toFixed(2)}</td><td>{l.unitSell.toFixed(2)}</td><td>{l.systemQty} {l.unit}</td>
+            <td><input type="number" min="0" data-testid={'count-' + l.key} value={counts[l.key]==null ? '' : counts[l.key]} style={{width:90}}
+              onChange={e=>{ const v = e.target.value; setCounts(c=>{ const n = {...c}; if(v==='') delete n[l.key]; else n[l.key] = v; return n; }); }} /></td>
+            <td style={{color: l.diff<0 ? 'var(--red)' : l.diff>0 ? 'var(--green)' : undefined, fontWeight: l.diff ? 700 : 400}}>{l.diff==null ? '' : (l.diff>0 ? '+' : '') + l.diff}</td>
+            <td>{l.diff ? fmt(l.diff*l.unitCost) : ''}</td></tr>)}</tbody>
+        </table></div>}
+      </div>
+    </div>
+  );
+}
+
 function StockView({items, batches}){
-  const rows = items.map(it=>{
+  const [q,setQ] = useState('');
+  const ql = q.trim().toLowerCase();
+  const rows = items.filter(it=> !ql || String(it.brandName||'').toLowerCase().includes(ql) || String(it.genericName||'').toLowerCase().includes(ql) || String(it.itemNumber||'').toLowerCase().includes(ql)).map(it=>{
     const bs = batches.filter(b=>b.itemId===it.id);
     const rem = bs.reduce((s,b)=>s+(b.remainingUnits||0),0);
     const nearestExpiry = bs.filter(b=>b.remainingUnits>0).map(b=>b.expiryDate).sort()[0];
-    return {...it, rem, batchCount:bs.length, nearestExpiry};
+    return {...it, rem, batchCount:bs.length, nearestExpiry, prices: itemLastPrices(it.id, batches)};
   }).sort((a,b)=>a.brandName<b.brandName?-1:1);
 
   return (
     <div className="card">
       <h3>📋 Current Stock</h3>
-      {rows.length===0? <div className="empty">Stock data නැහැ</div> :
+      <input data-testid="stock-search" value={q} onChange={e=>setQ(e.target.value)} placeholder="🔍 Item name / generic / code type කරන්න — prices බලන්න" style={{marginBottom:12}} />
+      {rows.length===0? <div className="empty">{ql ? 'ඒ නමින් item එකක් නැහැ' : 'Stock data නැහැ'}</div> :
       <table>
-        <thead><tr><th>Code</th><th>Brand</th><th>Generic</th><th>Batches</th><th>Units Left</th><th>Nearest Expiry</th><th>Status</th></tr></thead>
+        <thead><tr><th>Code</th><th>Brand</th><th>Generic</th><th>Batches</th><th>Units Left</th><th>Unit Cost</th><th>Unit Sell</th><th>Nearest Expiry</th><th>Status</th></tr></thead>
         <tbody>
           {rows.map(r=>{
             const status = r.rem===0? 'out' : r.rem<=20 ? 'low' : 'ok';
             return (
               <tr key={r.id}>
                 <td>{r.itemNumber}</td><td>{r.brandName}</td><td>{r.genericName}</td>
-                <td>{r.batchCount}</td><td>{r.rem} {r.unit}</td><td>{r.nearestExpiry||'—'}</td>
+                <td>{r.batchCount}</td><td>{r.rem} {r.unit}</td>
+                <td>{r.prices.unitCost ? r.prices.unitCost.toFixed(2) : '—'}</td><td>{r.prices.unitSell ? r.prices.unitSell.toFixed(2) : '—'}</td>
+                <td>{r.nearestExpiry||'—'}</td>
                 <td><span className={"tag "+status}>{status==='ok'?'In stock':status==='low'?'Low':'Out'}</span></td>
               </tr>
             );
@@ -7783,6 +8400,373 @@ function StaffSpecialOrders({specialOrders, notify, onConvertToInvoice}){
 }
 
 /* ---------- Reports: Sales / Purchasing / Item Ledger / P&L / Expired Write-Off ---------- */
+/* ---------- Reports → 📊 Charts ----------
+   Pure builders (unit tested) + two small SVG/HTML chart components. Sales = what bills charged
+   (totalToPay) less sales returns; cost = each line's locked-in batch cost; gross profit = the rest. */
+const CHART_COST = '#3987e5', CHART_PROFIT = '#199e70';
+
+// Daily buckets for ranges up to 62 days, monthly beyond. Dates are 'YYYY-MM-DD' strings.
+function chartBuckets(fromDate, toDate){
+  if(!fromDate || !toDate || fromDate > toDate) return { unit:'day', buckets:[] };
+  const toUTC = (s)=> Date.UTC(+s.slice(0,4), +s.slice(5,7)-1, +s.slice(8,10));
+  const iso = (ms)=> new Date(ms).toISOString().slice(0,10);
+  const days = Math.round((toUTC(toDate) - toUTC(fromDate)) / 86400000) + 1;
+  const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const buckets = [];
+  if(days <= 62){
+    for(let ms = toUTC(fromDate); ms <= toUTC(toDate); ms += 86400000){
+      const d = iso(ms);
+      buckets.push({ key:d, label: +d.slice(8,10) + ' ' + MON[+d.slice(5,7)-1] });
+    }
+    return { unit:'day', buckets };
+  }
+  let y = +fromDate.slice(0,4), m = +fromDate.slice(5,7);
+  const endKey = toDate.slice(0,7);
+  for(;;){
+    const key = y + '-' + String(m).padStart(2,'0');
+    buckets.push({ key, label: MON[m-1] + ' ' + String(y).slice(2) });
+    if(key >= endKey) break;
+    m++; if(m>12){ m=1; y++; }
+  }
+  return { unit:'month', buckets };
+}
+
+// invoices / salesReturns → one row per bucket {key,label,sales,cost,profit,bills}.
+// dayOf(inv) gives the bill's local 'YYYY-MM-DD'; lineCost(line) its cost.
+function buildSalesTrend(invoices, salesReturns, fromDate, toDate, dayOf, lineCost){
+  const { unit, buckets } = chartBuckets(fromDate, toDate);
+  const rows = buckets.map(b=> ({ ...b, sales:0, cost:0, profit:0, bills:0 }));
+  const byKey = Object.fromEntries(rows.map(r=> [r.key, r]));
+  const keyOf = (d)=> d && d>=fromDate && d<=toDate ? (unit==='day' ? d : d.slice(0,7)) : null;
+  (invoices||[]).forEach(inv=>{
+    const r = byKey[keyOf(dayOf(inv))]; if(!r) return;
+    r.sales += Number(inv.totalToPay)||0;
+    r.cost += (inv.items||[]).reduce((s,l)=> s + (Number(lineCost(l))||0), 0);
+    r.bills += 1;
+  });
+  (salesReturns||[]).forEach(ret=>{
+    const r = byKey[keyOf(ret.date)]; if(!r) return;
+    r.sales -= Number(ret.refundAmount)||0;
+    r.cost -= Number(ret.costImpact)||0;
+  });
+  rows.forEach(r=>{ r.sales = Math.round(r.sales*100)/100; r.cost = Math.round(Math.max(0, r.cost)*100)/100; r.profit = Math.round((r.sales - r.cost)*100)/100; });
+  return { unit, rows };
+}
+
+// Top items in the bills given: [{name, sales, cost, profit, qty}] sorted by `by` ('sales'|'profit').
+function buildTopItems(invoices, lineCost, by, n){
+  const map = {};
+  (invoices||[]).forEach(inv=> (inv.items||[]).forEach(l=>{
+    const k = l.itemId || l.brandName; if(!k) return;
+    const r = map[k] || (map[k] = { name: l.brandName || k, sales:0, cost:0, qty:0 });
+    r.sales += Number(l.lineTotal) || (Number(l.unitPrice)||0)*(Number(l.qty)||0);
+    r.cost += Number(lineCost(l))||0;
+    r.qty += Number(l.qty)||0;
+  }));
+  return Object.values(map).map(r=> ({ ...r, profit: r.sales - r.cost }))
+    .sort((a,b)=> (b[by]||0) - (a[by]||0)).slice(0, n||10);
+}
+
+// Bill totals by how they were paid.
+function buildPaymentMix(invoices){
+  const names = { cash:'Cash', card:'Card', credit:'Credit (ණය)' };
+  const map = {};
+  (invoices||[]).forEach(inv=>{
+    const k = names[inv.payment] ? inv.payment : 'cash';
+    const r = map[k] || (map[k] = { key:k, name:names[k], value:0, bills:0 });
+    r.value += Number(inv.totalToPay)||0; r.bills += 1;
+  });
+  return ['cash','card','credit'].filter(k=> map[k]).map(k=> map[k]);
+}
+
+// Stock still on the shelf by expiry month (value at cost), from today for `months` months;
+// already-expired stock is one row in front.
+function buildExpiryValue(batches, today, months){
+  const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  let y = +today.slice(0,4), m = +today.slice(5,7);
+  const rows = [{ key:'expired', name:'Expired', value:0, units:0 }];
+  for(let i=0;i<months;i++){
+    rows.push({ key: y + '-' + String(m).padStart(2,'0'), name: MON[m-1] + ' ' + y, value:0, units:0 });
+    m++; if(m>12){ m=1; y++; }
+  }
+  const byKey = Object.fromEntries(rows.map(r=> [r.key, r]));
+  (batches||[]).forEach(b=>{
+    const units = Number(b.remainingUnits)||0;
+    if(units<=0 || !b.expiryDate) return;
+    const r = b.expiryDate < today ? byKey.expired : byKey[b.expiryDate.slice(0,7)];
+    if(!r) return;
+    r.value += units * (Number(b.unitCost)||0); r.units += units;
+  });
+  return rows;
+}
+
+function chartNiceMax(v){
+  if(!(v>0)) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v))), f = v / p;
+  return (f<=1 ? 1 : f<=2 ? 2 : f<=2.5 ? 2.5 : f<=5 ? 5 : 10) * p;
+}
+const chartShort = (n)=> { const a = Math.abs(n); return a>=1e6 ? (n/1e6).toFixed(a>=1e7?0:1)+'M' : a>=1e3 ? (n/1e3).toFixed(a>=1e4?0:1)+'k' : String(Math.round(n)); };
+
+// Stacked vertical bars: cost (bottom) + gross profit (top) = sales. A loss day shows cost only,
+// with the loss in the tooltip. Hover any column for its figures.
+function SalesTrendChart({rows}){
+  const [hi,setHi] = useState(null);
+  const W = 720, H = 240, L = 44, R = 8, T = 10, B = 26;
+  const max = chartNiceMax(Math.max(...rows.map(r=> Math.max(r.sales, r.cost)), 0));
+  const pw = (W-L-R) / Math.max(1, rows.length), bw = Math.max(3, Math.min(28, pw*0.62));
+  const y = (v)=> T + (H-T-B) * (1 - v/max);
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map(f=> f*max);
+  const every = Math.ceil(rows.length / 10);
+  const topRounded = (x, y0, w, h, r)=>{ r = Math.min(r, h, w/2); return `M${x},${y0+h} V${y0+r} Q${x},${y0} ${x+r},${y0} H${x+w-r} Q${x+w},${y0} ${x+w},${y0+r} V${y0+h} Z`; };
+  const h = hi!=null ? rows[hi] : null;
+  return (
+    <div style={{position:'relative'}}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{width:'100%', height:'auto', display:'block'}} role="img" aria-label="Sales, cost and gross profit over time">
+        {ticks.map((t,i)=> <g key={i}>
+          <line x1={L} x2={W-R} y1={y(t)} y2={y(t)} stroke="var(--line)" strokeWidth="1" />
+          <text x={L-6} y={y(t)+4} textAnchor="end" fontSize="11" fill="var(--ink-soft)">{chartShort(t)}</text>
+        </g>)}
+        {rows.map((r,i)=>{
+          const x = L + pw*i + (pw-bw)/2;
+          const cost = Math.max(0, r.cost), profit = Math.max(0, r.sales - r.cost);
+          const yc = y(cost), yp = y(cost + profit);
+          const fade = hi!=null && hi!==i ? 0.45 : 1;
+          return <g key={r.key} opacity={fade}>
+            {cost>0 && (profit>0
+              ? <rect x={x} y={yc} width={bw} height={y(0)-yc} fill={CHART_COST} />
+              : <path d={topRounded(x, yc, bw, y(0)-yc, 4)} fill={CHART_COST} />)}
+            {profit>0 && <path d={topRounded(x, yp, bw, Math.max(0, yc-yp-(cost>0?2:0)), 4)} fill={CHART_PROFIT} />}
+            {i % every===0 && <text x={L + pw*i + pw/2} y={H-8} textAnchor="middle" fontSize="11" fill="var(--ink-soft)">{r.label}</text>}
+            <rect x={L + pw*i} y={T} width={pw} height={H-T-B} fill="transparent"
+              onMouseEnter={()=>setHi(i)} onMouseLeave={()=>setHi(null)} onClick={()=>setHi(i)} />
+          </g>;
+        })}
+        <line x1={L} x2={W-R} y1={y(0)} y2={y(0)} stroke="var(--ink-soft)" strokeWidth="1" />
+      </svg>
+      {h && (
+        <div style={{position:'absolute', top:4, left: `${Math.min(70, Math.max(0, (L + pw*hi)/W*100 - 10))}%`, background:'var(--bg)', border:'1px solid var(--line)',
+          borderRadius:8, padding:'8px 10px', fontSize:12.5, pointerEvents:'none', minWidth:170, boxShadow:'0 4px 14px rgba(0,0,0,.35)'}}>
+          <div style={{fontWeight:700, marginBottom:4}}>{h.label}</div>
+          <div>Sales: <b>{fmt(h.sales)}</b></div>
+          <div><span style={{display:'inline-block', width:9, height:9, borderRadius:2, background:CHART_COST, marginRight:6}} />Cost: {fmt(h.cost)}</div>
+          <div><span style={{display:'inline-block', width:9, height:9, borderRadius:2, background:CHART_PROFIT, marginRight:6}} />{h.profit<0 ? 'Loss' : 'Gross profit'}: {fmt(h.profit)}</div>
+          <div style={{color:'var(--ink-soft)'}}>{h.sales>0 ? (h.profit/h.sales*100).toFixed(1)+'% margin · ' : ''}{h.bills} bills</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Horizontal bars, each directly labelled — rows: [{name, value, note}].
+function HBarList({rows, color, valueFmt, empty}){
+  const max = Math.max(0, ...rows.map(r=> r.value));
+  if(!rows.length || !(max>0)) return <div className="empty">{empty || 'Data නැහැ'}</div>;
+  return (
+    <div style={{display:'grid', gap:8}}>
+      {rows.map((r,i)=>(
+        <div key={r.key || r.name + i} title={r.name + ' — ' + (valueFmt||fmt)(r.value) + (r.note ? ' · ' + r.note : '')}>
+          <div style={{display:'flex', justifyContent:'space-between', gap:8, fontSize:13, marginBottom:3}}>
+            <span style={{overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap'}}>{r.name}</span>
+            <span style={{whiteSpace:'nowrap'}}><b>{(valueFmt||fmt)(r.value)}</b>{r.note && <span style={{color:'var(--ink-soft)'}}> · {r.note}</span>}</span>
+          </div>
+          <div style={{height:10, background:'var(--line)', borderRadius:4}}>
+            <div style={{height:10, width: Math.max(1, r.value/max*100)+'%', background: color || CHART_COST, borderRadius:4}} />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ---------- Charts → 🔎 Item analysis ---------- */
+// Every priced stock intake of an item, oldest first: [{date, unitCost, unitSell, source}].
+// Date = the GRN's bill date, else the opening-stock date, else when the batch was saved.
+// Returned stock is skipped (it carries the sold bill's price, not a new purchase price).
+function buildItemPriceHistory(itemId, batches, grns){
+  const grnDate = Object.fromEntries((grns||[]).map(g=> [g.id, g.date]));
+  return (batches||[]).filter(b=> b.itemId===itemId && !b.isReturn && (Number(b.unitCost)>0 || Number(b.unitSell)>0)).map(b=>({
+    date: (b.grnId && grnDate[b.grnId]) || b.openingDate || (b.createdAt?.seconds ? localDateStr(new Date(b.createdAt.seconds*1000)) : ''),
+    unitCost: Number(b.unitCost)||0, unitSell: Number(b.unitSell)||0,
+    source: b.grnNo || (b.isOpeningStock ? 'Opening stock' : b.batchCode || ''),
+  })).filter(p=> p.date).sort((a,b)=> a.date<b.date ? -1 : a.date>b.date ? 1 : 0);
+}
+
+// Units of an item sold per month, for the `months` months up to `today`.
+function buildItemMonthlyUnits(itemId, invoices, dayOf, today, months){
+  const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  let y = +today.slice(0,4), m = +today.slice(5,7);
+  const rows = [];
+  for(let i=0;i<months;i++){
+    rows.unshift({ key: y + '-' + String(m).padStart(2,'0'), label: MON[m-1] + ' ' + String(y).slice(2), units:0, sales:0 });
+    m--; if(m<1){ m=12; y--; }
+  }
+  const byKey = Object.fromEntries(rows.map(r=> [r.key, r]));
+  (invoices||[]).forEach(inv=>{
+    const r = byKey[(dayOf(inv)||'').slice(0,7)]; if(!r) return;
+    (inv.items||[]).forEach(l=>{ if(l.itemId!==itemId) return;
+      r.units += Number(l.qty)||0; r.sales += Number(l.lineTotal) || (Number(l.unitPrice)||0)*(Number(l.qty)||0); });
+  });
+  return rows;
+}
+
+// Brands of one generic, compared on the bills given: [{itemId, name, units, sales, cost, profit}] by profit.
+function buildGenericComparison(generic, items, invoices, lineCost){
+  const g = String(generic||'').trim().toLowerCase();
+  if(!g) return [];
+  const mine = (items||[]).filter(it=> String(it.genericName||'').trim().toLowerCase()===g);
+  const map = Object.fromEntries(mine.map(it=> [it.id, { itemId:it.id, name:it.brandName, units:0, sales:0, cost:0 }]));
+  (invoices||[]).forEach(inv=> (inv.items||[]).forEach(l=>{
+    const r = map[l.itemId]; if(!r) return;
+    r.units += Number(l.qty)||0;
+    r.sales += Number(l.lineTotal) || (Number(l.unitPrice)||0)*(Number(l.qty)||0);
+    r.cost += Number(lineCost(l))||0;
+  }));
+  return Object.values(map).map(r=> ({ ...r, profit: r.sales - r.cost })).sort((a,b)=> b.profit - a.profit || b.sales - a.sales);
+}
+
+// Cost and sell price at each stock intake — two lines on one Rs axis, markers on every point.
+function PriceHistoryChart({points}){
+  const [hi,setHi] = useState(null);
+  const W = 720, H = 220, L = 48, R = 12, T = 12, B = 26;
+  const max = chartNiceMax(Math.max(...points.map(p=> Math.max(p.unitCost, p.unitSell)), 0));
+  const step = points.length>1 ? (W-L-R)/(points.length-1) : 0;
+  const x = (i)=> points.length>1 ? L + step*i : (L + W - R)/2;
+  const y = (v)=> T + (H-T-B) * (1 - v/max);
+  const path = (k)=> points.map((p,i)=> (i?'L':'M') + x(i) + ',' + y(p[k])).join(' ');
+  const every = Math.ceil(points.length / 8);
+  const h = hi!=null ? points[hi] : null;
+  return (
+    <div style={{position:'relative'}}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{width:'100%', height:'auto', display:'block'}} role="img" aria-label="Unit cost and unit sell price at each stock intake">
+        {[0,0.25,0.5,0.75,1].map((f,i)=> <g key={i}>
+          <line x1={L} x2={W-R} y1={y(f*max)} y2={y(f*max)} stroke="var(--line)" strokeWidth="1" />
+          <text x={L-6} y={y(f*max)+4} textAnchor="end" fontSize="11" fill="var(--ink-soft)">{chartShort(f*max)}</text>
+        </g>)}
+        {hi!=null && <line x1={x(hi)} x2={x(hi)} y1={T} y2={H-B} stroke="var(--ink-soft)" strokeWidth="1" strokeDasharray="3 3" />}
+        <path d={path('unitCost')} fill="none" stroke={CHART_COST} strokeWidth="2" />
+        <path d={path('unitSell')} fill="none" stroke={CHART_PROFIT} strokeWidth="2" />
+        {points.map((p,i)=> <g key={i}>
+          <circle cx={x(i)} cy={y(p.unitCost)} r={hi===i?5:4} fill={CHART_COST} stroke="var(--card)" strokeWidth="2" />
+          <circle cx={x(i)} cy={y(p.unitSell)} r={hi===i?5:4} fill={CHART_PROFIT} stroke="var(--card)" strokeWidth="2" />
+          {(i % every===0 || i===points.length-1) && (points.length<2 || i===points.length-1 || i+every<points.length) && <text x={x(i)} y={H-8} fontSize="11" fill="var(--ink-soft)"
+            textAnchor={points.length<2 ? 'middle' : i===0 ? 'start' : i===points.length-1 ? 'end' : 'middle'}>{p.date}</text>}
+          <rect x={x(i) - Math.max(step,24)/2} y={T} width={Math.max(step,24)} height={H-T-B} fill="transparent"
+            onMouseEnter={()=>setHi(i)} onMouseLeave={()=>setHi(null)} onClick={()=>setHi(i)} />
+        </g>)}
+      </svg>
+      {h && (
+        <div style={{position:'absolute', top:4, left:`${Math.min(70, Math.max(0, x(hi)/W*100 - 10))}%`, background:'var(--bg)', border:'1px solid var(--line)',
+          borderRadius:8, padding:'8px 10px', fontSize:12.5, pointerEvents:'none', minWidth:160, boxShadow:'0 4px 14px rgba(0,0,0,.35)'}}>
+          <div style={{fontWeight:700, marginBottom:4}}>{h.date} · {h.source}</div>
+          <div><span style={{display:'inline-block', width:9, height:9, borderRadius:2, background:CHART_COST, marginRight:6}} />Unit cost: Rs {h.unitCost.toFixed(2)}</div>
+          <div><span style={{display:'inline-block', width:9, height:9, borderRadius:2, background:CHART_PROFIT, marginRight:6}} />Unit sell: Rs {h.unitSell.toFixed(2)}</div>
+          <div style={{color:'var(--ink-soft)'}}>{h.unitSell>0 ? ((h.unitSell-h.unitCost)/h.unitSell*100).toFixed(1) + '% margin' : ''}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Single-series vertical bars with a hover tooltip — rows: [{key, label, value, tip}].
+function SimpleBarChart({rows, color, valueLabel}){
+  const [hi,setHi] = useState(null);
+  const W = 720, H = 200, L = 40, R = 8, T = 20, B = 26;
+  const max = chartNiceMax(Math.max(...rows.map(r=> r.value), 0));
+  const pw = (W-L-R)/Math.max(1, rows.length), bw = Math.max(3, Math.min(30, pw*0.62));
+  const y = (v)=> T + (H-T-B) * (1 - v/max);
+  const top = Math.max(...rows.map(r=> r.value));
+  const h = hi!=null ? rows[hi] : null;
+  return (
+    <div style={{position:'relative'}}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{width:'100%', height:'auto', display:'block'}} role="img" aria-label={valueLabel}>
+        {[0,0.5,1].map((f,i)=> <g key={i}>
+          <line x1={L} x2={W-R} y1={y(f*max)} y2={y(f*max)} stroke="var(--line)" strokeWidth="1" />
+          <text x={L-6} y={y(f*max)+4} textAnchor="end" fontSize="11" fill="var(--ink-soft)">{chartShort(f*max)}</text>
+        </g>)}
+        {rows.map((r,i)=>{
+          const bx = L + pw*i + (pw-bw)/2, by = y(r.value), bh = y(0)-by, rr = Math.min(4, bh, bw/2);
+          return <g key={r.key} opacity={hi!=null && hi!==i ? 0.45 : 1}>
+            {r.value>0 && <path d={`M${bx},${by+bh} V${by+rr} Q${bx},${by} ${bx+rr},${by} H${bx+bw-rr} Q${bx+bw},${by} ${bx+bw},${by+rr} V${by+bh} Z`} fill={color||CHART_COST} />}
+            {r.value>0 && r.value===top && <text x={bx+bw/2} y={by-4} textAnchor="middle" fontSize="11" fill="var(--ink)">{chartShort(r.value)}</text>}
+            <text x={L + pw*i + pw/2} y={H-8} textAnchor="middle" fontSize="11" fill="var(--ink-soft)">{r.label}</text>
+            <rect x={L + pw*i} y={T} width={pw} height={H-T-B} fill="transparent" onMouseEnter={()=>setHi(i)} onMouseLeave={()=>setHi(null)} onClick={()=>setHi(i)} />
+          </g>;
+        })}
+        <line x1={L} x2={W-R} y1={y(0)} y2={y(0)} stroke="var(--ink-soft)" strokeWidth="1" />
+      </svg>
+      {h && (
+        <div style={{position:'absolute', top:4, left:`${Math.min(72, Math.max(0, (L + pw*hi)/W*100 - 8))}%`, background:'var(--bg)', border:'1px solid var(--line)',
+          borderRadius:8, padding:'8px 10px', fontSize:12.5, pointerEvents:'none', boxShadow:'0 4px 14px rgba(0,0,0,.35)'}}>
+          <div style={{fontWeight:700}}>{h.label}</div><div>{h.tip}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ItemAnalysis({items, batches, invoices, grns, periodInvoices, lineCost, rangeLabel}){
+  const [q,setQ] = useState(''), [itemId,setItemId] = useState(''), [open,setOpen] = useState(false);
+  const [generic,setGeneric] = useState('');
+  const item = items.find(it=> it.id===itemId);
+  const ql = q.trim().toLowerCase();
+  const matches = ql && !item ? items.filter(it=> String(it.brandName||'').toLowerCase().includes(ql) || String(it.genericName||'').toLowerCase().includes(ql) || String(it.itemNumber||'').includes(ql)).slice(0,8) : [];
+  const generics = [...new Set(items.map(it=> String(it.genericName||'').trim()).filter(Boolean))].sort();
+  const history = item ? buildItemPriceHistory(item.id, batches, grns) : [];
+  const monthly = item ? buildItemMonthlyUnits(item.id, invoices, inv=> inv.createdAtMs ? localDateStr(new Date(inv.createdAtMs)) : '', todayISO(), 12) : [];
+  const busiest = monthly.slice().sort((a,b)=> b.units - a.units).filter(r=> r.units>0).slice(0,3);
+  const cmp = buildGenericComparison(generic, items, periodInvoices, lineCost);
+  const pct = (a,b)=> b>0 ? (a/b*100).toFixed(1)+'%' : '—';
+  return (
+    <div data-testid="item-analysis">
+      <div className="card">
+        <h3>🔎 Item එකක් analyze කරන්න</h3>
+        <div className="autocomplete">
+          <input data-testid="analysis-item" value={item ? item.itemNumber + ' — ' + item.brandName : q} placeholder="Item නම / code type කරන්න"
+            onChange={e=>{ setQ(e.target.value); setItemId(''); setOpen(true); }} onFocus={()=>{ if(item){ setQ(item.brandName); setItemId(''); } setOpen(true); }}
+            onBlur={()=>setTimeout(()=>setOpen(false),150)} autoComplete="off" />
+          {open && matches.length>0 && <div className="ac-list">{matches.map(m=>
+            <div key={m.id} className="ac-item" onMouseDown={()=>{ setItemId(m.id); setOpen(false); }}>
+              <b>{m.itemNumber}</b> — {m.brandName} <span style={{color:'var(--ink-soft)'}}>({m.genericName})</span></div>)}</div>}
+        </div>
+        {item && <>
+          <h3 style={{marginTop:18}}>💲 Cost / Sell price වෙනස් වුණු විදිය</h3>
+          {history.length===0 ? <div className="empty">මේ item එකට prices තියෙන stock entries නැහැ</div> : <>
+            <div style={{display:'flex', gap:16, fontSize:13, marginBottom:8, flexWrap:'wrap'}}>
+              <span><span style={{display:'inline-block', width:10, height:10, borderRadius:2, background:CHART_COST, marginRight:6}} />Unit cost</span>
+              <span><span style={{display:'inline-block', width:10, height:10, borderRadius:2, background:CHART_PROFIT, marginRight:6}} />Unit sell</span>
+              <span style={{color:'var(--ink-soft)'}}>
+                {history.length>1 ? 'පළමු GRN එකට වඩා cost ' + pct(history[history.length-1].unitCost - history[0].unitCost, history[0].unitCost) + ', sell ' + pct(history[history.length-1].unitSell - history[0].unitSell, history[0].unitSell) + ' වෙනස් වෙලා' : 'Stock entry එකයි තියෙන්නේ'}
+              </span>
+            </div>
+            <PriceHistoryChart points={history} />
+            <details style={{marginTop:10}}><summary style={{cursor:'pointer', fontSize:13}}>📋 Table එක බලන්න</summary>
+              <div style={{overflowX:'auto'}}><table><thead><tr><th>Date</th><th>GRN</th><th>Unit Cost</th><th>Unit Sell</th><th>Margin</th></tr></thead>
+                <tbody>{history.map((p,i)=> <tr key={i}><td>{p.date}</td><td>{p.source}</td><td>{p.unitCost.toFixed(2)}</td><td>{p.unitSell.toFixed(2)}</td><td>{pct(p.unitSell-p.unitCost, p.unitSell)}</td></tr>)}</tbody></table></div>
+            </details>
+          </>}
+          <h3 style={{marginTop:18}}>📅 වැඩියෙන්ම විකිණෙන කාල (ගිය මාස 12, units)</h3>
+          {busiest.length===0 ? <div className="empty">ගිය මාස 12 ඇතුළත මේ item එක විකුණලා නැහැ</div> : <>
+            <div style={{fontSize:13, marginBottom:8}}>වැඩිම: {busiest.map(r=> <b key={r.key} style={{marginRight:10}}>{r.label} ({r.units})</b>)}</div>
+            <SimpleBarChart rows={monthly.map(r=> ({key:r.key, label:r.label.slice(0,3), value:r.units, tip: r.units + ' ' + (item.unit||'units') + ' · ' + fmt(r.sales)}))} valueLabel="Units sold per month" />
+          </>}
+        </>}
+      </div>
+      <div className="card">
+        <h3>🧪 Generic එක අනුව — වැඩියෙන්ම profit දෙන item එක ({rangeLabel})</h3>
+        <input data-testid="analysis-generic" list="generic-names" value={generic} onChange={e=>setGeneric(e.target.value)} placeholder="Generic නම type කරන්න (e.g. Paracetamol)" />
+        <datalist id="generic-names">{generics.map(g=> <option key={g} value={g} />)}</datalist>
+        {generic.trim() && (cmp.length===0 ? <div className="empty">ඒ generic නමින් items නැහැ — list එකෙන් තෝරන්න</div> : <div style={{marginTop:12}}>
+          {cmp[0].profit>0 && <div style={{marginBottom:10, fontSize:14}}>🏆 වැඩියෙන්ම profit: <b>{cmp[0].name}</b> — {fmt(cmp[0].profit)} ({pct(cmp[0].profit, cmp[0].sales)} margin)</div>}
+          <HBarList rows={cmp.filter(r=> r.profit>0).map(r=> ({key:r.itemId, name:r.name, value:r.profit, note: r.units + ' units · sales ' + fmt(r.sales) + ' · ' + pct(r.profit, r.sales)}))} color={CHART_PROFIT}
+            empty="මේ කාලය ඇතුළත මේ generic එකේ items වලින් profit එකක් නැහැ — උඩින් දින පරාසය වැඩි කරන්න" />
+          <div style={{overflowX:'auto', marginTop:12}}><table><thead><tr><th>Item</th><th>Units</th><th>Sales</th><th>Cost</th><th>Profit</th><th>Margin</th></tr></thead>
+            <tbody>{cmp.map(r=> <tr key={r.itemId}><td>{r.name}</td><td>{r.units}</td><td>{fmt(r.sales)}</td><td>{fmt(r.cost)}</td><td>{fmt(r.profit)}</td><td>{pct(r.profit, r.sales)}</td></tr>)}</tbody></table></div>
+        </div>)}
+      </div>
+    </div>
+  );
+}
+
 function Reports({invoices, journal, batches, items, grns, suppliers, expenses, adjustments, salesReturns, grnReturns, glAccounts, glJournals, customers, payments, notify}){
   const [reportTab,setReportTab] = useState('overview');
   const [fromDate,setFromDate] = useState(todayISO());
@@ -7838,6 +8822,7 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
           const id = await createJournal({ date: todayISO(), description: lines[0].description, sourceType, sourceId, lines }, glAccounts);
           await postJournal(id, glAccounts, glJournals);
         }
+        await reverseCardCharge(inv.id, glAccounts, glJournals, 'Bill ' + inv.billNo + ' changed to credit — no card payment');
       }catch(err){ console.error('Bill-to-credit accounting failed', err); notify('⚠ Bill එක වෙනස් වුණා, ඒත් accounts entry එක fail වුණා: ' + err.message); }
     }
   };
@@ -7926,7 +8911,8 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
   const cardInvoices = periodInvoices.filter(inv=>inv.payment==='card');
   const cardChargesTotal = cardInvoices.reduce((s,inv)=>s+(inv.totalToPay||0),0) * (Number(cardChargePct)||0)/100;
   const expensesTotal = periodExpenses.reduce((s,e)=>s+(e.amount||0),0);
-  const lossesTotal = periodLosses.reduce((s,j)=>s+(j.amount||0),0);
+  const lossesTotal = periodLosses.reduce((s,j)=>s+(j.amount||0),0)
+    - periodAdjustments.filter(a=> a.source==='stockAudit').reduce((s,a)=> s + (Number(a.valueAtCost)||0), 0); // stock-count shortage (−) / excess (+) at cost
   const netProfit = netSalesTotal - costTotal - cardChargesTotal - discountTotal - expensesTotal - lossesTotal;
 
   const purchasingTotal = periodGrns.reduce((s,g)=>s+(g.totalAmount||0),0);
@@ -8039,6 +9025,7 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
     {id:'ledger', label:'📒 Item Ledger'},
     {id:'writeoff', label:'🗑 Expired Write-Off'},
     {id:'collect', label:'💰 To Collect'},
+    {id:'charts', label:'📊 Charts'},
   ];
   const collections = reportTab==='collect' ? buildCollectionsReport(customers, invoices, payments, Date.now()) : null;
   const downloadBalanceCheck = ()=>{
@@ -8067,6 +9054,62 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
           </div>
         </div>
       )}
+
+      {reportTab==='charts' && (()=>{
+        const trend = buildSalesTrend(periodInvoices, periodSalesReturns, fromDate, toDate, inv=> dateOf(inv.createdAtMs), estimateLineCost);
+        const tSales = trend.rows.reduce((s,r)=>s+r.sales,0), tCost = trend.rows.reduce((s,r)=>s+r.cost,0), tBills = periodInvoices.length;
+        const topSales = buildTopItems(periodInvoices, estimateLineCost, 'sales', 10);
+        const topProfit = buildTopItems(periodInvoices, estimateLineCost, 'profit', 10);
+        const mix = buildPaymentMix(periodInvoices), mixTotal = mix.reduce((s,r)=>s+r.value,0);
+        const owing = buildCollectionsReport(customers, invoices, payments, Date.now()).rows.slice(0,10);
+        const expiry = buildExpiryValue(batches, todayISO(), 6);
+        const setRange = (days)=>{ const d = new Date(); d.setDate(d.getDate()-days+1); setFromDate(localDateStr(d)); setToDate(todayISO()); };
+        const pct = (a,b)=> b>0 ? (a/b*100).toFixed(1)+'%' : '—';
+        const tile = (label, value, sub)=> (
+          <div className="card" style={{margin:0}}><div style={{fontSize:12.5, color:'var(--ink-soft)'}}>{label}</div>
+            <div style={{fontSize:20, fontWeight:700}}>{value}</div>{sub && <div style={{fontSize:12, color:'var(--ink-soft)'}}>{sub}</div>}</div>);
+        return (
+          <div data-testid="charts">
+            <div className="card" style={{display:'flex', gap:8, flexWrap:'wrap', alignItems:'center'}}>
+              <span style={{color:'var(--ink-soft)', fontSize:13}}>ඉක්මනට:</span>
+              {[[7,'දින 7'],[30,'දින 30'],[90,'මාස 3'],[365,'මාස 12']].map(([d,l])=>
+                <button key={d} className="btn btn-sm btn-ghost" onClick={()=>setRange(d)}>{l}</button>)}
+            </div>
+            <div className="grid c4" style={{marginBottom:16}}>
+              {tile('Sales (returns අඩු කරලා)', fmt(tSales), tBills + ' bills')}
+              {tile('Cost of goods sold', fmt(tCost))}
+              {tile('Gross profit', fmt(tSales - tCost), pct(tSales - tCost, tSales) + ' margin')}
+              {tile('සාමාන්‍ය bill එක', fmt(tBills ? tSales/tBills : 0))}
+            </div>
+            <div className="card">
+              <h3>📈 Sales — Cost + Gross profit ({trend.unit==='day' ? 'දිනපතා' : 'මාසිකව'})</h3>
+              <div style={{display:'flex', gap:16, fontSize:13, marginBottom:8}}>
+                <span><span style={{display:'inline-block', width:10, height:10, borderRadius:2, background:CHART_COST, marginRight:6}} />Cost</span>
+                <span><span style={{display:'inline-block', width:10, height:10, borderRadius:2, background:CHART_PROFIT, marginRight:6}} />Gross profit</span>
+                <span style={{color:'var(--ink-soft)'}}>තීරුවේ උස = Sales · තීරුවක් උඩ mouse එක තියන්න / tap කරන්න</span>
+              </div>
+              {trend.rows.length ? <SalesTrendChart rows={trend.rows} /> : <div className="empty">From / To දින හරියට දෙන්න</div>}
+              <details style={{marginTop:10}}><summary style={{cursor:'pointer', fontSize:13}}>📋 Table එක බලන්න</summary>
+                <div style={{overflowX:'auto'}}><table><thead><tr><th>{trend.unit==='day'?'Day':'Month'}</th><th>Bills</th><th>Sales</th><th>Cost</th><th>Gross profit</th><th>Margin</th></tr></thead>
+                  <tbody>{trend.rows.map(r=> <tr key={r.key}><td>{r.label}</td><td>{r.bills}</td><td>{fmt(r.sales)}</td><td>{fmt(r.cost)}</td><td>{fmt(r.profit)}</td><td>{pct(r.profit, r.sales)}</td></tr>)}</tbody></table></div>
+              </details>
+            </div>
+            <div className="grid c2">
+              <div className="card"><h3>🏆 වැඩියෙන්ම විකුණුණු items (Sales)</h3>
+                <HBarList rows={topSales.map(r=> ({name:r.name, value:r.sales, note: r.qty + ' units · ' + pct(r.profit, r.sales)}))} color={CHART_COST} /></div>
+              <div className="card"><h3>💹 වැඩියෙන්ම ලාභ දුන්න items (Gross profit)</h3>
+                <HBarList rows={topProfit.filter(r=> r.profit>0).map(r=> ({name:r.name, value:r.profit, note: pct(r.profit, r.sales) + ' margin'}))} color={CHART_PROFIT} /></div>
+              <div className="card"><h3>💳 ගෙවපු විදිය (Cash / Card / Credit)</h3>
+                <HBarList rows={mix.map(r=> ({key:r.key, name:r.name, value:r.value, note: pct(r.value, mixTotal) + ' · ' + r.bills + ' bills'}))} color={CHART_COST} /></div>
+              <div className="card"><h3>👥 වැඩියෙන්ම ණය තියෙන customers (අද වෙනකොට)</h3>
+                <HBarList rows={owing.map(r=> ({key:r.id, name:r.name, value:r.outstanding, note: r.openBills + ' bills' + (r.oldestDays!=null ? ' · දින ' + r.oldestDays : '')}))} color={CHART_COST} empty="කාටවත් ණය නැහැ" /></div>
+            </div>
+            <div className="card"><h3>⏳ Expire වෙන stock (cost value, ඉදිරි මාස 6)</h3>
+              <HBarList rows={expiry.map(r=> ({key:r.key, name:r.name, value:r.value, note: r.units + ' units'}))} color={CHART_COST} empty="ඉදිරි මාස 6 ඇතුළත expire වෙන stock නැහැ" /></div>
+            <ItemAnalysis items={items} batches={batches} invoices={invoices} grns={grns||[]} periodInvoices={periodInvoices} lineCost={estimateLineCost} rangeLabel={fromDate + ' → ' + toDate} />
+          </div>
+        );
+      })()}
 
       {reportTab==='overview' && (
         <div>

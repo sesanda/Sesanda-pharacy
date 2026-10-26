@@ -6,7 +6,7 @@ const H = loadHelpers(['glToCents','glCentsToAmount','glIsLiveJournal','findGlAc
   'glActivePostedJournals','glLineDelta','computeTrialBalance','validateTrialBalance','computeProfitAndLoss',
   'computeBalanceSheet','validateBalanceSheet','glAgeInDays','glAgingBucket','glSubledgerLines','glARPaidByInvoice',
   'glAPPaidByGrn','computeAR','computeAP','invoiceBalanceInfo','computeCustomerOutstanding',
-  'buildSalesReturnLines','buildOpeningBalanceLines','computeAccountsHealth','customerUsuallyBuysOnCredit','buildBillToCreditLines','buildGrnReturnLines','itemSellPrice','restockBatchFields']);
+  'buildSalesReturnLines','buildOpeningBalanceLines','computeAccountsHealth','customerUsuallyBuysOnCredit','buildBillToCreditLines','buildGrnReturnLines','itemSellPrice','restockBatchFields','glCardBankCode','glBankAccounts']);
 
 const CHART = [
   ['1000','Cash','ASSET'], ['1010','Bank','ASSET'], ['1100','Accounts Receivable','ASSET'], ['1210','Pharmacy Inventory','ASSET'],
@@ -188,4 +188,153 @@ test('restockBatchFields: keeps the sold price and the source batch expiry', ()=
   const batches = [{ id:'b1', itemId:'i', batchCode:'A-1', unitSell:20, unitCost:12, expiryDate:'2027-03-01' }];
   assert.deepEqual(H.restockBatchFields({ itemId:'i', batchCode:'A-1', unitPrice:19, unitCost:12 }, batches), { unitSell:19, unitCost:12, expiryDate:'2027-03-01' });
   assert.deepEqual(H.restockBatchFields({ itemId:'i', batchCode:'?' }, batches, 11), { unitSell:20, unitCost:11, expiryDate:'' });
+});
+
+test('costPriceWarning flags a selling price equal to or below cost', ()=>{
+  const { costPriceWarning } = loadHelpers(['costPriceWarning']);
+  assert.equal(costPriceWarning(8, 10), null);
+  assert.equal(costPriceWarning('', 10), null);            // not typed yet
+  assert.equal(costPriceWarning(10, ''), null);
+  assert.match(costPriceWarning(10, 10), /සමානයි/);
+  assert.match(costPriceWarning('12', '10'), /අඩුයි/);
+});
+
+test('itemLastPrices: newest GRN cost, New Bill sell price, returns skipped', ()=>{
+  const { itemLastPrices } = loadHelpers(['itemSellPrice','itemLastPrices']);
+  const batches = [
+    { itemId:'i1', unitCost:8, unitSell:10, remainingUnits:0, grnNo:'GRN-1', createdAt:{seconds:1} },
+    { itemId:'i1', unitCost:9, unitSell:12, remainingUnits:5, grnNo:'GRN-2', expiryDate:'2027-01-01', createdAt:{seconds:2} },
+    { itemId:'i1', unitCost:7, unitSell:12, remainingUnits:1, isReturn:true, createdAt:{seconds:3} },
+    { itemId:'i2', unitCost:5, unitSell:6, remainingUnits:1, isOpeningStock:true, grnNo:'' },
+  ];
+  assert.deepEqual(itemLastPrices('i1', batches), { unitCost:9, unitSell:12, grnNo:'GRN-2', expiryDate:'2027-01-01' });
+  assert.equal(itemLastPrices('i2', batches).grnNo, 'Opening stock');
+  assert.deepEqual([itemLastPrices('none', batches).unitCost, itemLastPrices('none', batches).unitSell], [0, 0]);
+});
+
+test('charts: buckets, sales trend, top items, payment mix, expiry value', ()=>{
+  const C = loadHelpers(['chartBuckets','buildSalesTrend','buildTopItems','buildPaymentMix','buildExpiryValue']);
+  assert.equal(C.chartBuckets('2026-10-01','2026-10-30').buckets.length, 30);
+  assert.deepEqual(C.chartBuckets('2025-11-15','2026-10-25').buckets.map(b=>b.key).slice(0,3), ['2025-11','2025-12','2026-01']);
+  assert.equal(C.chartBuckets('2025-11-15','2026-10-25').unit, 'month');
+  const invs = [
+    { totalToPay:100, payment:'cash', day:'2026-10-02', items:[{ itemId:'a', brandName:'A', qty:2, lineTotal:100, costTotal:60 }] },
+    { totalToPay:50, payment:'credit', day:'2026-10-02', items:[{ itemId:'b', brandName:'B', qty:1, lineTotal:50, costTotal:20 }] },
+    { totalToPay:30, payment:'card', day:'2026-10-03', items:[{ itemId:'a', brandName:'A', qty:1, lineTotal:30, costTotal:30 }] },
+    { totalToPay:999, payment:'cash', day:'2026-09-01', items:[] },
+  ];
+  const t = C.buildSalesTrend(invs, [{ date:'2026-10-03', refundAmount:10, costImpact:6 }], '2026-10-01', '2026-10-03', i=>i.day, l=>l.costTotal);
+  assert.deepEqual(t.rows.map(r=>[r.key, r.sales, r.cost, r.profit, r.bills]),
+    [['2026-10-01',0,0,0,0], ['2026-10-02',150,80,70,2], ['2026-10-03',20,24,-4,1]]);
+  const top = C.buildTopItems(invs.slice(0,3), l=>l.costTotal, 'profit', 5);
+  assert.deepEqual(top.map(r=>[r.name, r.sales, r.profit, r.qty]), [['A',130,40,3], ['B',50,30,1]]);
+  assert.deepEqual(C.buildPaymentMix(invs.slice(0,3)).map(r=>[r.key, r.value]), [['cash',100],['card',30],['credit',50]]);
+  const ex = C.buildExpiryValue([
+    { remainingUnits:10, unitCost:2, expiryDate:'2026-09-30' }, { remainingUnits:5, unitCost:4, expiryDate:'2026-11-20' },
+    { remainingUnits:0, unitCost:4, expiryDate:'2026-11-20' }, { remainingUnits:5, unitCost:4, expiryDate:'2028-01-01' }], '2026-10-25', 3);
+  assert.deepEqual(ex.map(r=>[r.key, r.value]), [['expired',20],['2026-10',0],['2026-11',20],['2026-12',0]]);
+});
+
+test('item analysis: price history, monthly units, generic comparison', ()=>{
+  const C = loadHelpers(['localDateStr','buildItemPriceHistory','buildItemMonthlyUnits','buildGenericComparison']);
+  const hist = C.buildItemPriceHistory('a', [
+    { itemId:'a', unitCost:10, unitSell:12, grnId:'g2', grnNo:'GRN-2' },
+    { itemId:'a', unitCost:8, unitSell:11, isOpeningStock:true, openingDate:'2026-01-05' },
+    { itemId:'a', unitCost:9, unitSell:12, isReturn:true, openingDate:'2026-02-01' },
+    { itemId:'b', unitCost:1, unitSell:2, openingDate:'2026-01-01' },
+  ], [{ id:'g2', date:'2026-06-10' }]);
+  assert.deepEqual(hist.map(p=>[p.date, p.unitCost, p.unitSell, p.source]), [['2026-01-05',8,11,'Opening stock'], ['2026-06-10',10,12,'GRN-2']]);
+  const invs = [
+    { day:'2026-10-02', items:[{ itemId:'a', qty:3, lineTotal:36, costTotal:30 }, { itemId:'b', qty:5, lineTotal:10, costTotal:5 }] },
+    { day:'2026-08-15', items:[{ itemId:'a', qty:2, lineTotal:24, costTotal:20 }] },
+    { day:'2025-01-01', items:[{ itemId:'a', qty:99, lineTotal:1, costTotal:1 }] },
+  ];
+  const mu = C.buildItemMonthlyUnits('a', invs, i=>i.day, '2026-10-25', 3);
+  assert.deepEqual(mu.map(r=>[r.key, r.units, r.sales]), [['2026-08',2,24], ['2026-09',0,0], ['2026-10',3,36]]);
+  const items = [{ id:'a', brandName:'A', genericName:'Paracetamol' }, { id:'b', brandName:'B', genericName:'paracetamol ' }, { id:'c', brandName:'C', genericName:'Other' }];
+  const cmp = C.buildGenericComparison('PARACETAMOL', items, invs.slice(0,2), l=>l.costTotal);
+  assert.deepEqual(cmp.map(r=>[r.name, r.units, r.sales, r.profit]), [['A',5,60,10], ['B',5,10,5]]);
+});
+
+test('card charges: fee, lines, and which card bills / payments still need one', ()=>{
+  const C = loadHelpers(['glToCents','glIsLiveJournal','findGlAccountByCode','localDateStr','glDocDate','invoiceBalanceInfo','cardChargeAmount','buildCardChargeLines','pendingCardCharges','glCardBankCode','glBankAccounts']);
+  assert.equal(C.cardChargeAmount(1000, 3), 30);
+  assert.equal(C.cardChargeAmount(333.33, 2.5), 8.33);
+  const chart = [{ id:'a6500', accountCode:'6500', accountType:'EXPENSE', isActive:true }, { id:'a1010', accountCode:'1010', accountType:'ASSET', isActive:true }];
+  assert.deepEqual(C.buildCardChargeLines(30, chart, 'x').map(l=>[l.accountId, l.debit, l.credit]), [['a6500',30,0],['a1010',0,30]]);
+  assert.throws(()=> C.buildCardChargeLines(30, chart.slice(0,1), 'x'), /1010 Bank/);
+  const J = (sourceType, sourceId)=> ({ status:'POSTED', sourceType, sourceId });
+  const invs = [
+    { id:'i1', billNo:'INV-1', payment:'card', totalToPay:1000, paidAmount:1000, date:'2026-10-01' },                   // pending, current %
+    { id:'i2', billNo:'INV-2', payment:'card', totalToPay:500, paidAmount:500, cardChargePct:2, date:'2026-10-02' },   // pending, own %
+    { id:'i3', payment:'card', totalToPay:500, paidAmount:500 },                                                        // charge already posted
+    { id:'i4', payment:'cash', totalToPay:500, paidAmount:500 },                                                        // cash
+    { id:'i5', payment:'card', totalToPay:500, paidAmount:500 },                                                        // sale not in books
+    { id:'i6', payment:'card', totalToPay:500, paidAmount:500, cardChargePct:0 },                                       // 0% when saved
+    { id:'i7', payment:'card', totalToPay:500, paidAmount:500 },                                                        // changed to credit
+  ];
+  const pays = [{ id:'p1', method:'card', amount:200, customerName:'Alpha', date:'2026-10-03' }, { id:'p2', method:'cash', amount:200 }];
+  const js = [J('SALE','i1'), J('SALE','i2'), J('SALE','i3'), J('CARD_CHARGE','i3'), J('SALE','i4'), J('SALE','i6'), J('SALE','i7'), J('BILL_TO_CREDIT','i7'),
+    J('CUSTOMER_PAYMENT','p1'), J('CUSTOMER_PAYMENT','p2')];
+  assert.deepEqual(C.pendingCardCharges(invs, pays, js, 3).map(c=>[c.id, c.amount, c.pct, c.date]),
+    [['i1',1000,3,'2026-10-01'], ['i2',500,2,'2026-10-02'], ['p1',200,3,'2026-10-03']]);
+  assert.equal(C.pendingCardCharges(invs, pays, js, 0).length, 1);   // only INV-2's own 2%
+});
+
+test('bank accounts: list, next code, transfer lines, card bank per document', ()=>{
+  const C = loadHelpers(['glToCents','findGlAccountByCode','glBankAccounts','nextBankAccountCode','buildBankTransferLines']);
+  const chart = [{ id:'a1000', accountCode:'1000', accountType:'ASSET' }, { id:'a1010', accountCode:'1010', accountType:'ASSET' },
+    { id:'a1012', accountCode:'1012', accountType:'ASSET', isBank:true }, { id:'a1100', accountCode:'1100', accountType:'ASSET' },
+    { id:'a1013', accountCode:'1013', accountType:'ASSET', isBank:true, isActive:false }];
+  assert.deepEqual(C.glBankAccounts(chart).map(a=>a.accountCode), ['1010','1012']);
+  assert.equal(C.nextBankAccountCode(chart), '1011');
+  assert.deepEqual(C.buildBankTransferLines('1000','1012', 500, chart, 'd').map(l=>[l.accountId, l.debit, l.credit]), [['a1012',500,0],['a1000',0,500]]);
+  assert.throws(()=> C.buildBankTransferLines('1010','1010', 5, chart, 'd'), /එකම account/);
+  assert.throws(()=> C.buildBankTransferLines('1000','1010', 0, chart, 'd'), /0ට වඩා/);
+  const { glCardBankCode } = loadHelpers(['glCardBankCode']);
+  assert.equal(glCardBankCode({ cardBankCode:'1012' }), '1012');
+  assert.equal(glCardBankCode({}), '1010');
+});
+
+test('stock audit: one line per item + expiry + cost + sell, counts compared at cost and sell', ()=>{
+  const C = loadHelpers(['buildStockAuditRows','stockAuditSummary','stockAuditSheetHtml']);
+  const items = [{ id:'a', brandName:'Alpha', itemNumber:'A1', unit:'tab' }, { id:'b', brandName:'Beta <x>', itemNumber:'B1' }, { id:'c', brandName:'Cee' }];
+  const batches = [
+    { itemId:'a', remainingUnits:10, unitCost:5, unitSell:8, expiryDate:'2027-01-01', batchCode:'aa' },
+    { itemId:'a', remainingUnits:4, unitCost:5, unitSell:8, expiryDate:'2027-01-01', batchCode:'ab' },
+    { itemId:'a', remainingUnits:6, unitCost:6, unitSell:9, expiryDate:'2027-01-01', batchCode:'ac' },
+    { itemId:'a', remainingUnits:3, unitCost:5, unitSell:8, expiryDate:'2026-12-01', batchCode:'ad' },
+    { itemId:'a', remainingUnits:0, unitCost:5, unitSell:8, expiryDate:'2026-01-01' },
+    { itemId:'b', remainingUnits:2, unitCost:10, unitSell:12, expiryDate:'2027-03-01' },
+  ];
+  const all = C.buildStockAuditRows(items, batches, null, false);
+  assert.deepEqual(all.map(r=>[r.name, r.expiry, r.unitCost, r.systemQty]),
+    [['Alpha','2026-12-01',5,3], ['Alpha','2027-01-01',5,14], ['Alpha','2027-01-01',6,6], ['Beta <x>','2027-03-01',10,2]]);
+  assert.equal(C.buildStockAuditRows(items, batches, null, true).length, 5);          // + Cee with 0
+  assert.deepEqual(C.buildStockAuditRows(items, batches, ['c','b'], false).map(r=>[r.name, r.systemQty]), [['Beta <x>',2], ['Cee',0]]);
+  const s = C.stockAuditSummary(all, { [all[1].key]:'12', [all[2].key]:'7', [all[3].key]:'2' });
+  assert.deepEqual([s.counted, s.shortQty, s.overQty, s.shortCost, s.overCost, s.netCost, s.netSell], [3, 2, 1, 10, 6, -4, -7]);
+  assert.equal(s.lines[0].diff, null);
+  const html = C.stockAuditSheetHtml(s, { date:'2026-10-25', scope:'All items' });
+  assert.match(html, /Beta &lt;x&gt;/);
+  assert.match(html, /Net: Rs -4\.00 \(cost\)/);
+});
+
+test('stock audit apply: batches set to the count, journal at cost, no-batch excess skipped', ()=>{
+  const C = loadHelpers(['glToCents','findGlAccountByCode','planStockAuditAdjustment','buildStockAuditLines']);
+  const batches = [{ id:'b1', remainingUnits:3 }, { id:'b2', remainingUnits:10 }, { id:'b3', remainingUnits:4 }];
+  const lines = [
+    { key:'k1', itemId:'a', name:'A', batchIds:['b1','b2'], systemQty:13, unitCost:5, unitSell:8, diff:-5 },   // 3 off b1, 2 off b2
+    { key:'k2', itemId:'b', name:'B', batchIds:['b3'], systemQty:4, unitCost:10, unitSell:12, diff:2 },
+    { key:'k3', itemId:'c', name:'C', batchIds:[], systemQty:0, unitCost:0, unitSell:0, diff:4 },
+    { key:'k4', itemId:'d', name:'D', batchIds:['b9'], diff:null },
+  ];
+  const p = C.planStockAuditAdjustment(lines, batches);
+  assert.deepEqual(p.updates, [{ id:'b1', remainingUnits:0 }, { id:'b2', remainingUnits:8 }, { id:'b3', remainingUnits:6 }]);
+  assert.deepEqual(p.adjustments.map(a=>[a.itemId, a.qty, a.valueAtCost]), [['a',-5,-25], ['b',2,20]]);
+  assert.deepEqual([p.skipped.map(l=>l.key), p.shortCost, p.overCost, p.net], [['k3'], 25, 20, -5]);
+  const chart = [{ id:'a6700', accountCode:'6700' }, { id:'a1210', accountCode:'1210' }];
+  assert.deepEqual(C.buildStockAuditLines(-5, chart, 'x').map(l=>[l.accountId, l.debit, l.credit]), [['a6700',5,0],['a1210',0,5]]);
+  assert.deepEqual(C.buildStockAuditLines(7, chart, 'x').map(l=>[l.accountId, l.debit, l.credit]), [['a1210',7,0],['a6700',0,7]]);
+  assert.deepEqual(C.buildStockAuditLines(0, chart, 'x'), []);
 });

@@ -6,6 +6,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+// Sidebar pages sit inside folding groups: open the page's group first if it's closed.
+async function goTo(page, label){
+  const btn = page.locator('.side .nav-btn').filter({ has: page.getByText(label, { exact:true }) }).first();
+  if(!(await btn.isVisible().catch(()=>false))) await page.locator('.side .nav-group[data-labels*="|' + label + '|"]').first().click();
+  await btn.click();
+}
 const here = path.dirname(fileURLToPath(import.meta.url));
 const DEPS = process.env.TEST_DEPS;
 const HTML_FILE = process.env.TEST_HTML || path.join(here, '..', 'index.html');
@@ -34,14 +40,21 @@ test('every staff tab renders without uncaught errors', { skip: !DEPS && 'TEST_D
     await page.getByText('Staff / Admin Portal').click();
     const inputs = page.locator('input'); await inputs.nth(0).fill('t@example.test'); await inputs.nth(1).fill('x');
     await page.getByRole('button', { name:'Login' }).click();
-    await page.getByText('Customers', { exact:true }).first().waitFor();
-    const labels = ['Dashboard','New Bill','Item Registration','Purchase Orders','GRN Entry','Returns','Opening Stock','Stock','Suppliers','Customers','Orders','Prescriptions/Voice','Reports','Cash Control','Finance (Setup)','General Ledger','Trial Balance','Profit & Loss','Balance Sheet','Accounts Receivable','Accounts Payable','Cash Flow Statement','Expenses','Capital & Loans','AI Insights','Dashboard'];
+    await page.locator('.side .brand').waitFor();
+    const labels = ['Dashboard','New Bill','Item Registration','Purchase Orders','GRN Entry','Returns','Opening Stock','Stock','Suppliers','Customers','Orders','Prescriptions/Voice','Reports','Cash Control','Finance (Setup)','General Ledger','Trial Balance','Profit & Loss','Balance Sheet','Accounts Receivable','Accounts Payable','Cash Flow Statement','Expenses','Capital & Loans','AI Insights','Bank Accounts','Sub GRN Entry','Dashboard'];
+    // groups start folded; a heading opens and closes its pages
+    const gl = page.locator('.side .nav-btn').filter({ has: page.getByText('General Ledger', { exact:true }) });
+    assert.equal(await gl.count(), 0);
+    await page.locator('.side .nav-group', { hasText:'Accounting' }).click();
+    await gl.waitFor();
+    if(process.env.SHOT) await page.locator('.side').screenshot({ path: process.env.SHOT });
+    await page.locator('.side .nav-group', { hasText:'Accounting' }).click();
+    assert.equal(await gl.count(), 0);
     const visited = [];
     for(const label of [...new Set(labels)]){
       if(/Sign out|Back/.test(label)) continue;
-      const el = page.getByText(label, { exact:true }).first();
-      if(!(await el.isVisible().catch(()=>false))) continue;
-      await el.click().catch(()=>{}); await page.waitForTimeout(250); visited.push(label);
+      try{ await goTo(page, label); }catch(e){ continue; }
+      await page.waitForTimeout(250); visited.push(label);
     }
     console.log('visited tabs:', visited.join(', '));
     assert.ok(visited.length>10, 'expected to visit most tabs, got '+visited.length);
