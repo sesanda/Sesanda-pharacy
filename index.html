@@ -1615,6 +1615,40 @@ async function postCapitalLoanAccounting(txn, glAccounts, existingJournals){
    the new accounting engine (P&L, Balance Sheet, GL, Trial Balance, Cash Flow) also picks it up.
    sourceId is the batch's own document ID — batches already get an accountingStatus/journalId/
    accountingError update at write-off time, so no new collection was needed just to track this. */
+// 6700 Inventory Write-off is needed by every stock loss/gain posting — create it when missing and
+// hand back the chart that includes it, so a missing account never leaves stock and books apart.
+async function ensureWriteOffAccount(glAccounts){
+  if(findGlAccountByCode(glAccounts, '6700')) return glAccounts;
+  const ref = await db.collection('glAccounts').add({ accountCode:'6700', accountName:'Inventory Write-off', accountType:'EXPENSE', parentAccountId:null, isActive:true,
+    createdAt: firebase.firestore.FieldValue.serverTimestamp(), updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+  return [...(glAccounts||[]), { id: ref.id, accountCode:'6700', accountName:'Inventory Write-off', accountType:'EXPENSE', isActive:true }];
+}
+
+// Cost of taking qty units of an item off the shelf the way deductStockFEFO() does (earliest expiry first).
+function fefoTakeCost(itemId, qty, batches){
+  let left = Number(qty)||0, cost = 0;
+  (batches||[]).filter(b=> b.itemId===itemId && b.remainingUnits>0).sort((a,b)=> (a.expiryDate||'')<(b.expiryDate||'')?-1:1).forEach(b=>{
+    if(left<=0) return;
+    const take = Math.min(b.remainingUnits, left);
+    cost += take * (Number(b.unitCost)||0); left -= take;
+  });
+  return Math.round(cost*100)/100;
+}
+
+// A manual stock adjustment (Item Ledger) or a stock difference fixed from the health check, at
+// cost: a loss DR 6700 / CR 1210 Inventory, a gain the other way round. Same lines as a stock audit.
+async function postStockAdjustAccounting(adj, glAccounts, existingJournals){
+  const sourceType = 'STOCK_ADJUST', sourceId = adj.id;
+  const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j));
+  if(dup) return { status:'ALREADY_POSTED', journalId: dup.id };
+  if(glToCents(adj.valueAtCost)===0) return { status:'NO_VALUE' };
+  const accounts = await ensureWriteOffAccount(glAccounts);
+  const lines = buildStockAuditLines(adj.valueAtCost, accounts, adj.desc);
+  const journalId = await createJournal({ date: adj.date || todayISO(), description: adj.desc, sourceType, sourceId, lines }, accounts);
+  await postJournal(journalId, accounts, existingJournals);
+  return { status:'POSTED', journalId };
+}
+
 async function postInventoryWriteOffAccounting(writeOff, glAccounts, existingJournals){
   const sourceType = 'INVENTORY_WRITEOFF', sourceId = writeOff.id;
   const dup = (existingJournals||[]).find(j=> j.sourceType===sourceType && j.sourceId===sourceId && glIsLiveJournal(j));
@@ -1623,8 +1657,8 @@ async function postInventoryWriteOffAccounting(writeOff, glAccounts, existingJou
   const amount = Number(writeOff.amount)||0;
   if(amount <= 0) throw new Error('Write-off amount is zero — nothing to post');
 
+  glAccounts = await ensureWriteOffAccount(glAccounts);
   const writeOffAcc = findGlAccountByCode(glAccounts, '6700');
-  if(!writeOffAcc) throw new Error('Chart of Accounts has no active 6700 Inventory Write-off account — create it in Reports → Expired Write-Off');
   const inventoryAcc = findGlAccountByCode(glAccounts, '1210');
   if(!inventoryAcc) throw new Error('Chart of Accounts has no active 1210 Pharmacy Inventory account — load/check it in Finance');
 
@@ -4079,6 +4113,17 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
     catch(err){ console.error(err); notify('❌ ' + err.message); }
     setHealthBusy(null);
   };
+  // Stock that is gone (or turned up) without an entry — e.g. an old manual adjustment — is a loss or
+  // gain of this period, not an opening balance: post it to 6700 Inventory Write-off.
+  const postInventoryDiff = async (c)=>{
+    if(!window.confirm(`1210 Inventory\n\nBooks: Rs. ${c.books.toFixed(2)}\nShop stock: Rs. ${c.shop.toFixed(2)}\n\n`+
+      `වෙනස Rs. ${Math.abs(c.diff).toFixed(2)} ${c.diff<0 ? 'stock අඩුවක් (loss) විදියට 6700 Inventory Write-off එකට' : 'stock වැඩියක් (gain) විදියට 6700 එකෙන්'} post කරලා books එක shop stock එකට ගේනවා. Post කරන්නද?`)) return;
+    setHealthBusy('wo-'+c.code);
+    try{ await postStockAdjustAccounting({ id:'HC-' + Date.now(), valueAtCost: c.diff, date: todayISO(), desc: 'Stock difference found by health check (' + (c.diff<0 ? 'shortage' : 'excess') + ')' }, glAccounts, glJournals);
+      notify('✓ Inventory difference 6700 Inventory Write-off එකට post කළා'); }
+    catch(err){ console.error(err); notify('❌ ' + err.message); }
+    setHealthBusy(null);
+  };
   const reverseOrphan = async (j)=>{
     if(!window.confirm(j.journalNo + ' — ' + j.description + '\n\nමේ entry එකේ ' + (j.sourceType==='SALE'?'bill':'GRN') + ' එක delete කරලා. Books වලින් reverse කරන්නද?')) return;
     setHealthBusy('or-'+j.id);
@@ -4116,6 +4161,7 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
           <div>{ok(health.balanceSheet.balanced)} Balance Sheet {health.balanceSheet.balanced ? 'balanced' : ('out by Rs. ' + health.balanceSheet.difference.toFixed(2))}</div>
           <div>{ok(health.orphans.length===0)} Deleted bills/GRNs still in the books: {health.orphans.length}</div>
           <div>{ok(BULK_GROUPS.every(g=> g.items().length===0))} Failed postings waiting for retry: {BULK_GROUPS.reduce((s,g)=> s + g.items().length, 0)}{bulkButton(BULK_GROUPS, 'Retry all failed')}</div>
+          {failedWriteOffs.length>0 && <div>{ok(false)} Expired write-offs not yet in the books: {failedWriteOffs.length} — යටින් "Inventory Write-offs Pending Accounting" එකේ Retry ඔබන්න</div>}
           <div>ℹ Cash in books: <b>Rs. {health.cash.toFixed(2)}</b> · Bank in books: <b>Rs. {health.bank.toFixed(2)}</b> — drawer එකේ සල්ලි / bank statement එකත් එක්ක ගලපලා බලන්න.</div>
           <div data-testid="card-charges">{ok(pendingCards.length===0)} 💳 Card charge
             <input type="number" step="0.01" value={cardPct==null ? '' : cardPct} onChange={e=>saveCardPct(e.target.value)} style={{width:70, display:'inline-block', margin:'0 4px', padding:'2px 6px'}} />%
@@ -4132,9 +4178,10 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
                 <td>Rs. {c.books.toFixed(2)}</td>
                 <td>Rs. {c.shop.toFixed(2)} <span style={{fontSize:11, color:'var(--ink-soft)'}}>({c.shopLabel})</span></td>
                 <td style={{fontWeight:700, color: Math.abs(c.diff)<0.01 ? 'var(--accent)' : 'var(--red)'}}>{Math.abs(c.diff)<0.01 ? '✓ matches' : ('Rs. ' + c.diff.toFixed(2))}</td>
-                <td>{Math.abs(c.diff)>=0.01 && (
+                <td>{Math.abs(c.diff)>=0.01 && <div style={{display:'flex', gap:6, flexWrap:'wrap'}}>
+                  {c.code==='1210' && <button className="btn btn-primary btn-sm" disabled={!!healthBusy} onClick={()=>postInventoryDiff(c)}>{healthBusy==='wo-'+c.code ? 'Posting…' : (c.diff<0 ? 'Stock අඩුව → 6700 Write-off' : 'Stock වැඩිය → 6700')}</button>}
                   <button className="btn btn-ghost btn-sm" disabled={!!healthBusy} onClick={()=>postOpening(c)}>{healthBusy==='ob-'+c.code ? 'Posting…' : 'Post opening balance'}</button>
-                )}</td>
+                </div>}</td>
               </tr>
             ))}
           </tbody>
@@ -9345,7 +9392,7 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
   const cardChargesTotal = cardInvoices.reduce((s,inv)=>s+(inv.totalToPay||0),0) * (Number(cardChargePct)||0)/100;
   const expensesTotal = periodExpenses.reduce((s,e)=>s+(e.amount||0),0);
   const lossesTotal = periodLosses.reduce((s,j)=>s+(j.amount||0),0)
-    - periodAdjustments.filter(a=> a.source==='stockAudit').reduce((s,a)=> s + (Number(a.valueAtCost)||0), 0); // stock-count shortage (−) / excess (+) at cost
+    - periodAdjustments.filter(a=> a.valueAtCost!=null).reduce((s,a)=> s + (Number(a.valueAtCost)||0), 0); // stock audit / manual adjustment shortage (−) / excess (+) at cost
   const netProfit = netSalesTotal - costTotal - cardChargesTotal - discountTotal - expensesTotal - lossesTotal;
 
   const purchasingTotal = periodGrns.reduce((s,g)=>s+(g.totalAmount||0),0);
@@ -9430,25 +9477,44 @@ function Reports({invoices, journal, batches, items, grns, suppliers, expenses, 
     if(!ledgerItem) return notify('Item එකක් තෝරන්න');
     const qty = Number(adjQty);
     if(!qty) return notify('Adjustment quantity එකක් දෙන්න (+ හෝ -)');
+    // Valued at cost so the books follow the stock: a cut is costed off the batches it comes from
+    // (FEFO, as deductStockFEFO takes them); an addition joins at the item's latest cost and price.
+    let valueAtCost, applied = qty;
     if(qty<0){
+      const onHand = stockForLedger;
+      applied = -Math.min(onHand, Math.abs(qty));
+      valueAtCost = -fefoTakeCost(ledgerItem.id, -applied, batches);
       const short = await deductStockFEFO(ledgerItem.id, Math.abs(qty), batches);
       if(short>0) notify('⚠ Stock මදි — ' + short + ' units අඩු කරන්න බැරි වුනා');
     } else {
-      // positive adjustment — add as a zero-cost adjustment batch so it shows in stock
+      const lp = itemLastPrices(ledgerItem.id, batches), pk = Number(ledgerItem.packSize)||1;
+      valueAtCost = Math.round(qty * lp.unitCost * 100)/100;
       await db.collection('batches').add({
         batchCode:'ADJ-'+Date.now(), itemId:ledgerItem.id, brandName:ledgerItem.brandName,
-        costPricePerPack:0, sellPricePerPack:0, unitCost:0, unitSell:0,
-        expiryDate:'', qtyPacks:0, qtyUnits:qty, remainingUnits:qty,
+        costPricePerPack: lp.unitCost*pk, sellPricePerPack: lp.unitSell*pk, unitCost: lp.unitCost, unitSell: lp.unitSell,
+        expiryDate: lp.expiryDate||'', qtyPacks:0, qtyUnits:qty, remainingUnits:qty,
         supplierId:'', supplierName:'Adjustment', invoiceNum:'', isAdjustment:true,
         createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       });
     }
-    await db.collection('adjustments').add({
-      itemId:ledgerItem.id, itemName:ledgerItem.brandName, qty, reason:adjReason||'Stock adjustment',
+    const adjRef = await db.collection('adjustments').add({
+      itemId:ledgerItem.id, itemName:ledgerItem.brandName, qty: applied, reason:adjReason||'Stock adjustment', valueAtCost,
       date: todayISO(), createdAt: firebase.firestore.FieldValue.serverTimestamp(),
     });
     notify('✓ Adjustment එක save කළා');
     setAdjQty(''); setAdjReason('');
+    if(glAccounts && glAccounts.length && glToCents(valueAtCost)!==0){
+      try{
+        const desc = 'Stock adjustment — ' + ledgerItem.brandName + ' ' + (applied>0 ? '+' : '') + applied + (adjReason ? ' (' + adjReason + ')' : '');
+        await postStockAdjustAccounting({ id: adjRef.id, valueAtCost, date: todayISO(), desc }, glAccounts, glJournals);
+        await db.collection('adjustments').doc(adjRef.id).update({ accountingStatus:'POSTED' });
+        notify('✓ Books update කළා — ' + fmt(valueAtCost) + ' (6700 Inventory Write-off)');
+      }catch(err){
+        console.error('stock adjustment accounting failed', err);
+        await db.collection('adjustments').doc(adjRef.id).update({ accountingStatus:'FAILED', accountingError: err.message }).catch(()=>{});
+        notify('⚠ Stock adjust වුණා, ඒත් books entry එක fail වුණා: ' + err.message);
+      }
+    }
   };
 
   const REPORT_TABS = [

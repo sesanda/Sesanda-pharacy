@@ -668,3 +668,36 @@ test('Staff Advances: create 1150, give an advance, cut it from salary — balan
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('Item Ledger adjustment reaches the books; a stock difference can go to 6700 from the health check', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.items = [{ id:'it1', itemNumber:'T001', brandName:'Testamol', genericName:'Paracetamol', unit:'tab', packSize:10 }];
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await goTo(page, 'Reports');
+    await page.getByRole('button', { name:'📒 Item Ledger' }).click();
+    await page.getByPlaceholder('type brand name...').fill('Testa');
+    await page.locator('.ac-item', { hasText:'Testamol' }).first().dispatchEvent('mousedown');
+    await page.getByPlaceholder('e.g. -5 or 10').fill('-3');
+    await page.getByRole('button', { name:'+ Record Adjustment' }).click();
+    await page.waitForFunction(()=> (window.firebase.__store.glJournals||[]).some(j=> j.sourceType==='STOCK_ADJUST' && j.status==='POSTED'));
+    const wo = await page.evaluate(()=> window.firebase.__store.glAccounts.find(a=> a.accountCode==='6700'));
+    const j = await page.evaluate(()=> window.firebase.__store.glJournals.find(j=> j.sourceType==='STOCK_ADJUST'));
+    assert.deepEqual(j.lines.map(l=>[l.accountId, l.debit, l.credit]), [[wo.id,180,0],['a1210',0,180]]);   // 3 × Rs 60
+    const adj = await page.evaluate(()=> window.firebase.__store.adjustments.find(a=> a.itemId==='it1'));
+    assert.deepEqual([adj.qty, adj.valueAtCost, adj.accountingStatus], [-3, -180, 'POSTED']);
+    await goTo(page, 'Finance (Setup)');
+    let t = await page.getByTestId('health-control').innerText();
+    assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
+
+    // stock that went missing without any entry (as an old adjustment did) → one click to 6700
+    await page.evaluate(()=>{ window.firebase.__store.batches.find(b=> b.id==='b1').remainingUnits = 15; window.firebase.__notify('batches'); });
+    await page.locator('tr', { hasText:'1210' }).getByRole('button', { name:'Stock අඩුව → 6700 Write-off' }).click();
+    await page.waitForFunction(()=> /✓ matches[\s\S]*✓ matches[\s\S]*✓ matches/.test(document.querySelector('[data-testid="health-control"]').innerText));
+    const hj = await page.evaluate(()=> window.firebase.__store.glJournals.filter(j=> j.sourceType==='STOCK_ADJUST').pop());
+    assert.deepEqual(hj.lines.map(l=>[l.accountId, l.debit, l.credit]), [[wo.id,120,0],['a1210',0,120]]);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
