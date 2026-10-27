@@ -436,7 +436,7 @@ test('Card charge: a card bill posts its % to 6500 Bank Charges from Bank; older
 
     await goTo(page, 'Finance (Setup)');
     const box = page.getByTestId('card-charges');
-    assert.match(await box.innerText(), /නොගිය: 1 · Rs\. 15\.00/);                     // B0: 3% of 500
+    await page.waitForFunction(()=> /නොගිය: 1 · Rs\. 15\.00/.test((document.querySelector('[data-testid="card-charges"]')||{}).innerText));   // B0: 3% of 500
     await box.getByRole('button', { name:/Post card charges \(1\)/ }).click();
     await page.waitForFunction(()=> window.firebase.__store.glJournals.some(j=> j.sourceType==='CARD_CHARGE' && j.sourceId==='inv0' && j.status==='POSTED'));
     await page.waitForFunction(()=> /නොගිය: 0/.test(document.querySelector('[data-testid="card-charges"]').innerText));
@@ -609,6 +609,62 @@ test('Backup: reminder, download every collection, then put back a deleted recor
     const c = await page.evaluate(()=> window.firebase.__store.customers.find(c=> c.id==='c1'));
     assert.deepEqual([c.name, c.dueAmount], ['Alpha Test', 1000]);
     assert.equal(await page.evaluate(()=> window.firebase.__store.invoices.length), 1);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('Fewer reads: journals and other page-only collections load when their page first opens', { skip }, async()=>{
+  const { browser, page, errors } = await signIn();
+  try{
+    await page.waitForTimeout(300);
+    let on = await page.evaluate(()=> window.firebase.__listening());
+    for(const c of ['items','batches','customers','invoices','glAccounts']) assert.ok(on.includes(c), c + ' should load at start');
+    for(const c of ['glJournals','payments','salesReturns','opExpenses','capitalLoanTransactions','cashChecks']) assert.ok(!on.includes(c), c + ' should wait for its page');
+    await goTo(page, 'New Bill');
+    await page.waitForTimeout(200);
+    assert.ok(!(await page.evaluate(()=> window.firebase.__listening())).includes('glJournals'));
+    await goTo(page, 'Finance (Setup)');
+    await page.getByTestId('health-control').waitFor();
+    on = await page.evaluate(()=> window.firebase.__listening());
+    for(const c of ['glJournals','payments','salesReturns','opExpenses','capitalLoanTransactions']) assert.ok(on.includes(c), c + ' should load on Finance');
+    const t = await page.getByTestId('health-control').innerText();
+    assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
+    await goTo(page, 'Dashboard');
+    assert.ok((await page.evaluate(()=> window.firebase.__listening())).includes('glJournals'));   // stays live once loaded
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('Staff Advances: create 1150, give an advance, cut it from salary — balance and books follow', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.glAccounts.push({ id:'a6000', accountCode:'6000', accountName:'Salaries', accountType:'EXPENSE', isActive:true });
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await goTo(page, 'Staff Advances');
+    await page.getByRole('button', { name:'➕ 1150 Staff Advances account එක හදන්න' }).click();
+    await page.getByTestId('adv-staff').waitFor();
+    await page.getByTestId('adv-staff').fill('Nimal');
+    await page.getByTestId('adv-amount').fill('2000');
+    await page.getByRole('button', { name:'💾 Save' }).click();
+    await page.getByTestId('staff-balances').filter({ hasText:'Rs. 2,000.00' }).waitFor();
+    await page.getByTestId('staff-balances').getByRole('button', { name:'✂ කපාගන්න' }).click();
+    assert.equal(await page.getByTestId('adv-kind').inputValue(), 'salary');
+    await page.getByTestId('adv-amount').fill('1500');
+    await page.getByRole('button', { name:'💾 Save' }).click();
+    await page.getByTestId('staff-balances').filter({ hasText:'Rs. 500.00' }).waitFor();
+    const adv = await page.evaluate(()=> window.firebase.__store.glAccounts.find(a=> a.accountCode==='1150'));
+    assert.deepEqual([adv.accountType, adv.accountName], ['ASSET', 'Staff Advances']);
+    const js = await page.evaluate(()=> window.firebase.__store.glJournals.filter(j=> j.sourceType==='STAFF_ADVANCE'));
+    assert.deepEqual(js.map(j=> [j.staffName, j.status, j.lines.map(l=> [l.accountId, l.debit, l.credit])]), [
+      ['Nimal','POSTED',[[adv.id,2000,0],['a1000',0,2000]]], ['Nimal','POSTED',[['a6000',1500,0],[adv.id,0,1500]]] ]);
+    assert.deepEqual(await page.evaluate(()=> window.firebase.__store.meta.find(m=> m.id==='settings').staffNames), ['Nimal']);
+    if(process.env.SHOT){ await page.setViewportSize({ width:1200, height:1300 }); await page.getByTestId('staff-adv').screenshot({ path: process.env.SHOT }); }
+    await goTo(page, 'Finance (Setup)');
+    const t = await page.getByTestId('health-control').innerText();
+    assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
+    assert.match(await page.getByTestId('health-check').innerText(), /Balance Sheet balanced/);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });

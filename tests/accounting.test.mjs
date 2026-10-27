@@ -361,3 +361,21 @@ test('backup: timestamps round-trip, file check, missing docs, days since', ()=>
   assert.equal(C.backupDaysSince(null, 1), null);
   assert.equal(C.backupDaysSince(0 + 86400000*2, 86400000*9.5), 7);
 });
+
+test('staff advances: lines for given / salary cut / repaid, balances per staff with reversals', ()=>{
+  const C = loadHelpers(['glToCents','findGlAccountByCode','glActivePostedJournals','buildStaffAdvanceLines','staffAdvanceBalances']);
+  const chart = [{ id:'a1150', accountCode:'1150' }, { id:'a6000', accountCode:'6000' }, { id:'a1000', accountCode:'1000' }, { id:'a1011', accountCode:'1011' }];
+  const L = (k, amt, cash)=> C.buildStaffAdvanceLines(k, amt, chart, cash, 'd').map(l=>[l.accountId, l.debit, l.credit]);
+  assert.deepEqual(L('given', 2000, '1000'), [['a1150',2000,0],['a1000',0,2000]]);
+  assert.deepEqual(L('salary', 1500), [['a6000',1500,0],['a1150',0,1500]]);
+  assert.deepEqual(L('repaid', 300, '1011'), [['a1011',300,0],['a1150',0,300]]);
+  assert.throws(()=> L('given', 0, '1000'), /0ට වඩා/);
+  const J = (id, staffName, kind, lines, extra)=> ({ id, status:'POSTED', sourceType:'STAFF_ADVANCE', sourceId:'S'+id, staffName, date:'2026-10-0'+id.length, lines:C.buildStaffAdvanceLines(kind, lines, chart, '1000', ''), ...extra });
+  const js = [J('1','Nimal','given',2000), J('2','Nimal','salary',1500), J('3','Kamal','given',800, { status:'REVERSED' }),
+    { id:'r3', status:'POSTED', sourceType:'STAFF_ADVANCE', sourceId:'S3', reversalOfJournalId:'3', lines:[{accountId:'a1150', debit:0, credit:800}, {accountId:'a1000', debit:800, credit:0}] },
+    J('4','Kamal','given',250)];
+  const b = C.staffAdvanceBalances(chart, js);
+  assert.deepEqual([b.Nimal.given, b.Nimal.recovered, b.Nimal.balance], [2000, 1500, 500]);
+  assert.deepEqual([b.Kamal.given, b.Kamal.recovered, b.Kamal.balance], [250, 0, 250]);
+  assert.deepEqual(C.staffAdvanceBalances(chart.slice(1), js), {});
+});

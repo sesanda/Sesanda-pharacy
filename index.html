@@ -255,6 +255,9 @@ try {
   if (firebaseConfig.apiKey !== "YOUR_API_KEY") {
     firebase.initializeApp(firebaseConfig);
     db = firebase.firestore();
+    // Offline cache (IndexedDB, shared across tabs): reopening the app reads only what changed
+    // since last time instead of every document again, and the app keeps working without internet.
+    if(db.enablePersistence) db.enablePersistence({synchronizeTabs:true}).catch(e=> console.warn('offline cache off:', e && e.code));
     fbReady = true;
   }
 } catch(e){ console.error("Firebase init failed", e); }
@@ -618,13 +621,14 @@ function useAuthUid(){
   },[]);
   return uid;
 }
-function useCollection(name, orderField){
+// enabled=false holds the listener back (no reads) until a page that needs the collection opens.
+function useCollection(name, orderField, enabled=true){
   const [data,setData] = useState([]);
   const [loading,setLoading] = useState(true);
   const [error,setError] = useState(null);
   const authUid = useAuthUid();
   useEffect(()=>{
-    if(!db) return;
+    if(!db || !enabled) return;
     setLoading(true); setError(null);
     let q = db.collection(name);
     const unsub = q.onSnapshot(snap=>{
@@ -637,7 +641,7 @@ function useCollection(name, orderField){
       setError(err); setLoading(false);
     });
     return unsub;
-  },[name, authUid]);
+  },[name, authUid, enabled]);
   return [data, loading, error];
 }
 
@@ -2326,6 +2330,7 @@ function glClassifyCashLine(sourceType){
   if(sourceType==='BILL_TO_CREDIT') return { section:'operating', label:'Customer Sales Receipts' };
   if(sourceType==='OPENING_BALANCE') return { section:'financing', label:'Opening Balance Entries' };
   if(sourceType==='CARD_CHARGE') return { section:'operating', label:'Card / Bank Charges' };
+  if(sourceType==='STAFF_ADVANCE') return { section:'operating', label:'Staff advances (given / repaid)' };
   if(sourceType==='BANK_TRANSFER') return { section:'transfer', label:'Cash deposits / bank transfers' };
   return null;
 }
@@ -3550,6 +3555,144 @@ function CapitalLoans({glAccounts, glJournals, capitalLoanTxns, notify}){
 
 
 /* ---------- 🏦 Bank Accounts: add accounts, pick the card account, record deposits / transfers ---------- */
+/* ---------- 👤 Staff Advances ----------
+   Money the shop pays for a staff member's personal expenses (or lends them) is an amount they
+   owe the shop — 1150 Staff Advances (ASSET) — until it is cut from their salary or paid back.
+     given:     DR 1150 Staff Advances / CR Cash or Bank
+     salary:    DR 6000 Salaries       / CR 1150   (the cut is part of their pay)
+     repaid:    DR Cash or Bank        / CR 1150
+   Each entry is a STAFF_ADVANCE journal carrying staffName; balances are read from those. */
+const STAFF_ADVANCE_CODE = '1150';
+function buildStaffAdvanceLines(kind, amount, glAccounts, cashCode, desc){
+  const need = (code)=>{ const a = findGlAccountByCode(glAccounts, code); if(!a) throw new Error('Chart of Accounts එකේ ' + code + ' account එක නැහැ'); return a; };
+  const amt = Number(amount)||0;
+  if(glToCents(amt) <= 0) throw new Error('Amount එක 0ට වඩා වැඩි වෙන්න ඕන');
+  const adv = need('1150');
+  const other = kind==='salary' ? need('6000') : need(cashCode || '1000');
+  return kind==='given'
+    ? [{ accountId: adv.id, debit: amt, credit: 0, description: desc }, { accountId: other.id, debit: 0, credit: amt, description: desc }]
+    : [{ accountId: other.id, debit: amt, credit: 0, description: desc }, { accountId: adv.id, debit: 0, credit: amt, description: desc }];
+}
+// Per staff member: {name: {given, recovered, balance, last}} from STAFF_ADVANCE journals (reversals net out).
+function staffAdvanceBalances(glAccounts, glJournals){
+  const adv = findGlAccountByCode(glAccounts, '1150');
+  if(!adv) return {};
+  const posted = glActivePostedJournals(glJournals).filter(j=> j.sourceType==='STAFF_ADVANCE');
+  const nameBySource = {};
+  posted.forEach(j=>{ if(j.staffName) nameBySource[j.sourceId] = j.staffName; });
+  const out = {};
+  posted.forEach(j=>{
+    const name = j.staffName || nameBySource[j.sourceId]; if(!name) return;
+    const r = out[name] || (out[name] = { given:0, recovered:0, balance:0, last:'' });
+    (j.lines||[]).forEach(l=>{
+      if(l.accountId!==adv.id) return;
+      const d = Number(l.debit)||0, c = Number(l.credit)||0;
+      if(j.reversalOfJournalId){ r.given -= c; r.recovered -= d; } else { r.given += d; r.recovered += c; }
+      r.balance += d - c;
+    });
+    if(!j.reversalOfJournalId && (j.date||'') > r.last) r.last = j.date||'';
+  });
+  Object.values(out).forEach(r=>{ ['given','recovered','balance'].forEach(k=> r[k] = Math.round(r[k]*100)/100); });
+  return out;
+}
+
+function StaffAdvances({glAccounts, glJournals, notify}){
+  const adv = findGlAccountByCode(glAccounts, STAFF_ADVANCE_CODE);
+  const balances = staffAdvanceBalances(glAccounts, glJournals);
+  const [names,setNames] = useState([]);
+  const [f,setF] = useState({ kind:'given', staff:'', date: todayISO(), amount:'', cash:'1000', note:'' });
+  const [busy,setBusy] = useState(false), [filter,setFilter] = useState('');
+  useEffect(()=>{ db.collection('meta').doc('settings').get().then(s=> setNames((s.exists && s.data().staffNames)||[])).catch(()=>{}); },[]);
+  const allNames = [...new Set([...names, ...Object.keys(balances)])].sort();
+  const cashOptions = [findGlAccountByCode(glAccounts, '1000'), ...glBankAccounts(glAccounts)].filter(Boolean);
+  const KINDS = { given:'💸 Personal expense / advance දුන්නා', salary:'✂ Salary එකෙන් කපාගත්තා', repaid:'💵 Cash / bank එකෙන් ආපහු ගෙව්වා' };
+
+  const createAccount = async ()=>{
+    setBusy(true);
+    try{
+      await db.collection('glAccounts').add({ accountCode: STAFF_ADVANCE_CODE, accountName:'Staff Advances', accountType:'ASSET', parentAccountId:null, isActive:true,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(), updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+      notify('✓ 1150 Staff Advances account එක හැදුවා');
+    }catch(e){ notify('❌ ' + (e.message||e)); }
+    setBusy(false);
+  };
+  const save = async ()=>{
+    const staff = f.staff.trim();
+    if(!staff) return notify('Staff කෙනාගේ නම දෙන්න');
+    const amt = Number(f.amount);
+    const owed = (balances[staff]||{}).balance || 0;
+    if(f.kind!=='given' && amt > owed + 0.001 && !window.confirm(staff + ' ගෙවන්න තියෙන්නේ ' + fmt(owed) + ' යි — ' + fmt(amt) + ' ම ' + (f.kind==='salary' ? 'කපාගන්නද' : 'ගන්නද') + '?')) return;
+    const desc = KINDS[f.kind].replace(/^\S+\s/, '') + ' — ' + staff + (f.note.trim() ? ' (' + f.note.trim() + ')' : '');
+    let lines;
+    try{ lines = buildStaffAdvanceLines(f.kind, amt, glAccounts, f.cash, desc); }catch(e){ return notify('❌ ' + e.message); }
+    setBusy(true);
+    try{
+      const id = await createJournal({ date: f.date || todayISO(), description: desc, sourceType:'STAFF_ADVANCE', sourceId:'SADV-' + Date.now(), lines }, glAccounts);
+      await db.collection('glJournals').doc(id).update({ staffName: staff, staffAdvanceKind: f.kind });
+      await postJournal(id, glAccounts, glJournals);
+      if(!names.includes(staff)){ const next = [...names, staff]; setNames(next); db.collection('meta').doc('settings').set({ staffNames: next }, {merge:true}).catch(()=>{}); }
+      notify('✓ ' + staff + ' — ' + fmt(amt) + ' save කළා');
+      setF(x=> ({ ...x, amount:'', note:'' }));
+    }catch(e){ console.error(e); notify('❌ Save වුනේ නැහැ: ' + (e.message||e)); }
+    setBusy(false);
+  };
+  const history = glActivePostedJournals(glJournals).filter(j=> j.sourceType==='STAFF_ADVANCE' && !j.reversalOfJournalId && j.status==='POSTED' && (!filter || j.staffName===filter))
+    .sort((a,b)=> (b.date||'').localeCompare(a.date||'') || String(b.journalNo||'').localeCompare(String(a.journalNo||''))).slice(0, 40);
+  const amountOf = (j)=> (j.lines||[]).reduce((s,l)=> s + (Number(l.debit)||0), 0);
+
+  if(!glAccounts.length) return <div className="card"><div className="empty">මුලින්ම Finance (Setup) එකෙන් Chart of Accounts load කරන්න</div></div>;
+  if(!adv) return <div className="card" data-testid="staff-adv">
+    <h3>👤 Staff Advances</h3>
+    <p>Staff ලාගේ personal වියදම් / advances record කරන්න <b>1150 Staff Advances</b> account එකක් ඕන (Chart of Accounts එකේ තවම නැහැ).</p>
+    <button className="btn btn-primary" disabled={busy} onClick={createAccount}>➕ 1150 Staff Advances account එක හදන්න</button></div>;
+  const total = Object.values(balances).reduce((s,r)=> s + r.balance, 0);
+  return (
+    <div data-testid="staff-adv">
+      <div className="card">
+        <h3>👤 Staff ලාගෙන් ලැබෙන්න තියෙන ගාණ — {fmt(total)}</h3>
+        {Object.keys(balances).length===0 ? <div className="empty">තවම entries නැහැ</div> :
+        <table data-testid="staff-balances"><thead><tr><th>Staff</th><th>දුන්නා</th><th>කපාගත්තා / ගෙව්වා</th><th>ඉතුරු (ගෙවන්න ඕන)</th><th>අන්තිම</th><th></th></tr></thead>
+          <tbody>{Object.entries(balances).sort((a,b)=> b[1].balance - a[1].balance).map(([n,r])=> <tr key={n}>
+            <td><b>{n}</b></td><td>{fmt(r.given)}</td><td>{fmt(r.recovered)}</td>
+            <td style={{fontWeight:700, color: r.balance>0.001 ? 'var(--red)' : undefined}}>{fmt(r.balance)}</td><td>{r.last}</td>
+            <td><button className="btn btn-ghost btn-sm" onClick={()=>{ setF(x=> ({...x, staff:n, kind:'salary', amount: r.balance>0 ? String(r.balance) : ''})); }}>✂ කපාගන්න</button></td></tr>)}</tbody></table>}
+      </div>
+
+      <div className="card" style={{background:'var(--teal-100)', border:'1.5px solid var(--teal-500)'}}>
+        <h3>➕ Entry එකක්</h3>
+        <div className="grid c3">
+          <div><label>වර්ගය</label><select data-testid="adv-kind" value={f.kind} onChange={e=>setF({...f, kind:e.target.value})}>
+            {Object.entries(KINDS).map(([k,l])=> <option key={k} value={k}>{l}</option>)}</select></div>
+          <div><label>Staff නම</label><input data-testid="adv-staff" list="staff-names" value={f.staff} onChange={e=>setF({...f, staff:e.target.value})} placeholder="නම type කරන්න / තෝරන්න" />
+            <datalist id="staff-names">{allNames.map(n=> <option key={n} value={n} />)}</datalist>
+            {f.staff.trim() && balances[f.staff.trim()] && <div style={{fontSize:12, color:'var(--ink-soft)', marginTop:4}}>දැනට ගෙවන්න තියෙන්නේ {fmt(balances[f.staff.trim()].balance)}</div>}</div>
+          <div><label>Date</label><input type="date" value={f.date} onChange={e=>setF({...f, date:e.target.value})} /></div>
+          <div><label>Amount (Rs.)</label><input data-testid="adv-amount" type="number" value={f.amount} onChange={e=>setF({...f, amount:e.target.value})} /></div>
+          {f.kind!=='salary' && <div><label>{f.kind==='given' ? 'සල්ලි ගත්තේ (from)' : 'සල්ලි දැම්මේ (into)'}</label>
+            <select value={f.cash} onChange={e=>setF({...f, cash:e.target.value})}>{cashOptions.map(a=> <option key={a.id} value={a.accountCode}>{a.accountCode} {a.accountName}</option>)}</select></div>}
+          <div><label>Note (e.g. බඩු / phone bill)</label><input value={f.note} onChange={e=>setF({...f, note:e.target.value})} /></div>
+        </div>
+        <button className="btn btn-primary" style={{marginTop:12}} disabled={busy} onClick={save}>💾 Save</button>
+        <div style={{fontSize:12.5, color:'var(--ink-soft)', marginTop:10, lineHeight:1.6}}>
+          • <b>දුන්නා:</b> staff කෙනාගේ personal වියදමකට shop එකෙන් සල්ලි ගියාම — ඒ ගාණ ඔහු/ඇය shop එකට ගෙවන්න ඕන ණයක් (1150) විදියට යනවා, ලාභයෙන් අඩු වෙන්නේ නැහැ.<br/>
+          • <b>Salary එකෙන් කපාගත්තා:</b> salary එක ගෙවද්දී කපාගත්ත ගාණ — ඒක salary වියදමේ කොටසක් (6000 Salaries). ඉතුරු salary එක සාමාන්‍ය විදියට Expenses එකෙන් දාන්න.<br/>
+          • <b>ආපහු ගෙව්වා:</b> staff කෙනා cash / bank එකෙන් ආපහු දුන්නාම.
+        </div>
+      </div>
+
+      <div className="card">
+        <h3 style={{display:'flex', gap:8, alignItems:'center'}}><span style={{flex:1}}>🧾 Entries</span>
+          <select value={filter} onChange={e=>setFilter(e.target.value)} style={{width:'auto'}}><option value="">ඔක්කොම staff</option>{allNames.map(n=> <option key={n} value={n}>{n}</option>)}</select></h3>
+        {history.length===0 ? <div className="empty">Entries නැහැ</div> :
+        <table><thead><tr><th>Date</th><th>JE</th><th>Staff</th><th>වර්ගය</th><th>Amount</th><th>විස්තරය</th></tr></thead>
+          <tbody>{history.map(j=> <tr key={j.id}><td>{j.date}</td><td>{j.journalNo}</td><td>{j.staffName}</td>
+            <td>{(KINDS[j.staffAdvanceKind]||'').split(' ')[0]} {j.staffAdvanceKind==='given' ? 'දුන්නා' : j.staffAdvanceKind==='salary' ? 'Salary කැපීම' : 'ආපහු ගෙව්වා'}</td>
+            <td>{fmt(amountOf(j))}</td><td>{j.description}</td></tr>)}</tbody></table>}
+      </div>
+    </div>
+  );
+}
+
 function BankAccounts({glAccounts, glJournals, notify}){
   const banks = glBankAccounts(glAccounts);
   const cashAcc = findGlAccountByCode(glAccounts, '1000');
@@ -4266,6 +4409,29 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
 /* ========================================================================
    STAFF APP
    ======================================================================== */
+// Which pages need which of the less-used collections (see StaffApp's lazy()). Items, stock batches,
+// suppliers, customers, bills, GRNs, orders, prescriptions and the chart of accounts are always live.
+// Journals are left out of the everyday pages (New Bill, GRN, Customers, Dashboard): those only post
+// new entries, whose duplicate guard never needs the old ones.
+const ACCT_PAGES = ['finance','banks','staffadv','ledger','trialbalance','pnl','balancesheet','ar','ap','cashflow','expenses','capitalloans'];
+const STAFF_TAB_COLLECTIONS = (()=>{
+  const m = {};
+  const add = (tabs, cols)=> tabs.forEach(t=> m[t] = [...(m[t]||[]), ...cols]);
+  add([...ACCT_PAGES, 'returns', 'reports', 'stockaudit', 'suppliers'], ['glJournals']);
+  add(['reports','stockaudit'], ['journal','expenses','adjustments']);
+  add(['returns','reports','finance','ar'], ['salesReturns']);
+  add(['returns','reports','finance','ap'], ['grnReturns']);
+  add(['customers','reports','cashcontrol','finance','ar'], ['payments']);
+  add(['dashboard','customers'], ['medReminders']);
+  add(['dashboard','purchaseOrders'], ['purchaseOrders']);
+  add(['ai'], ['calendarEvents']);
+  add(['cashcontrol'], ['cashChecks']);
+  add(['finance','ap'], ['supplierPayments']);
+  add(['finance','expenses'], ['opExpenses']);
+  add(['finance','capitalloans'], ['capitalLoanTransactions']);
+  return m;
+})();
+
 function StaffApp({onExit}){
   const [user,setUser] = useState(null);
   const [authChecked,setAuthChecked] = useState(false);
@@ -4382,21 +4548,30 @@ function StaffApp({onExit}){
   const [grns] = useCollection('grns');
   const [specialOrders] = useCollection('specialOrders');
   const [invoices, invoicesLoading, invoicesError] = useCollection('invoices');
-  const [journal] = useCollection('journal');
-  const [expenses] = useCollection('expenses');
-  const [adjustments] = useCollection('adjustments');
-  const [medReminders] = useCollection('medReminders');
-  const [salesReturns] = useCollection('salesReturns');
-  const [grnReturns] = useCollection('grnReturns');
-  const [calendarEvents] = useCollection('calendarEvents');
-  const [purchaseOrders] = useCollection('purchaseOrders');
-  const [payments] = useCollection('payments');
-  const [cashChecks] = useCollection('cashChecks');
+  // Collections only some pages use are read the first time one of those pages opens (and then
+  // kept live for the session) — opening the app no longer reads every document of every collection.
+  const [needed,setNeeded] = useState(()=> new Set(STAFF_TAB_COLLECTIONS[tab]||[]));
+  useEffect(()=>{
+    const want = STAFF_TAB_COLLECTIONS[tab]||[];
+    setNeeded(n=> want.every(c=> n.has(c)) ? n : new Set([...n, ...want]));
+  },[tab]);
+  const lazyLoading = {};
+  const lazy = (name)=>{ const r = useCollection(name, undefined, needed.has(name)); lazyLoading[name] = r[1]; return r; };
+  const [journal] = lazy('journal');
+  const [expenses] = lazy('expenses');
+  const [adjustments] = lazy('adjustments');
+  const [medReminders] = lazy('medReminders');
+  const [salesReturns] = lazy('salesReturns');
+  const [grnReturns] = lazy('grnReturns');
+  const [calendarEvents] = lazy('calendarEvents');
+  const [purchaseOrders] = lazy('purchaseOrders');
+  const [payments] = lazy('payments');
+  const [cashChecks] = lazy('cashChecks');
   const [glAccounts] = useCollection('glAccounts');
-  const [glJournals] = useCollection('glJournals');
-  const [supplierPayments] = useCollection('supplierPayments');
-  const [opExpenses] = useCollection('opExpenses');
-  const [capitalLoanTxns] = useCollection('capitalLoanTransactions');
+  const [glJournals] = lazy('glJournals');
+  const [supplierPayments] = lazy('supplierPayments');
+  const [opExpenses] = lazy('opExpenses');
+  const [capitalLoanTxns] = lazy('capitalLoanTransactions');
 
   // Convert an approved Purchase Order into a preloaded GRN draft. This NEVER touches stock/cost
   // itself — it only opens the existing GRN Entry form with items queued up; stock/cost change
@@ -4488,6 +4663,7 @@ function StaffApp({onExit}){
     {id:'cashflow', label:'Cash Flow Statement', ic:'💵'},
     {id:'expenses', label:'Expenses', ic:'💸'},
     {id:'capitalloans', label:'Capital & Loans', ic:'💰'},
+    {id:'staffadv', label:'Staff Advances', ic:'👤'},
     {id:'ai', label:'AI Insights', ic:'🤖'},
     {id:'backup', label:'Backup', ic:'💾'},
   ];
@@ -4497,7 +4673,7 @@ function StaffApp({onExit}){
     {id:'stockGrp', label:'Stock & Purchasing', ic:'📦', items:['items','purchaseOrders','grn','subgrn','returns','opening','stock','stockaudit','suppliers']},
     {id:'custGrp', label:'Customers & Orders', ic:'👥', items:['customers','orders','special']},
     {id:'reportGrp', label:'Reports & Cash', ic:'📈', items:['reports','cashcontrol','ai','backup']},
-    {id:'acctGrp', label:'Accounting', ic:'💰', items:['finance','banks','ledger','trialbalance','pnl','balancesheet','ar','ap','cashflow','expenses','capitalloans']},
+    {id:'acctGrp', label:'Accounting', ic:'💰', items:['finance','banks','staffadv','ledger','trialbalance','pnl','balancesheet','ar','ap','cashflow','expenses','capitalloans']},
   ];
   const grouped = new Set(NAV_GROUPS.flatMap(g=> g.items));
   const navBtn = (n)=> (
@@ -4547,6 +4723,7 @@ function StaffApp({onExit}){
               <button className="btn btn-primary btn-sm" onClick={()=>setTab('backup')}>💾 Backup ගන්න</button>
             </div>
           )}
+          {(STAFF_TAB_COLLECTIONS[tab]||[]).some(c=> lazyLoading[c]) ? <div className="card" data-testid="page-loading"><div className="empty">⏳ Data load වෙනවා…</div></div> : <>
           {tab==='backup' && <Backup notify={notify} onBackedUp={setLastBackupAt} />}
           {tab==='dashboard' && <Dashboard items={items} batches={batches} orders={orders} suppliers={suppliers} customers={customers} invoices={invoices} grns={grns} medReminders={medReminders} notify={notify} purchaseOrders={purchaseOrders} glAccounts={glAccounts} glJournals={glJournals}/>}
           {tab==='billing' && (
@@ -4595,6 +4772,7 @@ function StaffApp({onExit}){
             suppliers={suppliers} expenses={expenses} adjustments={adjustments} salesReturns={salesReturns} grnReturns={grnReturns}
             glAccounts={glAccounts} glJournals={glJournals} customers={customers} payments={payments} notify={notify}/>}
           {tab==='cashcontrol' && <CashControl invoices={invoices} payments={payments} cashChecks={cashChecks} notify={notify} />}
+          {tab==='staffadv' && <StaffAdvances glAccounts={glAccounts} glJournals={glJournals} notify={notify} />}
           {tab==='banks' && <BankAccounts glAccounts={glAccounts} glJournals={glJournals} notify={notify} />}
           {tab==='finance' && <Finance glAccounts={glAccounts} glJournals={glJournals} grns={grns} invoices={invoices} payments={payments} supplierPayments={supplierPayments} expenses={opExpenses} capitalLoanTxns={capitalLoanTxns} batches={batches} customers={customers} salesReturns={salesReturns} grnReturns={grnReturns} notify={notify} />}
           {tab==='ledger' && <GeneralLedger glAccounts={glAccounts} glJournals={glJournals} />}
@@ -4607,6 +4785,7 @@ function StaffApp({onExit}){
           {tab==='expenses' && <ExpenseManagement glAccounts={glAccounts} glJournals={glJournals} expenses={opExpenses} notify={notify} />}
           {tab==='capitalloans' && <CapitalLoans glAccounts={glAccounts} glJournals={glJournals} capitalLoanTxns={capitalLoanTxns} notify={notify} />}
           {tab==='ai' && <AIInsights items={items} batches={batches} invoices={invoices} suppliers={suppliers} calendarEvents={calendarEvents} notify={notify}/>}
+          </>}
         </div>
       </div>
       {toast && <div className="toast">{toast}</div>}
