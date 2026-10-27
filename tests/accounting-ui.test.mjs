@@ -577,3 +577,38 @@ test('Stock Audit apply: stock follows the count, shortage goes to 6700 and the 
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('Backup: reminder, download every collection, then put back a deleted record from the file', { skip }, async()=>{
+  const { browser, page, errors } = await signIn();
+  try{
+    await page.getByTestId('backup-reminder').waitFor();
+    await page.getByTestId('backup-reminder').getByRole('button', { name:'💾 Backup ගන්න' }).click();
+    const [dl] = await Promise.all([ page.waitForEvent('download'), page.getByRole('button', { name:'💾 Backup එක ගන්න (Download)' }).click() ]);
+    assert.match(dl.suggestedFilename(), /^sesanda-backup-\d{4}-\d\d-\d\d-\d{4}\.json$/);
+    const file = await dl.path();
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(data.app, 'sesanda-pharmacy');
+    assert.deepEqual(data.collections.invoices.map(i=> i.id), ['inv1']);
+    assert.equal(data.collections.customers[0].name, 'Alpha Test');
+    assert.ok(data.collections.glJournals.length >= 2);
+    await page.waitForFunction(()=> (window.firebase.__store.meta||[]).some(m=> m.id==='settings' && m.lastBackupAt));
+    await page.getByTestId('backup-last').filter({ hasText:'අද' }).waitFor();
+    await goTo(page, 'Dashboard');
+    assert.equal(await page.getByTestId('backup-reminder').count(), 0);
+
+    // a customer goes missing — the backup file puts it back, nothing else is touched
+    await page.evaluate(()=>{ window.firebase.__store.customers = []; window.firebase.__notify('customers'); });
+    await goTo(page, 'Backup');
+    await page.getByTestId('backup-file').setInputFiles(file);
+    await page.getByTestId('backup-info').waitFor();
+    await page.getByRole('button', { name:'🔍 දැන් app එකේ නැති records හොයන්න' }).click();
+    assert.match(await page.getByTestId('backup-missing').innerText(), /customers 1/);
+    if(process.env.SHOT){ await page.setViewportSize({ width:1200, height:1100 }); await page.getByTestId('backup').screenshot({ path: process.env.SHOT }); }
+    await page.getByRole('button', { name:/නැති records 1 ආපහු දාන්න/ }).click();
+    await page.waitForFunction(()=> (window.firebase.__store.customers||[]).some(c=> c.id==='c1'));
+    const c = await page.evaluate(()=> window.firebase.__store.customers.find(c=> c.id==='c1'));
+    assert.deepEqual([c.name, c.dueAmount], ['Alpha Test', 1000]);
+    assert.equal(await page.evaluate(()=> window.firebase.__store.invoices.length), 1);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});

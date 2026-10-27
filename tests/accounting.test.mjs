@@ -348,3 +348,16 @@ test('stock audit record: saved lines summarise like the live sheet', ()=>{
   assert.deepEqual([s.counted, s.shortCost, s.overCost, s.netCost, s.netSell], [3, 10, 6, -4, -7]);
   assert.deepEqual(s.lines.map(l=> l.batchCodes), [[], [], []]);
 });
+
+test('backup: timestamps round-trip, file check, missing docs, days since', ()=>{
+  const C = loadHelpers(['backupEncode','backupDecode','inspectBackup','backupMissingDocs','backupDaysSince']);
+  const enc = C.backupEncode({ a:1, t:{ toMillis:()=>1700000000000 }, list:[{ t:{ toMillis:()=>5 } }], n:null });
+  assert.deepEqual(enc, { a:1, t:{ __ts:1700000000000 }, list:[{ t:{ __ts:5 } }], n:null });
+  assert.deepEqual(C.backupDecode(enc, ms=> 'TS' + ms), { a:1, t:'TS1700000000000', list:[{ t:'TS5' }], n:null });
+  assert.equal(C.inspectBackup({ foo:1 }).ok, false);
+  const data = { app:'sesanda-pharmacy', createdAt:'2026-10-26T00:00:00Z', collections:{ items:[{id:'a'},{id:'b'}], invoices:[{id:'x'}], meta:[] } };
+  assert.deepEqual([C.inspectBackup(data).ok, C.inspectBackup(data).total, C.inspectBackup(data).counts.items], [true, 3, 2]);
+  assert.deepEqual(C.backupMissingDocs(data, { items:new Set(['a']), invoices:new Set(['x']) }), { items:[{id:'b'}] });
+  assert.equal(C.backupDaysSince(null, 1), null);
+  assert.equal(C.backupDaysSince(0 + 86400000*2, 86400000*9.5), 7);
+});
