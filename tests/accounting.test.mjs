@@ -379,3 +379,12 @@ test('staff advances: lines for given / salary cut / repaid, balances per staff 
   assert.deepEqual([b.Kamal.given, b.Kamal.recovered, b.Kamal.balance], [250, 0, 250]);
   assert.deepEqual(C.staffAdvanceBalances(chart.slice(1), js), {});
 });
+
+test('fefoTakeCost: cost of units taken earliest-expiry first', ()=>{
+  const { fefoTakeCost } = loadHelpers(['fefoTakeCost']);
+  const batches = [{ itemId:'a', remainingUnits:4, unitCost:10, expiryDate:'2027-05-01' }, { itemId:'a', remainingUnits:5, unitCost:7, expiryDate:'2027-01-01' },
+    { itemId:'a', remainingUnits:0, unitCost:1, expiryDate:'2026-01-01' }, { itemId:'b', remainingUnits:9, unitCost:99, expiryDate:'2025-01-01' }];
+  assert.equal(fefoTakeCost('a', 7, batches), 5*7 + 2*10);
+  assert.equal(fefoTakeCost('a', 50, batches), 5*7 + 4*10);
+  assert.equal(fefoTakeCost('x', 3, batches), 0);
+});
