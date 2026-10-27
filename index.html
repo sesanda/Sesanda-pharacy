@@ -255,6 +255,9 @@ try {
   if (firebaseConfig.apiKey !== "YOUR_API_KEY") {
     firebase.initializeApp(firebaseConfig);
     db = firebase.firestore();
+    // Offline cache (IndexedDB, shared across tabs): reopening the app reads only what changed
+    // since last time instead of every document again, and the app keeps working without internet.
+    if(db.enablePersistence) db.enablePersistence({synchronizeTabs:true}).catch(e=> console.warn('offline cache off:', e && e.code));
     fbReady = true;
   }
 } catch(e){ console.error("Firebase init failed", e); }
@@ -618,13 +621,14 @@ function useAuthUid(){
   },[]);
   return uid;
 }
-function useCollection(name, orderField){
+// enabled=false holds the listener back (no reads) until a page that needs the collection opens.
+function useCollection(name, orderField, enabled=true){
   const [data,setData] = useState([]);
   const [loading,setLoading] = useState(true);
   const [error,setError] = useState(null);
   const authUid = useAuthUid();
   useEffect(()=>{
-    if(!db) return;
+    if(!db || !enabled) return;
     setLoading(true); setError(null);
     let q = db.collection(name);
     const unsub = q.onSnapshot(snap=>{
@@ -637,7 +641,7 @@ function useCollection(name, orderField){
       setError(err); setLoading(false);
     });
     return unsub;
-  },[name, authUid]);
+  },[name, authUid, enabled]);
   return [data, loading, error];
 }
 
@@ -4266,6 +4270,29 @@ function Finance({glAccounts, glJournals, grns, invoices, payments, supplierPaym
 /* ========================================================================
    STAFF APP
    ======================================================================== */
+// Which pages need which of the less-used collections (see StaffApp's lazy()). Items, stock batches,
+// suppliers, customers, bills, GRNs, orders, prescriptions and the chart of accounts are always live.
+// Journals are left out of the everyday pages (New Bill, GRN, Customers, Dashboard): those only post
+// new entries, whose duplicate guard never needs the old ones.
+const ACCT_PAGES = ['finance','banks','ledger','trialbalance','pnl','balancesheet','ar','ap','cashflow','expenses','capitalloans'];
+const STAFF_TAB_COLLECTIONS = (()=>{
+  const m = {};
+  const add = (tabs, cols)=> tabs.forEach(t=> m[t] = [...(m[t]||[]), ...cols]);
+  add([...ACCT_PAGES, 'returns', 'reports', 'stockaudit', 'suppliers'], ['glJournals']);
+  add(['reports','stockaudit'], ['journal','expenses','adjustments']);
+  add(['returns','reports','finance','ar'], ['salesReturns']);
+  add(['returns','reports','finance','ap'], ['grnReturns']);
+  add(['customers','reports','cashcontrol','finance','ar'], ['payments']);
+  add(['dashboard','customers'], ['medReminders']);
+  add(['dashboard','purchaseOrders'], ['purchaseOrders']);
+  add(['ai'], ['calendarEvents']);
+  add(['cashcontrol'], ['cashChecks']);
+  add(['finance','ap'], ['supplierPayments']);
+  add(['finance','expenses'], ['opExpenses']);
+  add(['finance','capitalloans'], ['capitalLoanTransactions']);
+  return m;
+})();
+
 function StaffApp({onExit}){
   const [user,setUser] = useState(null);
   const [authChecked,setAuthChecked] = useState(false);
@@ -4382,21 +4409,30 @@ function StaffApp({onExit}){
   const [grns] = useCollection('grns');
   const [specialOrders] = useCollection('specialOrders');
   const [invoices, invoicesLoading, invoicesError] = useCollection('invoices');
-  const [journal] = useCollection('journal');
-  const [expenses] = useCollection('expenses');
-  const [adjustments] = useCollection('adjustments');
-  const [medReminders] = useCollection('medReminders');
-  const [salesReturns] = useCollection('salesReturns');
-  const [grnReturns] = useCollection('grnReturns');
-  const [calendarEvents] = useCollection('calendarEvents');
-  const [purchaseOrders] = useCollection('purchaseOrders');
-  const [payments] = useCollection('payments');
-  const [cashChecks] = useCollection('cashChecks');
+  // Collections only some pages use are read the first time one of those pages opens (and then
+  // kept live for the session) — opening the app no longer reads every document of every collection.
+  const [needed,setNeeded] = useState(()=> new Set(STAFF_TAB_COLLECTIONS[tab]||[]));
+  useEffect(()=>{
+    const want = STAFF_TAB_COLLECTIONS[tab]||[];
+    setNeeded(n=> want.every(c=> n.has(c)) ? n : new Set([...n, ...want]));
+  },[tab]);
+  const lazyLoading = {};
+  const lazy = (name)=>{ const r = useCollection(name, undefined, needed.has(name)); lazyLoading[name] = r[1]; return r; };
+  const [journal] = lazy('journal');
+  const [expenses] = lazy('expenses');
+  const [adjustments] = lazy('adjustments');
+  const [medReminders] = lazy('medReminders');
+  const [salesReturns] = lazy('salesReturns');
+  const [grnReturns] = lazy('grnReturns');
+  const [calendarEvents] = lazy('calendarEvents');
+  const [purchaseOrders] = lazy('purchaseOrders');
+  const [payments] = lazy('payments');
+  const [cashChecks] = lazy('cashChecks');
   const [glAccounts] = useCollection('glAccounts');
-  const [glJournals] = useCollection('glJournals');
-  const [supplierPayments] = useCollection('supplierPayments');
-  const [opExpenses] = useCollection('opExpenses');
-  const [capitalLoanTxns] = useCollection('capitalLoanTransactions');
+  const [glJournals] = lazy('glJournals');
+  const [supplierPayments] = lazy('supplierPayments');
+  const [opExpenses] = lazy('opExpenses');
+  const [capitalLoanTxns] = lazy('capitalLoanTransactions');
 
   // Convert an approved Purchase Order into a preloaded GRN draft. This NEVER touches stock/cost
   // itself — it only opens the existing GRN Entry form with items queued up; stock/cost change
@@ -4547,6 +4583,7 @@ function StaffApp({onExit}){
               <button className="btn btn-primary btn-sm" onClick={()=>setTab('backup')}>💾 Backup ගන්න</button>
             </div>
           )}
+          {(STAFF_TAB_COLLECTIONS[tab]||[]).some(c=> lazyLoading[c]) ? <div className="card" data-testid="page-loading"><div className="empty">⏳ Data load වෙනවා…</div></div> : <>
           {tab==='backup' && <Backup notify={notify} onBackedUp={setLastBackupAt} />}
           {tab==='dashboard' && <Dashboard items={items} batches={batches} orders={orders} suppliers={suppliers} customers={customers} invoices={invoices} grns={grns} medReminders={medReminders} notify={notify} purchaseOrders={purchaseOrders} glAccounts={glAccounts} glJournals={glJournals}/>}
           {tab==='billing' && (
@@ -4607,6 +4644,7 @@ function StaffApp({onExit}){
           {tab==='expenses' && <ExpenseManagement glAccounts={glAccounts} glJournals={glJournals} expenses={opExpenses} notify={notify} />}
           {tab==='capitalloans' && <CapitalLoans glAccounts={glAccounts} glJournals={glJournals} capitalLoanTxns={capitalLoanTxns} notify={notify} />}
           {tab==='ai' && <AIInsights items={items} batches={batches} invoices={invoices} suppliers={suppliers} calendarEvents={calendarEvents} notify={notify}/>}
+          </>}
         </div>
       </div>
       {toast && <div className="toast">{toast}</div>}

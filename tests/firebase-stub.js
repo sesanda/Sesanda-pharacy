@@ -38,7 +38,7 @@
       doc: (id)=> docRef(name, id) };
     return q;
   }
-  const db = { collection: query,
+  const db = { collection: query, enablePersistence: async()=>{},
     batch: ()=>{ const ops = []; return {
       set(r,v,o){ ops.push(()=> o&&o.merge ? apply.set(r.__name, r.id, {...((store[r.__name]||[]).find(x=>x.id===r.id)||{}), ...v}) : apply.set(r.__name, r.id, v)); window.__writes.push({op:'batch.set',name:r.__name,v}); },
       update(r,v){ ops.push(()=> apply.update(r.__name, r.id, v)); window.__writes.push({op:'batch.update',name:r.__name,v}); },
@@ -55,5 +55,5 @@
     signInWithEmailAndPassword: async(email)=>{ currentUser = {uid:'test-uid', email}; authCbs.forEach(cb=>cb(currentUser)); return {user:currentUser}; },
     signOut: async()=>{ currentUser = null; authCbs.forEach(cb=>cb(null)); },
   });
-  window.firebase = { apps:[], initializeApp(){ this.apps.push({}); return {}; }, firestore, auth, __notify:notify, __store:store };
+  window.firebase = { apps:[], initializeApp(){ this.apps.push({}); return {}; }, firestore, auth, __notify:notify, __store:store, __listening: ()=> [...new Set([...listeners].filter(l=> !l.closed).map(l=> l.name))].sort() };
 })();

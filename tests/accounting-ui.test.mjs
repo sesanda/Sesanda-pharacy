@@ -436,7 +436,7 @@ test('Card charge: a card bill posts its % to 6500 Bank Charges from Bank; older
 
     await goTo(page, 'Finance (Setup)');
     const box = page.getByTestId('card-charges');
-    assert.match(await box.innerText(), /නොගිය: 1 · Rs\. 15\.00/);                     // B0: 3% of 500
+    await page.waitForFunction(()=> /නොගිය: 1 · Rs\. 15\.00/.test((document.querySelector('[data-testid="card-charges"]')||{}).innerText));   // B0: 3% of 500
     await box.getByRole('button', { name:/Post card charges \(1\)/ }).click();
     await page.waitForFunction(()=> window.firebase.__store.glJournals.some(j=> j.sourceType==='CARD_CHARGE' && j.sourceId==='inv0' && j.status==='POSTED'));
     await page.waitForFunction(()=> /නොගිය: 0/.test(document.querySelector('[data-testid="card-charges"]').innerText));
@@ -609,6 +609,28 @@ test('Backup: reminder, download every collection, then put back a deleted recor
     const c = await page.evaluate(()=> window.firebase.__store.customers.find(c=> c.id==='c1'));
     assert.deepEqual([c.name, c.dueAmount], ['Alpha Test', 1000]);
     assert.equal(await page.evaluate(()=> window.firebase.__store.invoices.length), 1);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('Fewer reads: journals and other page-only collections load when their page first opens', { skip }, async()=>{
+  const { browser, page, errors } = await signIn();
+  try{
+    await page.waitForTimeout(300);
+    let on = await page.evaluate(()=> window.firebase.__listening());
+    for(const c of ['items','batches','customers','invoices','glAccounts']) assert.ok(on.includes(c), c + ' should load at start');
+    for(const c of ['glJournals','payments','salesReturns','opExpenses','capitalLoanTransactions','cashChecks']) assert.ok(!on.includes(c), c + ' should wait for its page');
+    await goTo(page, 'New Bill');
+    await page.waitForTimeout(200);
+    assert.ok(!(await page.evaluate(()=> window.firebase.__listening())).includes('glJournals'));
+    await goTo(page, 'Finance (Setup)');
+    await page.getByTestId('health-control').waitFor();
+    on = await page.evaluate(()=> window.firebase.__listening());
+    for(const c of ['glJournals','payments','salesReturns','opExpenses','capitalLoanTransactions']) assert.ok(on.includes(c), c + ' should load on Finance');
+    const t = await page.getByTestId('health-control').innerText();
+    assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
+    await goTo(page, 'Dashboard');
+    assert.ok((await page.evaluate(()=> window.firebase.__listening())).includes('glJournals'));   // stays live once loaded
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
