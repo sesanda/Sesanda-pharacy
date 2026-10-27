@@ -634,3 +634,37 @@ test('Fewer reads: journals and other page-only collections load when their page
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('Staff Advances: create 1150, give an advance, cut it from salary — balance and books follow', { skip }, async()=>{
+  const fx = JSON.parse(JSON.stringify(fixture));
+  fx.collections.glAccounts.push({ id:'a6000', accountCode:'6000', accountName:'Salaries', accountType:'EXPENSE', isActive:true });
+  const saved = fixture.collections; fixture.collections = fx.collections;
+  const { browser, page, errors } = await signIn();
+  fixture.collections = saved;
+  try{
+    await goTo(page, 'Staff Advances');
+    await page.getByRole('button', { name:'➕ 1150 Staff Advances account එක හදන්න' }).click();
+    await page.getByTestId('adv-staff').waitFor();
+    await page.getByTestId('adv-staff').fill('Nimal');
+    await page.getByTestId('adv-amount').fill('2000');
+    await page.getByRole('button', { name:'💾 Save' }).click();
+    await page.getByTestId('staff-balances').filter({ hasText:'Rs. 2,000.00' }).waitFor();
+    await page.getByTestId('staff-balances').getByRole('button', { name:'✂ කපාගන්න' }).click();
+    assert.equal(await page.getByTestId('adv-kind').inputValue(), 'salary');
+    await page.getByTestId('adv-amount').fill('1500');
+    await page.getByRole('button', { name:'💾 Save' }).click();
+    await page.getByTestId('staff-balances').filter({ hasText:'Rs. 500.00' }).waitFor();
+    const adv = await page.evaluate(()=> window.firebase.__store.glAccounts.find(a=> a.accountCode==='1150'));
+    assert.deepEqual([adv.accountType, adv.accountName], ['ASSET', 'Staff Advances']);
+    const js = await page.evaluate(()=> window.firebase.__store.glJournals.filter(j=> j.sourceType==='STAFF_ADVANCE'));
+    assert.deepEqual(js.map(j=> [j.staffName, j.status, j.lines.map(l=> [l.accountId, l.debit, l.credit])]), [
+      ['Nimal','POSTED',[[adv.id,2000,0],['a1000',0,2000]]], ['Nimal','POSTED',[['a6000',1500,0],[adv.id,0,1500]]] ]);
+    assert.deepEqual(await page.evaluate(()=> window.firebase.__store.meta.find(m=> m.id==='settings').staffNames), ['Nimal']);
+    if(process.env.SHOT){ await page.setViewportSize({ width:1200, height:1300 }); await page.getByTestId('staff-adv').screenshot({ path: process.env.SHOT }); }
+    await goTo(page, 'Finance (Setup)');
+    const t = await page.getByTestId('health-control').innerText();
+    assert.equal((t.match(/✓ matches/g)||[]).length, 3, t);
+    assert.match(await page.getByTestId('health-check').innerText(), /Balance Sheet balanced/);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
